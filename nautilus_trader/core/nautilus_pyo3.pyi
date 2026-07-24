@@ -9079,6 +9079,226 @@ class OKXVipLevel(Enum):
     @property
     def value(self) -> int: ...  # type: ignore[override]
 
+# Bitget
+
+class BitgetEnvironment(Enum):
+    MAINNET = "MAINNET"
+
+class BitgetProductType(Enum):
+    SPOT = "SPOT"
+    USDT_FUTURES = "USDT-FUTURES"
+
+def get_bitget_http_base_url(environment: BitgetEnvironment) -> str: ...
+def get_bitget_ws_url_public(environment: BitgetEnvironment) -> str: ...
+def get_bitget_ws_url_private(environment: BitgetEnvironment) -> str: ...
+def bitget_extract_raw_symbol(symbol: str) -> str: ...
+def bitget_product_type_from_symbol(symbol: str) -> BitgetProductType: ...
+def bitget_bar_spec_to_interval(aggregation: int, step: int) -> str: ...
+
+class BitgetRawHttpClient:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+        api_passphrase: str | None = None,
+        base_url: str | None = None,
+        timeout_secs: int = 60,
+        proxy_url: str | None = None,
+    ) -> None: ...
+    def cancel_all_requests(self) -> None: ...
+
+class BitgetHttpClient:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+        api_passphrase: str | None = None,
+        base_url: str | None = None,
+        timeout_secs: int = 60,
+        proxy_url: str | None = None,
+    ) -> None: ...
+    async def request_instruments(
+        self,
+        product_type: BitgetProductType,
+        ts_init_ns: int | None = None,
+    ) -> list[Instrument]: ...
+    async def request_orderbook_snapshot(
+        self,
+        product_type: BitgetProductType,
+        instrument: Instrument,
+        limit: int | None = None,
+        ts_init_ns: int | None = None,
+    ) -> OrderBookDeltas: ...
+    async def request_trades(
+        self,
+        product_type: BitgetProductType,
+        instrument: Instrument,
+        start: dt.datetime | None = None,
+        end: dt.datetime | None = None,
+        limit: int | None = None,
+    ) -> list[TradeTick]: ...
+    async def request_funding_rates(
+        self,
+        product_type: BitgetProductType,
+        instrument: Instrument,
+        start: dt.datetime | None = None,
+        end: dt.datetime | None = None,
+        limit: int | None = None,
+    ) -> list[FundingRateUpdate]: ...
+    async def request_account_state(
+        self,
+        product_type: BitgetProductType,
+        account_id: AccountId,
+        ts_init_ns: int | None = None,
+    ) -> AccountState: ...
+    async def request_order_status_report(
+        self,
+        account_id: AccountId,
+        product_type: BitgetProductType,
+        instrument: Instrument,
+        venue_order_id: str | None = None,
+        client_order_id: str | None = None,
+        ts_init_ns: int | None = None,
+    ) -> OrderStatusReport: ...
+    async def request_order_status_reports(
+        self,
+        account_id: AccountId,
+        product_type: BitgetProductType,
+        instrument: Instrument,
+        open_only: bool = False,
+        start: dt.datetime | None = None,
+        end: dt.datetime | None = None,
+        limit: int | None = None,
+        ts_init_ns: int | None = None,
+    ) -> list[OrderStatusReport]: ...
+    async def request_fill_reports(
+        self,
+        account_id: AccountId,
+        product_type: BitgetProductType,
+        instrument: Instrument,
+        start: dt.datetime | None = None,
+        end: dt.datetime | None = None,
+        limit: int | None = None,
+        ts_init_ns: int | None = None,
+    ) -> list[FillReport]: ...
+    async def request_position_status_reports(
+        self,
+        account_id: AccountId,
+        product_type: BitgetProductType,
+        instrument: Instrument,
+        ts_init_ns: int | None = None,
+    ) -> list[PositionStatusReport]: ...
+
+class BitgetInstrumentProviderConfig:
+    def __init__(
+        self,
+        product_type: BitgetProductType | None = None,
+        include_inactive: bool | None = None,
+    ) -> None: ...
+
+class BitgetDataClientConfig:
+    def __init__(
+        self,
+        product_type: BitgetProductType | None = None,
+        environment: BitgetEnvironment | None = None,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+        api_passphrase: str | None = None,
+        base_url_http: str | None = None,
+        base_url_ws_public: str | None = None,
+        base_url_ws_private: str | None = None,
+        proxy_url: str | None = None,
+        http_timeout_secs: int | None = None,
+        max_retries: int | None = None,
+        retry_delay_initial_ms: int | None = None,
+        retry_delay_max_ms: int | None = None,
+        heartbeat_interval_secs: int | None = None,
+        update_instruments_interval_mins: int | None = None,
+        instrument_poll_interval_secs: int | None = None,
+    ) -> None: ...
+
+class BitgetExecClientConfig:
+    def __init__(
+        self,
+        product_type: BitgetProductType | None = None,
+        environment: BitgetEnvironment | None = None,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+        api_passphrase: str | None = None,
+        base_url_http: str | None = None,
+        base_url_ws_private: str | None = None,
+        proxy_url: str | None = None,
+        http_timeout_secs: int | None = None,
+        max_retries: int | None = None,
+        retry_delay_initial_ms: int | None = None,
+        retry_delay_max_ms: int | None = None,
+        heartbeat_interval_secs: int | None = None,
+        account_id: AccountId | None = None,
+        ignore_uncached_instrument_executions: bool | None = None,
+        reconnect_reconciliation_lookback_mins: int | None = 60,
+    ) -> None: ...
+
+class BitgetDataClientFactory:
+    def __init__(self) -> None: ...
+    def name(self) -> str: ...
+
+class BitgetExecutionClientFactory:
+    def __init__(self, trader_id: TraderId, account_id: AccountId) -> None: ...
+    def name(self) -> str: ...
+
+class BitgetWebSocketClient:
+    def __init__(
+        self,
+        product_type: BitgetProductType = ...,
+        environment: BitgetEnvironment = ...,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+        api_passphrase: str | None = None,
+        url: str | None = None,
+        private: bool = False,
+        heartbeat_secs: int = 30,
+        proxy_url: str | None = None,
+    ) -> None: ...
+    @staticmethod
+    def new_public(
+        product_type: BitgetProductType = ...,
+        environment: BitgetEnvironment = ...,
+        url: str | None = None,
+        heartbeat_secs: int = 30,
+        proxy_url: str | None = None,
+    ) -> BitgetWebSocketClient: ...
+    @staticmethod
+    def new_private(
+        product_type: BitgetProductType = ...,
+        environment: BitgetEnvironment = ...,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+        api_passphrase: str | None = None,
+        url: str | None = None,
+        heartbeat_secs: int = 30,
+        proxy_url: str | None = None,
+    ) -> BitgetWebSocketClient: ...
+    @property
+    def url(self) -> str: ...
+    def is_active(self) -> bool: ...
+    def is_closed(self) -> bool: ...
+    async def connect(self) -> None: ...
+    async def wait_until_active(self, timeout_secs: float = 5.0) -> None: ...
+    async def disconnect(self) -> None: ...
+    async def close(self) -> None: ...
+    async def subscription_count(self) -> int: ...
+    async def send_text(self, payload: str) -> None: ...
+    async def next_event(self) -> dict[str, Any] | None: ...
+    async def subscribe_ticker(self, raw_symbol: str) -> None: ...
+    async def subscribe_trades(self, raw_symbol: str) -> None: ...
+    async def subscribe_books(self, raw_symbol: str) -> None: ...
+    async def subscribe_candles(self, raw_symbol: str, interval: str) -> None: ...
+    async def subscribe_account(self, coin: str | None = None) -> None: ...
+    async def subscribe_orders(self) -> None: ...
+    async def subscribe_fills(self) -> None: ...
+    async def subscribe_positions(self) -> None: ...
+    async def subscribe_strategy_orders(self) -> None: ...
+
 # BitMEX
 
 class BitmexEnvironment(Enum):

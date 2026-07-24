@@ -41,6 +41,7 @@ extension-module = [
   "nautilus-backtest/extension-module",
   "nautilus-betfair?/extension-module",
   "nautilus-binance/extension-module",
+  "nautilus-bitget/extension-module",
   "nautilus-bitmex/extension-module",
   "nautilus-coinbase/extension-module",
   "nautilus-blockchain?/extension-module",
@@ -85,6 +86,7 @@ high-precision = [
   "nautilus-serialization/high-precision",
   "nautilus-betfair?/high-precision",
   "nautilus-binance/high-precision",
+  "nautilus-bitget/high-precision",
   "nautilus-bitmex/high-precision",
   "nautilus-coinbase/high-precision",
   "nautilus-bybit/high-precision",
@@ -140,6 +142,7 @@ nautilus-trading = { workspace = true, features = ["python"] }
 nautilus-architect-ax = { workspace = true, features = ["python"] }
 nautilus-betfair = { workspace = true, optional = true }
 nautilus-binance = { workspace = true, features = ["python"] }
+nautilus-bitget = { workspace = true, features = ["python"] }
 nautilus-bitmex = { workspace = true, features = ["python"] }
 nautilus-blockchain = { workspace = true, features = [
   "python",
