@@ -46,7 +46,7 @@ use crate::common::{
         BITGET_MIX_ORDER_DETAIL_ENDPOINT, BITGET_MIX_ORDER_FILLS_ENDPOINT,
         BITGET_MIX_ORDERS_HISTORY_ENDPOINT, BITGET_MIX_ORDERS_PENDING_ENDPOINT,
         BITGET_MIX_PLACE_ORDER_ENDPOINT, BITGET_MIX_PLACE_PLAN_ORDER_ENDPOINT,
-        BITGET_MIX_SINGLE_POSITION_ENDPOINT, BITGET_REST_QUOTA,
+        BITGET_MIX_SINGLE_POSITION_ENDPOINT, BITGET_PAPTRADING_HEADER, BITGET_REST_QUOTA,
         BITGET_SPOT_ACCOUNT_ASSETS_ENDPOINT, BITGET_SPOT_BATCH_CANCEL_ORDER_ENDPOINT,
         BITGET_SPOT_CANCEL_ORDER_ENDPOINT, BITGET_SPOT_CANCEL_SYMBOL_ORDER_ENDPOINT,
         BITGET_SPOT_FILLS_ENDPOINT, BITGET_SPOT_HISTORY_ORDERS_ENDPOINT,
@@ -120,6 +120,7 @@ struct BitgetFillPage {
 #[derive(Clone)]
 pub struct BitgetRawHttpClient {
     base_url: String,
+    environment: BitgetEnvironment,
     client: HttpClient,
     credential: Option<Credential>,
     cancellation_token: Arc<std::sync::Mutex<CancellationToken>>,
@@ -135,6 +136,7 @@ impl Debug for BitgetRawHttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(BitgetRawHttpClient))
             .field("base_url", &self.base_url)
+            .field("environment", &self.environment)
             .field("has_credentials", &self.credential.is_some())
             .finish()
     }
@@ -151,9 +153,28 @@ impl BitgetRawHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> Result<Self, BitgetHttpError> {
+        Self::new_with_environment(
+            BitgetEnvironment::Mainnet,
+            base_url,
+            timeout_secs,
+            proxy_url,
+        )
+    }
+
+    /// Creates a new public [`BitgetRawHttpClient`] for an environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying HTTP client cannot be created.
+    pub fn new_with_environment(
+        environment: BitgetEnvironment,
+        base_url: Option<String>,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+    ) -> Result<Self, BitgetHttpError> {
         Ok(Self {
-            base_url: base_url
-                .unwrap_or_else(|| bitget_http_base_url(BitgetEnvironment::Mainnet).to_string()),
+            base_url: base_url.unwrap_or_else(|| bitget_http_base_url(environment).to_string()),
+            environment,
             client: HttpClient::new(
                 Self::default_headers(),
                 vec![],
@@ -184,7 +205,34 @@ impl BitgetRawHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> Result<Self, BitgetHttpError> {
-        let mut client = Self::new(base_url, timeout_secs, proxy_url)?;
+        Self::with_credentials_for_environment(
+            BitgetEnvironment::Mainnet,
+            api_key,
+            api_secret,
+            api_passphrase,
+            base_url,
+            timeout_secs,
+            proxy_url,
+        )
+    }
+
+    /// Creates a new authenticated [`BitgetRawHttpClient`] for an environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying HTTP client cannot be created.
+    #[expect(clippy::too_many_arguments)]
+    pub fn with_credentials_for_environment(
+        environment: BitgetEnvironment,
+        api_key: String,
+        api_secret: String,
+        api_passphrase: String,
+        base_url: Option<String>,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+    ) -> Result<Self, BitgetHttpError> {
+        let mut client =
+            Self::new_with_environment(environment, base_url, timeout_secs, proxy_url)?;
         client.credential = Some(Credential::new(api_key, api_secret, api_passphrase));
         Ok(client)
     }
@@ -202,13 +250,39 @@ impl BitgetRawHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> Result<Self, BitgetHttpError> {
+        Self::new_with_env_for_environment(
+            BitgetEnvironment::Mainnet,
+            api_key,
+            api_secret,
+            api_passphrase,
+            base_url,
+            timeout_secs,
+            proxy_url,
+        )
+    }
+
+    /// Creates a new [`BitgetRawHttpClient`] for an environment with credential resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn new_with_env_for_environment(
+        environment: BitgetEnvironment,
+        api_key: Option<String>,
+        api_secret: Option<String>,
+        api_passphrase: Option<String>,
+        base_url: Option<String>,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+    ) -> Result<Self, BitgetHttpError> {
         match Credential::resolve(api_key, api_secret, api_passphrase) {
             Some(credential) => {
-                let mut client = Self::new(base_url, timeout_secs, proxy_url)?;
+                let mut client =
+                    Self::new_with_environment(environment, base_url, timeout_secs, proxy_url)?;
                 client.credential = Some(credential);
                 Ok(client)
             }
-            None => Self::new(base_url, timeout_secs, proxy_url),
+            None => Self::new_with_environment(environment, base_url, timeout_secs, proxy_url),
         }
     }
 
@@ -227,6 +301,14 @@ impl BitgetRawHttpClient {
             ("Content-Type".to_string(), "application/json".to_string()),
             (BITGET_LOCALE_HEADER.to_string(), "en-US".to_string()),
         ])
+    }
+
+    fn environment_headers(&self) -> HashMap<String, String> {
+        if self.environment.is_demo() {
+            HashMap::from([(BITGET_PAPTRADING_HEADER.to_string(), "1".to_string())])
+        } else {
+            HashMap::new()
+        }
     }
 
     fn rate_limiter_quotas() -> Vec<(String, Quota)> {
@@ -287,12 +369,17 @@ impl BitgetRawHttpClient {
         }
 
         let body_bytes = body.as_ref().map(|body| body.as_bytes().to_vec());
-        let headers = if authenticated {
+        let mut headers = self.environment_headers();
+        if authenticated {
             let timestamp = chrono::Utc::now().timestamp_millis().to_string();
-            self.sign_request(&timestamp, method.clone(), endpoint, query, body.as_deref())?
-        } else {
-            HashMap::new()
-        };
+            headers.extend(self.sign_request(
+                &timestamp,
+                method.clone(),
+                endpoint,
+                query,
+                body.as_deref(),
+            )?);
+        }
 
         let response = self
             .client
@@ -1129,8 +1216,32 @@ impl BitgetHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> Result<Self, BitgetHttpError> {
+        Self::new_with_environment(
+            BitgetEnvironment::Mainnet,
+            base_url,
+            timeout_secs,
+            proxy_url,
+        )
+    }
+
+    /// Creates a new public [`BitgetHttpClient`] for an environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying HTTP client cannot be created.
+    pub fn new_with_environment(
+        environment: BitgetEnvironment,
+        base_url: Option<String>,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+    ) -> Result<Self, BitgetHttpError> {
         Ok(Self {
-            raw: BitgetRawHttpClient::new(base_url, timeout_secs, proxy_url)?,
+            raw: BitgetRawHttpClient::new_with_environment(
+                environment,
+                base_url,
+                timeout_secs,
+                proxy_url,
+            )?,
         })
     }
 
@@ -1148,8 +1259,35 @@ impl BitgetHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> Result<Self, BitgetHttpError> {
+        Self::with_credentials_for_environment(
+            BitgetEnvironment::Mainnet,
+            api_key,
+            api_secret,
+            api_passphrase,
+            base_url,
+            timeout_secs,
+            proxy_url,
+        )
+    }
+
+    /// Creates a new authenticated [`BitgetHttpClient`] for an environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying HTTP client cannot be created.
+    #[expect(clippy::too_many_arguments)]
+    pub fn with_credentials_for_environment(
+        environment: BitgetEnvironment,
+        api_key: String,
+        api_secret: String,
+        api_passphrase: String,
+        base_url: Option<String>,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+    ) -> Result<Self, BitgetHttpError> {
         Ok(Self {
-            raw: BitgetRawHttpClient::with_credentials(
+            raw: BitgetRawHttpClient::with_credentials_for_environment(
+                environment,
                 api_key,
                 api_secret,
                 api_passphrase,
@@ -1173,8 +1311,35 @@ impl BitgetHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> Result<Self, BitgetHttpError> {
+        Self::new_with_env_for_environment(
+            BitgetEnvironment::Mainnet,
+            api_key,
+            api_secret,
+            api_passphrase,
+            base_url,
+            timeout_secs,
+            proxy_url,
+        )
+    }
+
+    /// Creates a new [`BitgetHttpClient`] for an environment resolving credentials from
+    /// environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn new_with_env_for_environment(
+        environment: BitgetEnvironment,
+        api_key: Option<String>,
+        api_secret: Option<String>,
+        api_passphrase: Option<String>,
+        base_url: Option<String>,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+    ) -> Result<Self, BitgetHttpError> {
         Ok(Self {
-            raw: BitgetRawHttpClient::new_with_env(
+            raw: BitgetRawHttpClient::new_with_env_for_environment(
+                environment,
                 api_key,
                 api_secret,
                 api_passphrase,
@@ -1541,8 +1706,9 @@ mod tests {
     use axum::{
         Json, Router,
         extract::State,
+        http::HeaderMap,
         response::{IntoResponse, Response},
-        routing::post,
+        routing::{get, post},
     };
     use rstest::rstest;
     use serde_json::{Value, json};
@@ -1564,10 +1730,12 @@ mod tests {
     #[derive(Clone, Default)]
     struct OrderFixtureState {
         requests: Arc<tokio::sync::Mutex<Vec<(String, Value)>>>,
+        request_headers: Arc<tokio::sync::Mutex<Vec<(String, HeaderMap)>>>,
     }
 
     async fn start_order_fixture_server(state: OrderFixtureState) -> SocketAddr {
         let router = Router::new()
+            .route("/api/v3/market/instruments", get(handle_instruments))
             .route("/api/v3/trade/place-order", post(handle_spot_place_order))
             .route("/api/v3/trade/modify-order", post(handle_mix_modify_order))
             .route("/api/v3/trade/cancel-order", post(handle_mix_cancel_order))
@@ -1586,10 +1754,34 @@ mod tests {
         addr
     }
 
+    async fn handle_instruments(
+        State(state): State<OrderFixtureState>,
+        headers: HeaderMap,
+    ) -> Response {
+        state
+            .request_headers
+            .lock()
+            .await
+            .push(("instruments".to_string(), headers));
+        Json(json!({
+            "code": "00000",
+            "msg": "success",
+            "requestTime": 1700000000000i64,
+            "data": []
+        }))
+        .into_response()
+    }
+
     async fn handle_spot_place_order(
         State(state): State<OrderFixtureState>,
+        headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Response {
+        state
+            .request_headers
+            .lock()
+            .await
+            .push(("spot_place_order".to_string(), headers));
         state
             .requests
             .lock()
@@ -1606,8 +1798,14 @@ mod tests {
 
     async fn handle_mix_modify_order(
         State(state): State<OrderFixtureState>,
+        headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Response {
+        state
+            .request_headers
+            .lock()
+            .await
+            .push(("mix_modify_order".to_string(), headers));
         state
             .requests
             .lock()
@@ -1624,8 +1822,14 @@ mod tests {
 
     async fn handle_mix_cancel_order(
         State(state): State<OrderFixtureState>,
+        headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Response {
+        state
+            .request_headers
+            .lock()
+            .await
+            .push(("mix_cancel_order".to_string(), headers));
         state
             .requests
             .lock()
@@ -1642,8 +1846,14 @@ mod tests {
 
     async fn handle_batch_cancel(
         State(state): State<OrderFixtureState>,
+        headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Response {
+        state
+            .request_headers
+            .lock()
+            .await
+            .push(("batch_cancel".to_string(), headers));
         state
             .requests
             .lock()
@@ -1663,8 +1873,14 @@ mod tests {
 
     async fn handle_cancel_all(
         State(state): State<OrderFixtureState>,
+        headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Response {
+        state
+            .request_headers
+            .lock()
+            .await
+            .push(("cancel_all".to_string(), headers));
         state
             .requests
             .lock()
@@ -1693,11 +1909,117 @@ mod tests {
         .unwrap()
     }
 
+    fn demo_authenticated_fixture_client(addr: SocketAddr) -> BitgetHttpClient {
+        BitgetHttpClient::with_credentials_for_environment(
+            BitgetEnvironment::Demo,
+            "key".to_string(),
+            "secret".to_string(),
+            "passphrase".to_string(),
+            Some(format!("http://{addr}")),
+            5,
+            None,
+        )
+        .unwrap()
+    }
+
     #[rstest]
     fn raw_client_default_uses_mainnet_url() {
         let client = BitgetRawHttpClient::default();
 
         assert!(format!("{client:?}").contains("https://api.bitget.com"));
+    }
+
+    #[tokio::test]
+    async fn demo_environment_adds_paptrading_header_to_public_rest_requests() {
+        let state = OrderFixtureState::default();
+        let addr = start_order_fixture_server(state.clone()).await;
+        let client = BitgetHttpClient::new_with_environment(
+            BitgetEnvironment::Demo,
+            Some(format!("http://{addr}")),
+            5,
+            None,
+        )
+        .unwrap();
+
+        let instruments = client
+            .request_instruments(
+                BitgetProductType::Spot,
+                UnixNanos::new(1_700_000_000_000_000_000),
+            )
+            .await
+            .unwrap();
+
+        assert!(instruments.is_empty());
+        let request_headers = state.request_headers.lock().await;
+        let headers = &request_headers[0].1;
+        assert_eq!(
+            headers
+                .get(BITGET_PAPTRADING_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn demo_environment_adds_paptrading_header_to_private_rest_requests() {
+        let state = OrderFixtureState::default();
+        let addr = start_order_fixture_server(state.clone()).await;
+        let client = demo_authenticated_fixture_client(addr);
+        let request = BitgetSubmitOrderRequest::Spot(BitgetSpotPlaceOrderRequest {
+            category: "SPOT".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            side: "buy".to_string(),
+            order_type: "limit".to_string(),
+            force: Some("gtc".to_string()),
+            price: Some("100.0".to_string()),
+            size: "0.01".to_string(),
+            client_oid: Some("C-DEMO".to_string()),
+            stp_mode: None,
+        });
+
+        client.submit_order(&request).await.unwrap();
+
+        let request_headers = state.request_headers.lock().await;
+        let headers = request_headers
+            .iter()
+            .find(|(name, _)| name == "spot_place_order")
+            .map(|(_, headers)| headers)
+            .unwrap();
+        assert_eq!(
+            headers
+                .get(BITGET_PAPTRADING_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert!(headers.get(BITGET_ACCESS_SIGN_HEADER).is_some());
+    }
+
+    #[tokio::test]
+    async fn mainnet_environment_does_not_add_paptrading_header() {
+        let state = OrderFixtureState::default();
+        let addr = start_order_fixture_server(state.clone()).await;
+        let client = authenticated_fixture_client(addr);
+        let request = BitgetSubmitOrderRequest::Spot(BitgetSpotPlaceOrderRequest {
+            category: "SPOT".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            side: "buy".to_string(),
+            order_type: "limit".to_string(),
+            force: Some("gtc".to_string()),
+            price: Some("100.0".to_string()),
+            size: "0.01".to_string(),
+            client_oid: Some("C-MAINNET".to_string()),
+            stp_mode: None,
+        });
+
+        client.submit_order(&request).await.unwrap();
+
+        let request_headers = state.request_headers.lock().await;
+        let headers = request_headers
+            .iter()
+            .find(|(name, _)| name == "spot_place_order")
+            .map(|(_, headers)| headers)
+            .unwrap();
+        assert!(headers.get(BITGET_PAPTRADING_HEADER).is_none());
     }
 
     #[rstest]

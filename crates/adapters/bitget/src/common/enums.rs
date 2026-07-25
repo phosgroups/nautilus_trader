@@ -52,9 +52,19 @@ use strum::{AsRefStr, EnumIter, EnumString};
 pub enum BitgetEnvironment {
     /// Bitget mainnet.
     Mainnet,
+    /// Bitget demo trading environment.
+    Demo,
 }
 
-/// Bitget Classic product types supported by this adapter.
+impl BitgetEnvironment {
+    /// Returns `true` if this is Bitget demo trading.
+    #[must_use]
+    pub const fn is_demo(self) -> bool {
+        matches!(self, Self::Demo)
+    }
+}
+
+/// Bitget UTA product types supported by this adapter.
 #[derive(
     Copy,
     Clone,

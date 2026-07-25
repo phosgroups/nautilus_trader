@@ -9083,6 +9083,7 @@ class OKXVipLevel(Enum):
 
 class BitgetEnvironment(Enum):
     MAINNET = "MAINNET"
+    DEMO = "DEMO"
 
 class BitgetProductType(Enum):
     SPOT = "SPOT"
@@ -9101,6 +9102,7 @@ class BitgetRawHttpClient:
         api_key: str | None = None,
         api_secret: str | None = None,
         api_passphrase: str | None = None,
+        environment: BitgetEnvironment = ...,
         base_url: str | None = None,
         timeout_secs: int = 60,
         proxy_url: str | None = None,
@@ -9113,6 +9115,7 @@ class BitgetHttpClient:
         api_key: str | None = None,
         api_secret: str | None = None,
         api_passphrase: str | None = None,
+        environment: BitgetEnvironment = ...,
         base_url: str | None = None,
         timeout_secs: int = 60,
         proxy_url: str | None = None,

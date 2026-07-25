@@ -39,6 +39,7 @@ def get_cached_bitget_http_client(
         api_key=api_key,
         api_secret=api_secret,
         api_passphrase=api_passphrase,
+        environment=environment,
         base_url=base_url,
         timeout_secs=timeout_secs or 60,
         proxy_url=proxy_url,

@@ -40,6 +40,15 @@ pub const BITGET_WS_PUBLIC_URL: &str = "wss://ws.bitget.com/v2/ws/public";
 /// Bitget private WebSocket URL.
 pub const BITGET_WS_PRIVATE_URL: &str = "wss://ws.bitget.com/v2/ws/private";
 
+/// Bitget demo public WebSocket URL.
+pub const BITGET_WS_DEMO_PUBLIC_URL: &str = "wss://wspap.bitget.com/v3/ws/public";
+
+/// Bitget demo private WebSocket URL.
+pub const BITGET_WS_DEMO_PRIVATE_URL: &str = "wss://wspap.bitget.com/v3/ws/private";
+
+/// Bitget demo trading HTTP header name.
+pub const BITGET_PAPTRADING_HEADER: &str = "paptrading";
+
 /// Bitget API key HTTP header name.
 pub const BITGET_ACCESS_KEY_HEADER: &str = "ACCESS-KEY";
 

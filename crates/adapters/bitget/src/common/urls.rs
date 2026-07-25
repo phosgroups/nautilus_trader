@@ -16,7 +16,10 @@
 //! URL helpers for Bitget API endpoints.
 
 use crate::common::{
-    consts::{BITGET_HTTP_URL, BITGET_WS_PRIVATE_URL, BITGET_WS_PUBLIC_URL},
+    consts::{
+        BITGET_HTTP_URL, BITGET_WS_DEMO_PRIVATE_URL, BITGET_WS_DEMO_PUBLIC_URL,
+        BITGET_WS_PRIVATE_URL, BITGET_WS_PUBLIC_URL,
+    },
     enums::BitgetEnvironment,
 };
 
@@ -25,6 +28,7 @@ use crate::common::{
 pub const fn bitget_http_base_url(environment: BitgetEnvironment) -> &'static str {
     match environment {
         BitgetEnvironment::Mainnet => BITGET_HTTP_URL,
+        BitgetEnvironment::Demo => BITGET_HTTP_URL,
     }
 }
 
@@ -33,6 +37,7 @@ pub const fn bitget_http_base_url(environment: BitgetEnvironment) -> &'static st
 pub const fn bitget_ws_public_url(environment: BitgetEnvironment) -> &'static str {
     match environment {
         BitgetEnvironment::Mainnet => BITGET_WS_PUBLIC_URL,
+        BitgetEnvironment::Demo => BITGET_WS_DEMO_PUBLIC_URL,
     }
 }
 
@@ -41,5 +46,6 @@ pub const fn bitget_ws_public_url(environment: BitgetEnvironment) -> &'static st
 pub const fn bitget_ws_private_url(environment: BitgetEnvironment) -> &'static str {
     match environment {
         BitgetEnvironment::Mainnet => BITGET_WS_PRIVATE_URL,
+        BitgetEnvironment::Demo => BITGET_WS_DEMO_PRIVATE_URL,
     }
 }

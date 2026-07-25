@@ -242,7 +242,8 @@ impl BitgetExecutionClient {
             core.account_type,
             core.base_currency,
         );
-        let http_client = BitgetHttpClient::new_with_env(
+        let http_client = BitgetHttpClient::new_with_env_for_environment(
+            config.environment,
             config.api_key.clone(),
             config.api_secret.clone(),
             config.api_passphrase.clone(),

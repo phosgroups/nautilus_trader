@@ -26,7 +26,7 @@ use pyo3::{conversion::IntoPyObjectExt, prelude::*, types::PyList};
 
 use crate::{
     common::{
-        enums::BitgetProductType,
+        enums::{BitgetEnvironment, BitgetProductType},
         parse::{parse_fill_report, parse_order_status_report, parse_position_status_report},
     },
     http::client::{BitgetHttpClient, BitgetRawHttpClient},
@@ -41,6 +41,7 @@ impl BitgetRawHttpClient {
         api_key = None,
         api_secret = None,
         api_passphrase = None,
+        environment = BitgetEnvironment::Mainnet,
         base_url = None,
         timeout_secs = 60,
         proxy_url = None,
@@ -49,11 +50,13 @@ impl BitgetRawHttpClient {
         api_key: Option<String>,
         api_secret: Option<String>,
         api_passphrase: Option<String>,
+        environment: BitgetEnvironment,
         base_url: Option<String>,
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> PyResult<Self> {
-        Self::new_with_env(
+        Self::new_with_env_for_environment(
+            environment,
             api_key,
             api_secret,
             api_passphrase,
@@ -80,6 +83,7 @@ impl BitgetHttpClient {
         api_key = None,
         api_secret = None,
         api_passphrase = None,
+        environment = BitgetEnvironment::Mainnet,
         base_url = None,
         timeout_secs = 60,
         proxy_url = None,
@@ -88,11 +92,13 @@ impl BitgetHttpClient {
         api_key: Option<String>,
         api_secret: Option<String>,
         api_passphrase: Option<String>,
+        environment: BitgetEnvironment,
         base_url: Option<String>,
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> PyResult<Self> {
-        Self::new_with_env(
+        Self::new_with_env_for_environment(
+            environment,
             api_key,
             api_secret,
             api_passphrase,

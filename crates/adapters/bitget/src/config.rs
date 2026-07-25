@@ -282,6 +282,32 @@ mod tests {
     }
 
     #[rstest]
+    fn demo_environment_uses_pap_websocket_urls() {
+        let data_config = BitgetDataClientConfig {
+            environment: BitgetEnvironment::Demo,
+            ..Default::default()
+        };
+        let exec_config = BitgetExecClientConfig {
+            environment: BitgetEnvironment::Demo,
+            ..Default::default()
+        };
+
+        assert_eq!(data_config.http_base_url(), "https://api.bitget.com");
+        assert_eq!(
+            data_config.ws_public_url(),
+            "wss://wspap.bitget.com/v3/ws/public"
+        );
+        assert_eq!(
+            data_config.ws_private_url(),
+            "wss://wspap.bitget.com/v3/ws/private"
+        );
+        assert_eq!(
+            exec_config.ws_private_url(),
+            "wss://wspap.bitget.com/v3/ws/private"
+        );
+    }
+
+    #[rstest]
     fn config_toml_round_trips_product_type() {
         let config: BitgetDataClientConfig = toml::from_str(
             r#"

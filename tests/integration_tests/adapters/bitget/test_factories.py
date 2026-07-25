@@ -71,6 +71,15 @@ def test_bitget_url_and_symbol_helpers():
     assert nautilus_pyo3.get_bitget_http_base_url(BitgetEnvironment.MAINNET).startswith("https://")
     assert nautilus_pyo3.get_bitget_ws_url_public(BitgetEnvironment.MAINNET).startswith("wss://")
     assert nautilus_pyo3.get_bitget_ws_url_private(BitgetEnvironment.MAINNET).startswith("wss://")
+    assert nautilus_pyo3.get_bitget_http_base_url(BitgetEnvironment.DEMO) == "https://api.bitget.com"
+    assert (
+        nautilus_pyo3.get_bitget_ws_url_public(BitgetEnvironment.DEMO)
+        == "wss://wspap.bitget.com/v3/ws/public"
+    )
+    assert (
+        nautilus_pyo3.get_bitget_ws_url_private(BitgetEnvironment.DEMO)
+        == "wss://wspap.bitget.com/v3/ws/private"
+    )
 
     assert nautilus_pyo3.bitget_extract_raw_symbol("BTCUSDT-PERP") == "BTCUSDT"
     assert (
