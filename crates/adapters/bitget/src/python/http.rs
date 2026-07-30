@@ -16,21 +16,58 @@
 //! Python bindings for the Bitget HTTP client.
 
 use chrono::{DateTime, Utc};
-use nautilus_core::{UnixNanos, python::to_pyvalue_err};
+use nautilus_core::{
+    UUID4, UnixNanos,
+    python::{params::pydict_to_params, to_pyvalue_err},
+};
 use nautilus_model::{
-    identifiers::AccountId,
+    data::BarType,
+    enums::{OrderSide, OrderType, TimeInForce, TriggerType},
+    events::OrderInitialized,
+    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     instruments::Instrument,
     python::instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
+    types::{Price, Quantity},
 };
-use pyo3::{conversion::IntoPyObjectExt, prelude::*, types::PyList};
+use pyo3::{
+    conversion::IntoPyObjectExt,
+    prelude::*,
+    types::{PyDict, PyList},
+};
 
 use crate::{
     common::{
         enums::{BitgetEnvironment, BitgetProductType},
+        order::{map_cancel_order, map_submit_order},
         parse::{parse_fill_report, parse_order_status_report, parse_position_status_report},
     },
     http::client::{BitgetHttpClient, BitgetRawHttpClient},
 };
+
+fn bitget_order_ack_to_pydict(
+    py: Python<'_>,
+    ack: crate::http::models::BitgetOrderAck,
+) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+
+    if let Some(order_id) = ack.order_id {
+        dict.set_item("order_id", order_id)?;
+    }
+
+    if let Some(client_oid) = ack.client_oid {
+        dict.set_item("client_oid", client_oid)?;
+    }
+
+    if let Some(success) = ack.success {
+        dict.set_item("success", success)?;
+    }
+
+    if let Some(msg) = ack.msg {
+        dict.set_item("msg", msg)?;
+    }
+
+    dict.into_py_any(py)
+}
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -109,6 +146,45 @@ impl BitgetHttpClient {
         .map_err(to_pyvalue_err)
     }
 
+    /// Cancels all pending HTTP requests.
+    #[pyo3(name = "cancel_all_requests")]
+    fn py_cancel_all_requests(&self) {
+        self.cancel_all_requests();
+    }
+
+    /// Checks if the HTTP client has cached instrument definitions.
+    #[pyo3(name = "is_initialized")]
+    #[must_use]
+    fn py_is_initialized(&self) -> bool {
+        self.is_initialized()
+    }
+
+    /// Returns symbols currently cached inside the HTTP client.
+    #[pyo3(name = "get_cached_symbols")]
+    #[must_use]
+    fn py_get_cached_symbols(&self) -> Vec<String> {
+        self.get_cached_symbols()
+    }
+
+    /// Caches a single pyo3 instrument for later instrument-id based requests.
+    #[pyo3(name = "cache_instrument")]
+    fn py_cache_instrument(&self, py: Python<'_>, instrument: Py<PyAny>) -> PyResult<()> {
+        let instrument = pyobject_to_instrument_any(py, instrument)?;
+        self.cache_instrument(instrument);
+        Ok(())
+    }
+
+    /// Caches pyo3 instruments for later instrument-id based requests.
+    #[pyo3(name = "cache_instruments")]
+    fn py_cache_instruments(&self, py: Python<'_>, instruments: Vec<Py<PyAny>>) -> PyResult<()> {
+        let instruments = instruments
+            .into_iter()
+            .map(|instrument| pyobject_to_instrument_any(py, instrument))
+            .collect::<PyResult<Vec<_>>>()?;
+        self.cache_instruments(&instruments);
+        Ok(())
+    }
+
     /// Requests instruments for a Bitget product type.
     #[pyo3(name = "request_instruments")]
     #[pyo3(signature = (product_type, ts_init_ns = None))]
@@ -126,6 +202,7 @@ impl BitgetHttpClient {
                 .request_instruments(product_type, ts_init)
                 .await
                 .map_err(to_pyvalue_err)?;
+            client.cache_instruments(&instruments);
 
             Python::attach(|py| {
                 let py_instruments: Vec<Py<PyAny>> = instruments
@@ -139,17 +216,19 @@ impl BitgetHttpClient {
 
     /// Requests an order book snapshot and returns Nautilus order book deltas.
     #[pyo3(name = "request_orderbook_snapshot")]
-    #[pyo3(signature = (product_type, instrument, limit = None, ts_init_ns = None))]
+    #[pyo3(signature = (product_type, instrument_id, limit = None, ts_init_ns = None))]
     fn py_request_orderbook_snapshot<'py>(
         &self,
         py: Python<'py>,
         product_type: BitgetProductType,
-        instrument: Py<PyAny>,
+        instrument_id: InstrumentId,
         limit: Option<u32>,
         ts_init_ns: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
-        let instrument = pyobject_to_instrument_any(py, instrument)?;
+        let instrument = client
+            .instrument_from_cache_by_id(instrument_id)
+            .map_err(to_pyvalue_err)?;
         let ts_init = ts_init_ns.map(UnixNanos::from).unwrap_or_default();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -164,18 +243,20 @@ impl BitgetHttpClient {
 
     /// Requests public market trades and returns Nautilus trade ticks.
     #[pyo3(name = "request_trades")]
-    #[pyo3(signature = (product_type, instrument, start = None, end = None, limit = None))]
+    #[pyo3(signature = (product_type, instrument_id, start = None, end = None, limit = None))]
     fn py_request_trades<'py>(
         &self,
         py: Python<'py>,
         product_type: BitgetProductType,
-        instrument: Py<PyAny>,
+        instrument_id: InstrumentId,
         start: Option<DateTime<Utc>>,
         end: Option<DateTime<Utc>>,
         limit: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
-        let instrument = pyobject_to_instrument_any(py, instrument)?;
+        let instrument = client
+            .instrument_from_cache_by_id(instrument_id)
+            .map_err(to_pyvalue_err)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let trades = client
@@ -195,18 +276,20 @@ impl BitgetHttpClient {
 
     /// Requests historical funding rates and returns Nautilus funding updates.
     #[pyo3(name = "request_funding_rates")]
-    #[pyo3(signature = (product_type, instrument, start = None, end = None, limit = None))]
+    #[pyo3(signature = (product_type, instrument_id, start = None, end = None, limit = None))]
     fn py_request_funding_rates<'py>(
         &self,
         py: Python<'py>,
         product_type: BitgetProductType,
-        instrument: Py<PyAny>,
+        instrument_id: InstrumentId,
         start: Option<DateTime<Utc>>,
         end: Option<DateTime<Utc>>,
         limit: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
-        let instrument = pyobject_to_instrument_any(py, instrument)?;
+        let instrument = client
+            .instrument_from_cache_by_id(instrument_id)
+            .map_err(to_pyvalue_err)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let rates = client
@@ -218,6 +301,56 @@ impl BitgetHttpClient {
                 let py_rates: PyResult<Vec<_>> =
                     rates.into_iter().map(|rate| rate.into_py_any(py)).collect();
                 Ok(PyList::new(py, py_rates?)?.into_any().unbind())
+            })
+        })
+    }
+
+    /// Requests historical bars and returns Nautilus bars.
+    #[pyo3(name = "request_bars")]
+    #[pyo3(signature = (
+        product_type,
+        instrument_id,
+        bar_type,
+        start = None,
+        end = None,
+        limit = None,
+        timestamp_on_close = false,
+    ))]
+    #[expect(clippy::too_many_arguments)]
+    fn py_request_bars<'py>(
+        &self,
+        py: Python<'py>,
+        product_type: BitgetProductType,
+        instrument_id: InstrumentId,
+        bar_type: BarType,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<u32>,
+        timestamp_on_close: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let instrument = client
+            .instrument_from_cache_by_id(instrument_id)
+            .map_err(to_pyvalue_err)?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let bars = client
+                .request_bars(
+                    product_type,
+                    &instrument,
+                    bar_type,
+                    start,
+                    end,
+                    limit,
+                    timestamp_on_close,
+                )
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let py_bars: PyResult<Vec<_>> =
+                    bars.into_iter().map(|bar| bar.into_py_any(py)).collect();
+                Ok(PyList::new(py, py_bars?)?.into_any().unbind())
             })
         })
     }
@@ -250,7 +383,7 @@ impl BitgetHttpClient {
     #[pyo3(signature = (
         account_id,
         product_type,
-        instrument,
+        instrument_id,
         venue_order_id = None,
         client_order_id = None,
         ts_init_ns = None,
@@ -261,21 +394,23 @@ impl BitgetHttpClient {
         py: Python<'py>,
         account_id: AccountId,
         product_type: BitgetProductType,
-        instrument: Py<PyAny>,
+        instrument_id: InstrumentId,
         venue_order_id: Option<String>,
         client_order_id: Option<String>,
         ts_init_ns: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
-        let instrument = pyobject_to_instrument_any(py, instrument)?;
-        let instrument_id = instrument.id();
+        let instrument = client
+            .instrument_from_cache_by_id(instrument_id)
+            .map_err(to_pyvalue_err)?;
+        let cached_instrument_id = instrument.id();
         let ts_init = ts_init_ns.map(UnixNanos::from).unwrap_or_default();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let status = client
                 .request_order_status(
                     product_type,
-                    instrument_id,
+                    cached_instrument_id,
                     venue_order_id.as_deref(),
                     client_order_id.as_deref(),
                 )
@@ -293,7 +428,7 @@ impl BitgetHttpClient {
     #[pyo3(signature = (
         account_id,
         product_type,
-        instrument,
+        instrument_id,
         open_only = false,
         start = None,
         end = None,
@@ -306,7 +441,7 @@ impl BitgetHttpClient {
         py: Python<'py>,
         account_id: AccountId,
         product_type: BitgetProductType,
-        instrument: Py<PyAny>,
+        instrument_id: InstrumentId,
         open_only: bool,
         start: Option<DateTime<Utc>>,
         end: Option<DateTime<Utc>>,
@@ -314,15 +449,17 @@ impl BitgetHttpClient {
         ts_init_ns: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
-        let instrument = pyobject_to_instrument_any(py, instrument)?;
-        let instrument_id = instrument.id();
+        let instrument = client
+            .instrument_from_cache_by_id(instrument_id)
+            .map_err(to_pyvalue_err)?;
+        let cached_instrument_id = instrument.id();
         let ts_init = ts_init_ns.map(UnixNanos::from).unwrap_or_default();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let rows = client
                 .request_order_statuses(
                     product_type,
-                    Some(instrument_id),
+                    Some(cached_instrument_id),
                     start,
                     end,
                     open_only,
@@ -350,7 +487,7 @@ impl BitgetHttpClient {
     #[pyo3(signature = (
         account_id,
         product_type,
-        instrument,
+        instrument_id,
         start = None,
         end = None,
         limit = None,
@@ -362,20 +499,22 @@ impl BitgetHttpClient {
         py: Python<'py>,
         account_id: AccountId,
         product_type: BitgetProductType,
-        instrument: Py<PyAny>,
+        instrument_id: InstrumentId,
         start: Option<DateTime<Utc>>,
         end: Option<DateTime<Utc>>,
         limit: Option<u32>,
         ts_init_ns: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
-        let instrument = pyobject_to_instrument_any(py, instrument)?;
-        let instrument_id = instrument.id();
+        let instrument = client
+            .instrument_from_cache_by_id(instrument_id)
+            .map_err(to_pyvalue_err)?;
+        let cached_instrument_id = instrument.id();
         let ts_init = ts_init_ns.map(UnixNanos::from).unwrap_or_default();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let rows = client
-                .request_fills(product_type, Some(instrument_id), start, end, limit)
+                .request_fills(product_type, Some(cached_instrument_id), start, end, limit)
                 .await
                 .map_err(to_pyvalue_err)?;
 
@@ -395,23 +534,25 @@ impl BitgetHttpClient {
 
     /// Requests position status reports for one instrument.
     #[pyo3(name = "request_position_status_reports")]
-    #[pyo3(signature = (account_id, product_type, instrument, ts_init_ns = None))]
+    #[pyo3(signature = (account_id, product_type, instrument_id, ts_init_ns = None))]
     fn py_request_position_status_reports<'py>(
         &self,
         py: Python<'py>,
         account_id: AccountId,
         product_type: BitgetProductType,
-        instrument: Py<PyAny>,
+        instrument_id: InstrumentId,
         ts_init_ns: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
-        let instrument = pyobject_to_instrument_any(py, instrument)?;
-        let instrument_id = instrument.id();
+        let instrument = client
+            .instrument_from_cache_by_id(instrument_id)
+            .map_err(to_pyvalue_err)?;
+        let cached_instrument_id = instrument.id();
         let ts_init = ts_init_ns.map(UnixNanos::from).unwrap_or_default();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let rows = client
-                .request_positions(product_type, Some(instrument_id))
+                .request_positions(product_type, Some(cached_instrument_id))
                 .await
                 .map_err(to_pyvalue_err)?;
 
@@ -426,6 +567,146 @@ impl BitgetHttpClient {
                     .collect();
                 Ok(PyList::new(py, py_reports?)?.into_any().unbind())
             })
+        })
+    }
+
+    /// Submits an order through Bitget REST using Nautilus domain types.
+    #[pyo3(name = "submit_order")]
+    #[pyo3(signature = (
+        product_type,
+        trader_id,
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        order_side,
+        order_type,
+        quantity,
+        time_in_force,
+        price = None,
+        trigger_price = None,
+        trigger_type = None,
+        post_only = false,
+        reduce_only = false,
+        quote_quantity = false,
+        params = None,
+        ts_event_ns = None,
+        ts_init_ns = None,
+    ))]
+    #[expect(clippy::too_many_arguments)]
+    fn py_submit_order<'py>(
+        &self,
+        py: Python<'py>,
+        product_type: BitgetProductType,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        quantity: Quantity,
+        time_in_force: TimeInForce,
+        price: Option<Price>,
+        trigger_price: Option<Price>,
+        trigger_type: Option<TriggerType>,
+        post_only: bool,
+        reduce_only: bool,
+        quote_quantity: bool,
+        params: Option<Py<PyDict>>,
+        ts_event_ns: Option<u64>,
+        ts_init_ns: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let params = match params.as_ref() {
+            Some(dict) => pydict_to_params(py, dict)?,
+            None => None,
+        };
+        let client = self.clone();
+        let ts_event = ts_event_ns.map(UnixNanos::from).unwrap_or_default();
+        let ts_init = ts_init_ns.map(UnixNanos::from).unwrap_or(ts_event);
+        let order_init = OrderInitialized::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            order_side,
+            order_type,
+            quantity,
+            time_in_force,
+            post_only,
+            reduce_only,
+            quote_quantity,
+            false,
+            UUID4::new(),
+            ts_event,
+            ts_init,
+            price,
+            trigger_price,
+            trigger_type,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let request =
+            map_submit_order(product_type, &order_init, params.as_ref()).map_err(to_pyvalue_err)?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let ack = client
+                .submit_order(&request)
+                .await
+                .map_err(to_pyvalue_err)?;
+            Python::attach(|py| bitget_order_ack_to_pydict(py, ack))
+        })
+    }
+
+    /// Cancels an order through Bitget REST using Nautilus domain identifiers.
+    #[pyo3(name = "cancel_order")]
+    #[pyo3(signature = (
+        product_type,
+        instrument_id,
+        client_order_id,
+        venue_order_id = None,
+        params = None,
+    ))]
+    fn py_cancel_order<'py>(
+        &self,
+        py: Python<'py>,
+        product_type: BitgetProductType,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        venue_order_id: Option<VenueOrderId>,
+        params: Option<Py<PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let params = match params.as_ref() {
+            Some(dict) => pydict_to_params(py, dict)?,
+            None => None,
+        };
+        let client = self.clone();
+        let request = map_cancel_order(
+            product_type,
+            instrument_id,
+            client_order_id,
+            venue_order_id,
+            params.as_ref(),
+        )
+        .map_err(to_pyvalue_err)?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let ack = client
+                .cancel_order(&request)
+                .await
+                .map_err(to_pyvalue_err)?;
+            Python::attach(|py| bitget_order_ack_to_pydict(py, ack))
         })
     }
 }

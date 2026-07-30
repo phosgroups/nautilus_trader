@@ -25,6 +25,32 @@ use crate::{
     websocket::error::BitgetWsError,
 };
 
+/// Deserializes Bitget WebSocket event codes.
+///
+/// Official Bitget exchange WebSocket docs define `code` as a string and show `"0"` for login
+/// success. The demo/PAP gateway has been observed returning integer `0`; normalize integer codes
+/// to the documented string form while rejecting unrelated JSON types.
+fn deserialize_optional_code<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+
+    match value {
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(Value::Number(value)) if value.is_i64() || value.is_u64() => {
+            Ok(Some(value.to_string()))
+        }
+        Some(Value::Number(value)) => Err(serde::de::Error::custom(format!(
+            "expected Bitget code as a string or integer, got {value}",
+        ))),
+        Some(Value::Null) | None => Ok(None),
+        Some(value) => Err(serde::de::Error::custom(format!(
+            "expected Bitget code as a string or integer, got {value}",
+        ))),
+    }
+}
+
 /// Bitget WebSocket operation.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -187,7 +213,7 @@ pub struct BitgetWsEvent<T> {
     #[serde(default)]
     pub data: Vec<T>,
     /// Optional error code.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_code")]
     pub code: Option<String>,
     /// Optional error message.
     #[serde(default)]
@@ -747,6 +773,39 @@ mod tests {
         let msg = BitgetWsMessage::parse_text(raw).unwrap();
 
         assert!(matches!(msg, BitgetWsMessage::Subscribe(_)));
+    }
+
+    #[rstest]
+    fn login_ack_parses_documented_string_success_code() {
+        let raw = r#"{"event":"login","code":"0","msg":""}"#;
+
+        let msg = BitgetWsMessage::parse_text(raw).unwrap();
+
+        assert!(msg.is_login_success());
+        assert_eq!(
+            msg.event().and_then(|event| event.code.as_deref()),
+            Some("0"),
+        );
+    }
+
+    #[rstest]
+    fn login_ack_normalizes_demo_integer_success_code() {
+        let raw = r#"{"event":"login","code":0,"msg":""}"#;
+
+        let msg = BitgetWsMessage::parse_text(raw).unwrap();
+
+        assert!(msg.is_login_success());
+        assert_eq!(
+            msg.event().and_then(|event| event.code.as_deref()),
+            Some("0"),
+        );
+    }
+
+    #[rstest]
+    fn login_ack_rejects_non_code_json_types() {
+        let raw = r#"{"event":"login","code":true,"msg":""}"#;
+
+        assert!(BitgetWsMessage::parse_text(raw).is_err());
     }
 
     #[rstest]

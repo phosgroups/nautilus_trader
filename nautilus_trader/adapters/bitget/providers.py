@@ -57,6 +57,7 @@ class BitgetInstrumentProvider(InstrumentProvider):
         self._log.info(f"Loading all Bitget instruments{filters_str}")
 
         all_pyo3_instruments = await self._client.request_instruments(self._product_type)
+        self._client.cache_instruments(all_pyo3_instruments)
         self._instruments_pyo3 = all_pyo3_instruments
         instruments = instruments_from_pyo3(all_pyo3_instruments)
         for instrument in instruments:
@@ -67,7 +68,36 @@ class BitgetInstrumentProvider(InstrumentProvider):
         instrument_ids: list[InstrumentId],
         filters: dict | None = None,
     ) -> None:
+        if not instrument_ids:
+            self._log.warning("No instrument IDs given for loading")
+            return
+
+        existing_instruments = dict(self._instruments)
+        existing_pyo3_by_id = {
+            str(instrument.id): instrument for instrument in self._instruments_pyo3
+        }
+
         await self.load_all_async(filters=filters)
+
+        instrument_ids_set = set(instrument_ids)
+        self._instruments = {
+            instrument_id: instrument
+            for instrument_id, instrument in self._instruments.items()
+            if instrument_id in instrument_ids_set
+        }
+
+        for instrument_id, instrument in existing_instruments.items():
+            self._instruments.setdefault(instrument_id, instrument)
+
+        loaded_pyo3_by_id = dict(existing_pyo3_by_id)
+        loaded_pyo3_by_id.update(
+            {str(instrument.id): instrument for instrument in self._instruments_pyo3},
+        )
+        self._instruments_pyo3 = [
+            loaded_pyo3_by_id[instrument_id.value]
+            for instrument_id in self._instruments
+            if instrument_id.value in loaded_pyo3_by_id
+        ]
 
         for instrument_id in instrument_ids:
             if self.find(instrument_id) is None:

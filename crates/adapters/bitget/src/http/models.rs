@@ -15,7 +15,7 @@
 
 //! Data transfer objects for Bitget REST responses.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Bitget decimal fields are normally returned as strings, but some market-data payloads have
 /// historically used JSON numbers. Keep the raw value lossless enough for model parsing.
@@ -45,8 +45,17 @@ impl BitgetDecimalValue {
     }
 }
 
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    let value = Option::<T>::deserialize(deserializer)?;
+    Ok(value.unwrap_or_default())
+}
+
 /// Bitget REST response envelope.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BitgetResponse<T> {
     /// Bitget response code (`00000` indicates success).
@@ -54,11 +63,39 @@ pub struct BitgetResponse<T> {
     /// Response message.
     pub msg: String,
     /// Server request time in milliseconds.
-    #[serde(default)]
     pub request_time: Option<i64>,
     /// Response payload.
-    #[serde(default)]
     pub data: T,
+}
+
+impl<'de, T> Deserialize<'de> for BitgetResponse<T>
+where
+    T: Deserialize<'de> + Default,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Envelope<T> {
+            code: String,
+            msg: String,
+            #[serde(default)]
+            request_time: Option<i64>,
+            #[serde(default)]
+            data: Option<T>,
+        }
+
+        let envelope = Envelope::deserialize(deserializer)?;
+
+        Ok(Self {
+            code: envelope.code,
+            msg: envelope.msg,
+            request_time: envelope.request_time,
+            data: envelope.data.unwrap_or_default(),
+        })
+    }
 }
 
 impl<T> BitgetResponse<T> {
@@ -628,7 +665,7 @@ pub struct BitgetFill {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BitgetFillList {
-    #[serde(default, rename = "list")]
+    #[serde(default, rename = "list", deserialize_with = "null_as_default")]
     pub fill_list: Vec<BitgetFill>,
     #[serde(default, rename = "cursor")]
     pub end_id: Option<String>,
@@ -776,7 +813,7 @@ pub struct BitgetOrderStatus {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BitgetOrderStatusList {
-    #[serde(default, rename = "list")]
+    #[serde(default, rename = "list", deserialize_with = "null_as_default")]
     pub entrusted_list: Vec<BitgetOrderStatus>,
     #[serde(default, rename = "cursor")]
     pub end_id: Option<String>,
@@ -887,7 +924,7 @@ impl BitgetUtaAccount {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BitgetMixPositionList {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub list: Vec<BitgetMixPosition>,
 }
 
@@ -1140,6 +1177,21 @@ mod tests {
     }
 
     #[rstest]
+    fn parses_null_order_ack_envelope_as_default() {
+        let raw = r#"{
+            "code":"00000",
+            "msg":"success",
+            "requestTime":1700000000000,
+            "data":null
+        }"#;
+
+        let response: BitgetOrderAckResponse = serde_json::from_str(raw).unwrap();
+
+        assert!(response.is_success());
+        assert_eq!(response.data, BitgetOrderAck::default());
+    }
+
+    #[rstest]
     fn parses_uta_cancel_batch_response_envelope() {
         let raw = r#"{
             "code":"00000",
@@ -1224,6 +1276,38 @@ mod tests {
     }
 
     #[rstest]
+    fn parses_null_order_status_list_envelope_as_empty() {
+        let raw = r#"{
+            "code":"00000",
+            "msg":"success",
+            "requestTime":1700000000000,
+            "data":null
+        }"#;
+
+        let response: BitgetOrderStatusListResponse = serde_json::from_str(raw).unwrap();
+
+        assert!(response.is_success());
+        assert!(response.data.entrusted_list.is_empty());
+        assert!(response.data.end_id.is_none());
+    }
+
+    #[rstest]
+    fn parses_null_order_status_inner_list_as_empty() {
+        let raw = r#"{
+            "code":"00000",
+            "msg":"success",
+            "requestTime":1700000000000,
+            "data":{"list":null,"cursor":null}
+        }"#;
+
+        let response: BitgetOrderStatusListResponse = serde_json::from_str(raw).unwrap();
+
+        assert!(response.is_success());
+        assert!(response.data.entrusted_list.is_empty());
+        assert!(response.data.end_id.is_none());
+    }
+
+    #[rstest]
     fn parses_spot_fills_envelope() {
         let raw = r#"{
             "code":"00000",
@@ -1252,6 +1336,21 @@ mod tests {
             Some(BitgetFillFeeDetail::List(_))
         ));
         assert_eq!(response.data[0].trade_scope.as_deref(), Some("maker"));
+    }
+
+    #[rstest]
+    fn parses_null_spot_fills_envelope_as_empty_vec() {
+        let raw = r#"{
+            "code":"00000",
+            "msg":"success",
+            "requestTime":1700000000000,
+            "data":null
+        }"#;
+
+        let response: BitgetFillsResponse = serde_json::from_str(raw).unwrap();
+
+        assert!(response.is_success());
+        assert!(response.data.is_empty());
     }
 
     #[rstest]
@@ -1285,6 +1384,38 @@ mod tests {
             response.data.fill_list[0].fee_detail,
             Some(BitgetFillFeeDetail::List(_))
         ));
+    }
+
+    #[rstest]
+    fn parses_null_fill_list_envelope_as_empty() {
+        let raw = r#"{
+            "code":"00000",
+            "msg":"success",
+            "requestTime":1700000000000,
+            "data":null
+        }"#;
+
+        let response: BitgetFillListResponse = serde_json::from_str(raw).unwrap();
+
+        assert!(response.is_success());
+        assert!(response.data.fill_list.is_empty());
+        assert!(response.data.end_id.is_none());
+    }
+
+    #[rstest]
+    fn parses_null_fill_inner_list_as_empty() {
+        let raw = r#"{
+            "code":"00000",
+            "msg":"success",
+            "requestTime":1700000000000,
+            "data":{"list":null,"cursor":null}
+        }"#;
+
+        let response: BitgetFillListResponse = serde_json::from_str(raw).unwrap();
+
+        assert!(response.is_success());
+        assert!(response.data.fill_list.is_empty());
+        assert!(response.data.end_id.is_none());
     }
 
     #[rstest]
@@ -1359,5 +1490,35 @@ mod tests {
             response.data.list[0].average_open_price.as_deref(),
             Some("100.1")
         );
+    }
+
+    #[rstest]
+    fn parses_null_mix_positions_envelope_as_empty() {
+        let raw = r#"{
+            "code":"00000",
+            "msg":"success",
+            "requestTime":1700000000000,
+            "data":null
+        }"#;
+
+        let response: BitgetMixPositionsResponse = serde_json::from_str(raw).unwrap();
+
+        assert!(response.is_success());
+        assert!(response.data.list.is_empty());
+    }
+
+    #[rstest]
+    fn parses_null_mix_position_inner_list_as_empty() {
+        let raw = r#"{
+            "code":"00000",
+            "msg":"success",
+            "requestTime":1700000000000,
+            "data":{"list":null}
+        }"#;
+
+        let response: BitgetMixPositionsResponse = serde_json::from_str(raw).unwrap();
+
+        assert!(response.is_success());
+        assert!(response.data.list.is_empty());
     }
 }

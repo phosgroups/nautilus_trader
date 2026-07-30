@@ -14,6 +14,9 @@
 # -------------------------------------------------------------------------------------------------
 
 import os
+from datetime import UTC
+from datetime import datetime
+from datetime import timedelta
 
 import pytest
 
@@ -66,3 +69,59 @@ async def test_demo_private_read_only_smoke_requests_usdt_futures_account_state(
     )
 
     assert str(state.account_id) == "BITGET-DEMO"
+
+
+@pytest.mark.skipif(
+    os.getenv("BITGET_DEMO_PRIVATE_SMOKE") != "1"
+    or not os.getenv("BITGET_DEMO_API_KEY")
+    or not os.getenv("BITGET_DEMO_API_SECRET")
+    or "BITGET_DEMO_API_PASSPHRASE" not in os.environ,
+    reason=(
+        "Bitget private demo smoke requires BITGET_DEMO_PRIVATE_SMOKE=1 and "
+        "BITGET_DEMO_API_KEY/BITGET_DEMO_API_SECRET/BITGET_DEMO_API_PASSPHRASE"
+    ),
+)
+@pytest.mark.asyncio
+async def test_demo_private_read_only_smoke_requests_usdt_futures_reports():
+    client = nautilus_pyo3.BitgetHttpClient(
+        api_key=os.environ["BITGET_DEMO_API_KEY"],
+        api_secret=os.environ["BITGET_DEMO_API_SECRET"],
+        api_passphrase=os.environ["BITGET_DEMO_API_PASSPHRASE"],
+        environment=BitgetEnvironment.DEMO,
+        timeout_secs=10,
+    )
+
+    instruments = await client.request_instruments(BitgetProductType.USDT_FUTURES)
+    instrument = next(
+        (instrument for instrument in instruments if str(instrument.id) == "BTCUSDT-PERP.BITGET"),
+        None,
+    )
+    assert instrument is not None
+
+    account_id = nautilus_pyo3.AccountId("BITGET-DEMO")
+    start = datetime.now(UTC) - timedelta(minutes=60)
+
+    order_reports = await client.request_order_status_reports(
+        account_id,
+        BitgetProductType.USDT_FUTURES,
+        instrument.id,
+        open_only=False,
+        start=start,
+        limit=100,
+    )
+    fill_reports = await client.request_fill_reports(
+        account_id,
+        BitgetProductType.USDT_FUTURES,
+        instrument.id,
+        start=start,
+        limit=100,
+    )
+    position_reports = await client.request_position_status_reports(
+        account_id,
+        BitgetProductType.USDT_FUTURES,
+        instrument.id,
+    )
+
+    assert isinstance(order_reports, list)
+    assert isinstance(fill_reports, list)
+    assert isinstance(position_reports, list)

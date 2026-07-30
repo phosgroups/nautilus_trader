@@ -13,10 +13,23 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import asyncio
 from functools import lru_cache
 
+from nautilus_trader.adapters.bitget.config import BitgetDataClientConfig
+from nautilus_trader.adapters.bitget.config import BitgetExecClientConfig
+from nautilus_trader.adapters.bitget.data import BitgetDataClient
+from nautilus_trader.adapters.bitget.execution import BitgetExecutionClient
+from nautilus_trader.adapters.bitget.providers import BitgetInstrumentProvider
+from nautilus_trader.cache.cache import Cache
+from nautilus_trader.common.component import LiveClock
+from nautilus_trader.common.component import MessageBus
+from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.nautilus_pyo3 import BitgetEnvironment
+from nautilus_trader.core.nautilus_pyo3 import BitgetProductType
+from nautilus_trader.live.factories import LiveDataClientFactory
+from nautilus_trader.live.factories import LiveExecClientFactory
 
 
 @lru_cache(1)
@@ -46,5 +59,97 @@ def get_cached_bitget_http_client(
     )
 
 
-BitgetLiveDataClientFactory = nautilus_pyo3.BitgetDataClientFactory
-BitgetLiveExecClientFactory = nautilus_pyo3.BitgetExecutionClientFactory
+@lru_cache(1)
+def get_cached_bitget_instrument_provider(
+    client: nautilus_pyo3.BitgetHttpClient,
+    product_type: BitgetProductType = BitgetProductType.USDT_FUTURES,
+    config: InstrumentProviderConfig | None = None,
+) -> BitgetInstrumentProvider:
+    """
+    Cache and return a Bitget instrument provider.
+    """
+    return BitgetInstrumentProvider(
+        client=client,
+        product_type=product_type,
+        config=config,
+    )
+
+
+class BitgetLiveDataClientFactory(LiveDataClientFactory):
+    """
+    Provides a Bitget Python live data client factory.
+    """
+
+    @staticmethod
+    def create(
+        loop: asyncio.AbstractEventLoop,
+        name: str,
+        config: BitgetDataClientConfig,
+        msgbus: MessageBus,
+        cache: Cache,
+        clock: LiveClock,
+    ) -> BitgetDataClient:
+        environment = config.environment or BitgetEnvironment.MAINNET
+        client = get_cached_bitget_http_client(
+            environment=environment,
+            api_key=config.api_key,
+            api_secret=config.api_secret,
+            api_passphrase=config.api_passphrase,
+            base_url=config.base_url_http,
+            proxy_url=config.proxy_url,
+        )
+        provider = get_cached_bitget_instrument_provider(
+            client=client,
+            product_type=config.product_type,
+            config=config.instrument_provider,
+        )
+        return BitgetDataClient(
+            loop=loop,
+            client=client,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            instrument_provider=provider,
+            config=config,
+            name=name,
+        )
+
+
+class BitgetLiveExecClientFactory(LiveExecClientFactory):
+    """
+    Provides a Bitget Python live execution client factory.
+    """
+
+    @staticmethod
+    def create(
+        loop: asyncio.AbstractEventLoop,
+        name: str,
+        config: BitgetExecClientConfig,
+        msgbus: MessageBus,
+        cache: Cache,
+        clock: LiveClock,
+    ) -> BitgetExecutionClient:
+        environment = config.environment or BitgetEnvironment.MAINNET
+        client = get_cached_bitget_http_client(
+            environment=environment,
+            api_key=config.api_key,
+            api_secret=config.api_secret,
+            api_passphrase=config.api_passphrase,
+            base_url=config.base_url_http,
+            proxy_url=config.proxy_url,
+        )
+        provider = get_cached_bitget_instrument_provider(
+            client=client,
+            product_type=config.product_type,
+            config=config.instrument_provider,
+        )
+        return BitgetExecutionClient(
+            loop=loop,
+            client=client,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            instrument_provider=provider,
+            config=config,
+            name=name,
+        )

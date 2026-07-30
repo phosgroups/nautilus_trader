@@ -29,17 +29,17 @@ async def test_http_fixture_runs_public_data_key_paths(bitget_http_client):
 
     deltas = await bitget_http_client.request_orderbook_snapshot(
         BitgetProductType.USDT_FUTURES,
-        futures,
+        futures.id,
         limit=50,
     )
     trades = await bitget_http_client.request_trades(
         BitgetProductType.USDT_FUTURES,
-        futures,
+        futures.id,
         limit=10,
     )
     funding_rates = await bitget_http_client.request_funding_rates(
         BitgetProductType.USDT_FUTURES,
-        futures,
+        futures.id,
         limit=10,
     )
 
@@ -73,26 +73,26 @@ async def test_http_fixture_runs_execution_rest_report_key_paths(bitget_http_cli
     order_report = await bitget_http_client.request_order_status_report(
         pyo3_account_id,
         BitgetProductType.USDT_FUTURES,
-        futures,
+        futures.id,
         venue_order_id="O-1",
     )
     order_reports = await bitget_http_client.request_order_status_reports(
         pyo3_account_id,
         BitgetProductType.USDT_FUTURES,
-        futures,
+        futures.id,
         open_only=True,
         limit=10,
     )
     fill_reports = await bitget_http_client.request_fill_reports(
         pyo3_account_id,
         BitgetProductType.USDT_FUTURES,
-        futures,
+        futures.id,
         limit=10,
     )
     position_reports = await bitget_http_client.request_position_status_reports(
         pyo3_account_id,
         BitgetProductType.USDT_FUTURES,
-        futures,
+        futures.id,
     )
 
     assert str(spot_state.account_id) == "BITGET-001"

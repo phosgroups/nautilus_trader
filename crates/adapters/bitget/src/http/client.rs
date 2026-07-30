@@ -15,15 +15,24 @@
 
 //! Provides the HTTP client integration for the Bitget REST API.
 
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use nautilus_core::{UnixNanos, consts::NAUTILUS_USER_AGENT};
+#[cfg(feature = "python")]
+use nautilus_common::cache::InstrumentLookupError;
+use nautilus_core::{AtomicMap, UnixNanos, consts::NAUTILUS_USER_AGENT};
 use nautilus_model::{
     data::{Bar, BarType, FundingRateUpdate, OrderBookDeltas, TradeTick},
     events::AccountState,
-    identifiers::AccountId,
+    identifiers::{AccountId, InstrumentId},
     instruments::{Instrument, InstrumentAny},
 };
 use nautilus_network::{
@@ -32,6 +41,7 @@ use nautilus_network::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tokio_util::sync::CancellationToken;
+use ustr::Ustr;
 
 use super::{error::BitgetHttpError, models::BitgetResponse};
 use crate::common::{
@@ -70,7 +80,8 @@ use crate::common::{
 
 const BITGET_GLOBAL_RATE_KEY: &str = "bitget:global";
 
-fn query_string(params: Vec<(&str, String)>) -> Result<String, BitgetHttpError> {
+fn query_string(mut params: Vec<(&str, String)>) -> Result<String, BitgetHttpError> {
+    params.sort_by(|left, right| left.0.cmp(right.0).then(left.1.cmp(&right.1)));
     let query = serde_urlencoded::to_string(params)
         .map_err(|e| BitgetHttpError::ValidationError(e.to_string()))?;
     Ok(format!("?{query}"))
@@ -1192,15 +1203,31 @@ impl BitgetRawHttpClient {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bitget")
 )]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BitgetHttpClient {
     raw: BitgetRawHttpClient,
+    instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
+    cache_initialized: AtomicBool,
+}
+
+impl Clone for BitgetHttpClient {
+    fn clone(&self) -> Self {
+        let cache_initialized = AtomicBool::new(self.cache_initialized.load(Ordering::Acquire));
+
+        Self {
+            raw: self.raw.clone(),
+            instruments_cache: Arc::clone(&self.instruments_cache),
+            cache_initialized,
+        }
+    }
 }
 
 impl Default for BitgetHttpClient {
     fn default() -> Self {
         Self {
             raw: BitgetRawHttpClient::default(),
+            instruments_cache: Arc::new(AtomicMap::new()),
+            cache_initialized: AtomicBool::new(false),
         }
     }
 }
@@ -1242,6 +1269,8 @@ impl BitgetHttpClient {
                 timeout_secs,
                 proxy_url,
             )?,
+            instruments_cache: Arc::new(AtomicMap::new()),
+            cache_initialized: AtomicBool::new(false),
         })
     }
 
@@ -1295,6 +1324,8 @@ impl BitgetHttpClient {
                 timeout_secs,
                 proxy_url,
             )?,
+            instruments_cache: Arc::new(AtomicMap::new()),
+            cache_initialized: AtomicBool::new(false),
         })
     }
 
@@ -1347,6 +1378,8 @@ impl BitgetHttpClient {
                 timeout_secs,
                 proxy_url,
             )?,
+            instruments_cache: Arc::new(AtomicMap::new()),
+            cache_initialized: AtomicBool::new(false),
         })
     }
 
@@ -1354,6 +1387,57 @@ impl BitgetHttpClient {
     #[must_use]
     pub const fn raw(&self) -> &BitgetRawHttpClient {
         &self.raw
+    }
+
+    /// Cancels all pending HTTP requests.
+    pub fn cancel_all_requests(&self) {
+        self.raw.cancel_all_requests();
+    }
+
+    /// Checks if the client has cached instrument definitions.
+    #[must_use]
+    pub fn is_initialized(&self) -> bool {
+        self.cache_initialized.load(Ordering::Acquire)
+    }
+
+    /// Returns a snapshot of all instrument symbols currently held in the cache.
+    #[must_use]
+    pub fn get_cached_symbols(&self) -> Vec<String> {
+        self.instruments_cache
+            .load()
+            .keys()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// Caches a single instrument by both Nautilus and venue raw symbols.
+    pub fn cache_instrument(&self, instrument: InstrumentAny) {
+        self.instruments_cache.rcu(|cache| {
+            cache.insert(instrument.id().symbol.inner(), instrument.clone());
+            cache.insert(instrument.raw_symbol().inner(), instrument.clone());
+        });
+        self.cache_initialized.store(true, Ordering::Release);
+    }
+
+    /// Caches multiple instruments by both Nautilus and venue raw symbols.
+    pub fn cache_instruments(&self, instruments: &[InstrumentAny]) {
+        self.instruments_cache.rcu(|cache| {
+            for instrument in instruments {
+                cache.insert(instrument.id().symbol.inner(), instrument.clone());
+                cache.insert(instrument.raw_symbol().inner(), instrument.clone());
+            }
+        });
+        self.cache_initialized.store(true, Ordering::Release);
+    }
+
+    #[cfg(feature = "python")]
+    pub(crate) fn instrument_from_cache_by_id(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<InstrumentAny> {
+        self.instruments_cache
+            .get_cloned(&instrument_id.symbol.inner())
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id).into())
     }
 
     /// Requests instruments for the configured Bitget product type.
@@ -1622,7 +1706,7 @@ impl BitgetHttpClient {
     pub async fn request_order_status(
         &self,
         product_type: BitgetProductType,
-        instrument_id: nautilus_model::identifiers::InstrumentId,
+        instrument_id: InstrumentId,
         venue_order_id: Option<&str>,
         client_order_id: Option<&str>,
     ) -> Result<super::models::BitgetOrderStatus, BitgetHttpError> {
@@ -1640,7 +1724,7 @@ impl BitgetHttpClient {
     pub async fn request_order_statuses(
         &self,
         product_type: BitgetProductType,
-        instrument_id: Option<nautilus_model::identifiers::InstrumentId>,
+        instrument_id: Option<InstrumentId>,
         start: Option<DateTime<Utc>>,
         end: Option<DateTime<Utc>>,
         open_only: bool,
@@ -1667,7 +1751,7 @@ impl BitgetHttpClient {
     pub async fn request_fills(
         &self,
         product_type: BitgetProductType,
-        instrument_id: Option<nautilus_model::identifiers::InstrumentId>,
+        instrument_id: Option<InstrumentId>,
         start: Option<DateTime<Utc>>,
         end: Option<DateTime<Utc>>,
         limit: Option<u32>,
@@ -1686,7 +1770,7 @@ impl BitgetHttpClient {
     pub async fn request_positions(
         &self,
         product_type: BitgetProductType,
-        instrument_id: Option<nautilus_model::identifiers::InstrumentId>,
+        instrument_id: Option<InstrumentId>,
     ) -> Result<Vec<super::models::BitgetMixPosition>, BitgetHttpError> {
         if product_type == BitgetProductType::Spot {
             return Ok(Vec::new());
@@ -1741,6 +1825,11 @@ mod tests {
             .route("/api/v3/trade/cancel-order", post(handle_mix_cancel_order))
             .route("/api/v3/trade/cancel-batch", post(handle_batch_cancel))
             .route("/api/v3/trade/cancel-symbol-order", post(handle_cancel_all))
+            .route("/api/v3/trade/fills", get(handle_null_fills))
+            .route(
+                "/api/v3/position/current-position",
+                get(handle_null_positions),
+            )
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1897,6 +1986,42 @@ mod tests {
         .into_response()
     }
 
+    async fn handle_null_fills(
+        State(state): State<OrderFixtureState>,
+        headers: HeaderMap,
+    ) -> Response {
+        state
+            .request_headers
+            .lock()
+            .await
+            .push(("fills".to_string(), headers));
+        Json(json!({
+            "code": "00000",
+            "msg": "success",
+            "requestTime": 1700000000000i64,
+            "data": null
+        }))
+        .into_response()
+    }
+
+    async fn handle_null_positions(
+        State(state): State<OrderFixtureState>,
+        headers: HeaderMap,
+    ) -> Response {
+        state
+            .request_headers
+            .lock()
+            .await
+            .push(("positions".to_string(), headers));
+        Json(json!({
+            "code": "00000",
+            "msg": "success",
+            "requestTime": 1700000000000i64,
+            "data": null
+        }))
+        .into_response()
+    }
+
     fn authenticated_fixture_client(addr: SocketAddr) -> BitgetHttpClient {
         BitgetHttpClient::with_credentials(
             "key".to_string(),
@@ -2020,6 +2145,45 @@ mod tests {
             .map(|(_, headers)| headers)
             .unwrap();
         assert!(headers.get(BITGET_PAPTRADING_HEADER).is_none());
+    }
+
+    #[tokio::test]
+    async fn http_fixture_null_private_list_payloads_parse_as_empty() {
+        let state = OrderFixtureState::default();
+        let addr = start_order_fixture_server(state).await;
+        let client = authenticated_fixture_client(addr);
+
+        let fills = client
+            .raw()
+            .request_fills(
+                BitgetProductType::UsdtFutures,
+                Some("BTCUSDT"),
+                None,
+                None,
+                Some(100),
+            )
+            .await
+            .unwrap();
+        let positions = client
+            .raw()
+            .request_mix_positions(BitgetProductType::UsdtFutures, Some("BTCUSDT"))
+            .await
+            .unwrap();
+
+        assert!(fills.is_empty());
+        assert!(positions.is_empty());
+    }
+
+    #[rstest]
+    fn query_string_sorts_parameters_for_bitget_signing() {
+        let query = query_string(vec![
+            ("category", "USDT-FUTURES".to_string()),
+            ("symbol", "BTCUSDT".to_string()),
+            ("limit", "100".to_string()),
+        ])
+        .unwrap();
+
+        assert_eq!(query, "?category=USDT-FUTURES&limit=100&symbol=BTCUSDT");
     }
 
     #[rstest]
