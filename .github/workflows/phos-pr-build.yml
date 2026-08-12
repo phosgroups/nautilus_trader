@@ -1,0 +1,52 @@
+name: phos-pr-build
+
+# phos PR 构建验证（ADR-0015, TASK-0028）
+# 触发: PR → master → 双平台构建 + smoke test，不发布
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.14"
+  VERSION_SUFFIX: "-phos-cicd"
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build wheel (Linux x86_64) + smoke test
+        uses: phosgroups/phos-actions/nautilus-build@main
+        with:
+          platform: linux-x86
+          version-suffix: ${{ env.VERSION_SUFFIX }}
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build wheel (macOS arm64) + smoke test
+        uses: phosgroups/phos-actions/nautilus-build@main
+        with:
+          platform: macos-arm64
+          version-suffix: ${{ env.VERSION_SUFFIX }}

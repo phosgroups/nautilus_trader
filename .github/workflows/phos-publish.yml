@@ -1,0 +1,93 @@
+name: phos-publish
+
+# phos 发布 nautilus-trader 到 CodeArtifact（ADR-0015, TASK-0028）
+# 触发: push master → 构建 Linux + macOS → 发布（版本 = pyproject + -phos-cicd）
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PYTHON_VERSION: "3.14"
+  VERSION_SUFFIX: "-phos-cicd"
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build wheel (Linux x86_64)
+        uses: phosgroups/phos-actions/nautilus-build@main
+        with:
+          platform: linux-x86
+          version-suffix: ${{ env.VERSION_SUFFIX }}
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux
+          path: dist/*.whl
+          if-no-files-found: error
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build wheel (macOS arm64)
+        uses: phosgroups/phos-actions/nautilus-build@main
+        with:
+          platform: macos-arm64
+          version-suffix: ${{ env.VERSION_SUFFIX }}
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-macos
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+
+      - name: List wheels
+        run: ls -lh dist/
+
+      - name: Publish to CodeArtifact
+        uses: phosgroups/phos-actions/codeartifact-publish@main
+        with:
+          aws-account-id: ${{ secrets.AWS_ACCOUNT_ID }}
+          wheels-dir: dist
