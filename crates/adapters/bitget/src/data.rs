@@ -23,9 +23,10 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use async_trait::async_trait;
 use nautilus_common::{
@@ -37,26 +38,31 @@ use nautilus_common::{
             BarsResponse, BookResponse, DataResponse, FundingRatesResponse, InstrumentResponse,
             InstrumentsResponse, RequestBars, RequestBookSnapshot, RequestFundingRates,
             RequestInstrument, RequestInstruments, RequestTrades, SubscribeBars,
-            SubscribeBookDeltas, SubscribeFundingRates, SubscribeIndexPrices, SubscribeMarkPrices,
-            SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
-            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeMarkPrices,
-            UnsubscribeTrades,
+            SubscribeBookDeltas, SubscribeBookDepth10, SubscribeFundingRates, SubscribeIndexPrices,
+            SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeMarkPrices,
+            SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
+            UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeFundingRates,
+            UnsubscribeIndexPrices, UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus,
+            UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
 use nautilus_core::{
-    AtomicMap,
+    AtomicMap, AtomicSet,
     datetime::datetime_to_unix_nanos,
+    nanos::UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{BarType, Data, OrderBookDeltas_API},
-    enums::BookType,
+    data::{BarType, Data, InstrumentStatus, OrderBookDeltas_API},
+    enums::{BookType, MarketStatusAction},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     orderbook::book::OrderBook,
 };
 use rust_decimal::Decimal;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::{
@@ -64,8 +70,9 @@ use crate::{
         enums::BitgetProductType,
         parse::{
             bar_spec_to_bitget_interval_for_product, parse_candle_bar, parse_market_trade,
-            parse_orderbook_snapshot, parse_ws_funding_rate, parse_ws_index_price,
-            parse_ws_mark_price, parse_ws_orderbook_deltas,
+            parse_orderbook_depth10_snapshot, parse_orderbook_snapshot, parse_ws_funding_rate,
+            parse_ws_index_price, parse_ws_mark_price, parse_ws_orderbook_deltas,
+            parse_ws_quote_tick,
         },
         symbol::{BitgetSymbol, extract_raw_symbol},
     },
@@ -83,10 +90,14 @@ use crate::{
     },
 };
 
-const TICKER_SUB_MARK: &str = "mark";
-const TICKER_SUB_INDEX: &str = "index";
-const TICKER_SUB_FUNDING: &str = "funding";
+pub(crate) const TICKER_SUB_MARK: &str = "mark";
+pub(crate) const TICKER_SUB_INDEX: &str = "index";
+pub(crate) const TICKER_SUB_FUNDING: &str = "funding";
+pub(crate) const TICKER_SUB_QUOTE: &str = "quote";
+pub(crate) const BOOK_SUB_DELTAS: &str = "deltas";
+pub(crate) const BOOK_SUB_DEPTH10: &str = "depth10";
 const BITGET_BOOK_CHECKSUM_DEPTH: usize = 25;
+pub(crate) const BITGET_DEPTH10_DEPTH: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BookSyncDecision {
@@ -102,7 +113,7 @@ enum BookChecksumDecision {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct BitgetBookChecksumState {
+pub(crate) struct BitgetBookChecksumState {
     bids: BTreeMap<Decimal, (String, String)>,
     asks: BTreeMap<Decimal, (String, String)>,
 }
@@ -210,6 +221,203 @@ impl BitgetBookChecksumState {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BitgetBookDepth10State {
+    bids: BTreeMap<Decimal, (String, String)>,
+    asks: BTreeMap<Decimal, (String, String)>,
+}
+
+impl BitgetBookDepth10State {
+    fn from_snapshot(snapshot: &BitgetOrderBookSnapshot) -> anyhow::Result<Self> {
+        let mut state = Self::default();
+        for level in &snapshot.bids {
+            state.apply_snapshot_level(true, level)?;
+        }
+        for level in &snapshot.asks {
+            state.apply_snapshot_level(false, level)?;
+        }
+        Ok(state)
+    }
+
+    fn apply_snapshot(&mut self, book: &BitgetBookData) -> anyhow::Result<()> {
+        self.bids.clear();
+        self.asks.clear();
+        self.apply_update(book)
+    }
+
+    fn apply_update(&mut self, book: &BitgetBookData) -> anyhow::Result<()> {
+        for level in &book.bids {
+            self.apply_ws_level(true, level)?;
+        }
+        for level in &book.asks {
+            self.apply_ws_level(false, level)?;
+        }
+        Ok(())
+    }
+
+    fn apply_snapshot_level(
+        &mut self,
+        is_bid: bool,
+        level: &[BitgetDecimalValue],
+    ) -> anyhow::Result<()> {
+        let price = level
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("missing price in Bitget depth10 level"))?;
+        let size = level
+            .get(1)
+            .ok_or_else(|| anyhow::anyhow!("missing size in Bitget depth10 level"))?;
+        self.apply_raw_level(
+            is_bid,
+            book_decimal_value_as_string(price, "depth10.price")?,
+            book_decimal_value_as_string(size, "depth10.size")?,
+        )
+    }
+
+    fn apply_ws_level(&mut self, is_bid: bool, level: &BitgetBookLevel) -> anyhow::Result<()> {
+        self.apply_raw_level(is_bid, level.0.clone(), level.1.clone())
+    }
+
+    fn apply_raw_level(
+        &mut self,
+        is_bid: bool,
+        price_raw: String,
+        size_raw: String,
+    ) -> anyhow::Result<()> {
+        let price = Decimal::from_str(&price_raw)
+            .with_context(|| format!("invalid Bitget depth10 price: {price_raw:?}"))?;
+        let size = Decimal::from_str(&size_raw)
+            .with_context(|| format!("invalid Bitget depth10 size: {size_raw:?}"))?;
+        let levels = if is_bid {
+            &mut self.bids
+        } else {
+            &mut self.asks
+        };
+
+        if size.is_zero() {
+            levels.remove(&price);
+        } else {
+            levels.insert(price, (price_raw, size_raw));
+        }
+        Ok(())
+    }
+
+    fn top_levels(&self) -> (Vec<(String, String)>, Vec<(String, String)>) {
+        let bids = self
+            .bids
+            .iter()
+            .rev()
+            .take(10)
+            .map(|(_, level)| level.clone())
+            .collect();
+        let asks = self
+            .asks
+            .iter()
+            .take(10)
+            .map(|(_, level)| level.clone())
+            .collect();
+        (bids, asks)
+    }
+}
+
+fn parse_bitget_millis_timestamp(raw: &str, field: &str) -> anyhow::Result<UnixNanos> {
+    let millis = raw
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("invalid Bitget {field} timestamp: {raw:?}"))?;
+    Ok(UnixNanos::from_millis(millis))
+}
+
+fn raw_book_ts_event(snapshot: &BitgetOrderBookSnapshot, ts_init: UnixNanos) -> UnixNanos {
+    snapshot
+        .ts
+        .as_deref()
+        .and_then(|ts| parse_bitget_millis_timestamp(ts, "orderbook.ts").ok())
+        .unwrap_or(ts_init)
+}
+
+fn raw_book_sequence(snapshot: &BitgetOrderBookSnapshot, ts_event: UnixNanos) -> u64 {
+    snapshot
+        .seq
+        .as_deref()
+        .and_then(|seq| seq.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| ts_event.as_u64())
+}
+
+fn ws_book_ts_event(book: &BitgetBookData, ts_init: UnixNanos) -> UnixNanos {
+    book.ts
+        .as_deref()
+        .and_then(|ts| parse_bitget_millis_timestamp(ts, "book.ts").ok())
+        .unwrap_or(ts_init)
+}
+
+fn ws_book_sequence(book: &BitgetBookData, ts_event: UnixNanos) -> u64 {
+    book.seq
+        .and_then(|seq| u64::try_from(seq).ok())
+        .unwrap_or_else(|| ts_event.as_u64())
+}
+
+fn recovery_book_depth(
+    book_depths: &Arc<AtomicMap<InstrumentId, Option<u32>>>,
+    instrument_id: InstrumentId,
+    wants_deltas: bool,
+    wants_depth10: bool,
+) -> Option<u32> {
+    if wants_deltas {
+        book_depths.get_cloned(&instrument_id).flatten()
+    } else if wants_depth10 {
+        Some(BITGET_DEPTH10_DEPTH)
+    } else {
+        None
+    }
+}
+
+fn build_depth10_from_state(
+    state: &BitgetBookDepth10State,
+    instrument: &InstrumentAny,
+    sequence: u64,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> anyhow::Result<nautilus_model::data::OrderBookDepth10> {
+    let (bids, asks) = state.top_levels();
+    parse_orderbook_depth10_snapshot(&bids, &asks, instrument, sequence, ts_event, ts_init)
+}
+
+pub(crate) fn store_depth10_snapshot(
+    instrument: &InstrumentAny,
+    snapshot: &BitgetOrderBookSnapshot,
+    book_depth10_states: &Arc<AtomicMap<InstrumentId, BitgetBookDepth10State>>,
+) -> anyhow::Result<BitgetBookDepth10State> {
+    let state = BitgetBookDepth10State::from_snapshot(snapshot)?;
+    book_depth10_states.insert(instrument.id(), state.clone());
+    Ok(state)
+}
+
+fn emit_depth10_from_state(
+    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    state: &BitgetBookDepth10State,
+    instrument: &InstrumentAny,
+    sequence: u64,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> anyhow::Result<()> {
+    let depth10 = build_depth10_from_state(state, instrument, sequence, ts_event, ts_init)?;
+    send_data(sender, Data::Depth10(Box::new(depth10)));
+    Ok(())
+}
+
+pub(crate) fn emit_depth10_snapshot(
+    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    instrument: &InstrumentAny,
+    snapshot: &BitgetOrderBookSnapshot,
+    book_depth10_states: &Arc<AtomicMap<InstrumentId, BitgetBookDepth10State>>,
+    ts_init: UnixNanos,
+) -> anyhow::Result<()> {
+    let state = store_depth10_snapshot(instrument, snapshot, book_depth10_states)?;
+    let ts_event = raw_book_ts_event(snapshot, ts_init);
+    let sequence = raw_book_sequence(snapshot, ts_event);
+    emit_depth10_from_state(sender, &state, instrument, sequence, ts_event, ts_init)
+}
+
 fn append_checksum_level(raw: &mut String, price: &str, size: &str) {
     if !raw.is_empty() {
         raw.push(':');
@@ -238,14 +446,14 @@ fn checksum_matches(local: u32, remote: i64) -> bool {
     i64::from(local) == remote || i64::from(local as i32) == remote
 }
 
-fn upsert_instrument(
+pub(crate) fn upsert_instrument(
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     instrument: InstrumentAny,
 ) {
     instruments.insert(instrument.id(), instrument);
 }
 
-async fn get_or_fetch_instrument(
+pub(crate) async fn get_or_fetch_instrument(
     http: BitgetHttpClient,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     product_type: BitgetProductType,
@@ -272,14 +480,23 @@ async fn get_or_fetch_instrument(
     matched.ok_or_else(|| anyhow::anyhow!("Bitget instrument not found: {instrument_id}"))
 }
 
-fn send_data(sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>, data: Data) {
+pub(crate) fn send_data(sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>, data: Data) {
     if let Err(e) = sender.send(DataEvent::Data(data)) {
         log::error!("Failed to send Bitget data event: {e}");
     }
 }
 
-fn raw_symbol_for_instrument(instrument_id: InstrumentId) -> String {
+pub(crate) fn raw_symbol_for_instrument(instrument_id: InstrumentId) -> String {
     extract_raw_symbol(instrument_id.symbol.as_str()).to_string()
+}
+
+fn book_decimal_value_as_string(value: &BitgetDecimalValue, field: &str) -> anyhow::Result<String> {
+    let value = value.as_decimal_str();
+    anyhow::ensure!(
+        !value.trim().is_empty(),
+        "missing decimal value for {field}"
+    );
+    Ok(value)
 }
 
 fn instrument_id_from_ws_arg(arg: &BitgetWsArg) -> anyhow::Result<InstrumentId> {
@@ -337,7 +554,73 @@ fn record_book_sequence(
     book_sequences.insert(instrument_id, sequence);
 }
 
-async fn request_orderbook_snapshot_raw(
+pub(crate) fn emit_instrument_status(
+    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    instrument_id: InstrumentId,
+    action: MarketStatusAction,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) {
+    let is_trading = Some(matches!(action, MarketStatusAction::Trading));
+    let status = InstrumentStatus::new(
+        instrument_id,
+        action,
+        ts_event,
+        ts_init,
+        None,
+        None,
+        is_trading,
+        None,
+        None,
+    );
+
+    if let Err(e) = sender.send(DataEvent::InstrumentStatus(status)) {
+        log::error!("Failed to send Bitget instrument status: {e}");
+    }
+}
+
+fn diff_and_emit_instrument_statuses(
+    new_statuses: &AHashMap<InstrumentId, MarketStatusAction>,
+    cached_statuses: &mut AHashMap<InstrumentId, MarketStatusAction>,
+    subscriptions: &AHashSet<InstrumentId>,
+    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) {
+    for (instrument_id, &new_action) in new_statuses {
+        let changed = cached_statuses
+            .get(instrument_id)
+            .is_none_or(|&prev| prev != new_action);
+
+        if changed {
+            cached_statuses.insert(*instrument_id, new_action);
+            if subscriptions.contains(instrument_id) {
+                emit_instrument_status(sender, *instrument_id, new_action, ts_event, ts_init);
+            }
+        }
+    }
+
+    let removed: Vec<InstrumentId> = cached_statuses
+        .keys()
+        .filter(|id| !new_statuses.contains_key(id))
+        .copied()
+        .collect();
+
+    for instrument_id in removed {
+        cached_statuses.remove(&instrument_id);
+        if subscriptions.contains(&instrument_id) {
+            emit_instrument_status(
+                sender,
+                instrument_id,
+                MarketStatusAction::NotAvailableForTrading,
+                ts_event,
+                ts_init,
+            );
+        }
+    }
+}
+
+pub(crate) async fn request_orderbook_snapshot_raw(
     http: &BitgetHttpClient,
     product_type: BitgetProductType,
     instrument: &InstrumentAny,
@@ -357,7 +640,7 @@ async fn request_orderbook_snapshot_raw(
     Ok((snapshot, deltas))
 }
 
-fn store_spot_book_checksum_snapshot(
+pub(crate) fn store_spot_book_checksum_snapshot(
     product_type: BitgetProductType,
     instrument_id: InstrumentId,
     snapshot: &BitgetOrderBookSnapshot,
@@ -411,7 +694,7 @@ fn apply_and_validate_spot_book_checksum(
     Ok(BookChecksumDecision::Valid)
 }
 
-async fn recover_book_snapshot(
+pub(crate) async fn recover_book_snapshot(
     http: BitgetHttpClient,
     product_type: BitgetProductType,
     instrument: &InstrumentAny,
@@ -419,6 +702,9 @@ async fn recover_book_snapshot(
     sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
     book_sequences: &Arc<AtomicMap<InstrumentId, i64>>,
     book_checksum_states: &Arc<AtomicMap<InstrumentId, BitgetBookChecksumState>>,
+    book_depth10_states: &Arc<AtomicMap<InstrumentId, BitgetBookDepth10State>>,
+    emit_deltas: bool,
+    emit_depth10: bool,
     ts_init: nautilus_core::UnixNanos,
 ) -> anyhow::Result<()> {
     let (snapshot, deltas) =
@@ -436,11 +722,19 @@ async fn recover_book_snapshot(
         record_book_sequence(book_sequences, instrument.id(), sequence);
     }
 
-    send_data(sender, Data::Deltas(OrderBookDeltas_API::new(deltas)));
+    if emit_depth10 {
+        emit_depth10_snapshot(sender, instrument, &snapshot, book_depth10_states, ts_init)
+            .context("emit recovered Bitget order book depth10 snapshot")?;
+    }
+
+    if emit_deltas {
+        send_data(sender, Data::Deltas(OrderBookDeltas_API::new(deltas)));
+    }
+
     Ok(())
 }
 
-async fn handle_bitget_ws_message(
+pub(crate) async fn handle_bitget_ws_message(
     message: BitgetWsMessage,
     sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
     http: &BitgetHttpClient,
@@ -450,6 +744,8 @@ async fn handle_bitget_ws_message(
     book_sequences: &Arc<AtomicMap<InstrumentId, i64>>,
     book_depths: &Arc<AtomicMap<InstrumentId, Option<u32>>>,
     book_checksum_states: &Arc<AtomicMap<InstrumentId, BitgetBookChecksumState>>,
+    book_depth10_states: &Arc<AtomicMap<InstrumentId, BitgetBookDepth10State>>,
+    book_subs: &Arc<AtomicMap<InstrumentId, AHashSet<&'static str>>>,
     ticker_subs: &Arc<AtomicMap<InstrumentId, AHashSet<&'static str>>>,
     clock: &AtomicTime,
 ) {
@@ -488,6 +784,21 @@ async fn handle_bitget_ws_message(
             }
         }
         "books" => {
+            let (wants_deltas, wants_depth10) =
+                book_subs
+                    .load()
+                    .get(&instrument_id)
+                    .map_or((false, false), |subs| {
+                        (
+                            subs.contains(BOOK_SUB_DELTAS),
+                            subs.contains(BOOK_SUB_DEPTH10),
+                        )
+                    });
+
+            if !(wants_deltas || wants_depth10) {
+                return;
+            }
+
             for value in event.data {
                 let book = match serde_json::from_value::<BitgetBookData>(value) {
                     Ok(book) => book,
@@ -503,76 +814,149 @@ async fn handle_bitget_ws_message(
                     event.action.as_deref(),
                 ) {
                     BookSyncDecision::Apply => {
-                        match parse_ws_orderbook_deltas(
-                            &book,
-                            &instrument,
-                            event.action.as_deref(),
-                            Some(ts_init),
-                        ) {
-                            Ok(deltas) => {
-                                match apply_and_validate_spot_book_checksum(
-                                    product_type,
-                                    instrument_id,
-                                    &book,
-                                    event.action.as_deref(),
-                                    book_checksum_states,
-                                ) {
-                                    Ok(BookChecksumDecision::Valid) => {}
-                                    Ok(BookChecksumDecision::Recover) => {
-                                        let depth =
-                                            book_depths.get_cloned(&instrument_id).flatten();
-                                        if let Err(e) = recover_book_snapshot(
-                                            http.clone(),
-                                            product_type,
-                                            &instrument,
-                                            depth,
-                                            sender,
-                                            book_sequences,
-                                            book_checksum_states,
-                                            ts_init,
-                                        )
-                                        .await
-                                        {
-                                            log::error!(
-                                                "Failed to recover Bitget order book snapshot for checksum mismatch on {instrument_id}: {e:?}"
-                                            );
-                                        }
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        log::error!(
-                                            "Failed to validate Bitget Spot book checksum for {instrument_id}: {e:?}"
-                                        );
-                                        let depth =
-                                            book_depths.get_cloned(&instrument_id).flatten();
-                                        if let Err(e) = recover_book_snapshot(
-                                            http.clone(),
-                                            product_type,
-                                            &instrument,
-                                            depth,
-                                            sender,
-                                            book_sequences,
-                                            book_checksum_states,
-                                            ts_init,
-                                        )
-                                        .await
-                                        {
-                                            log::error!(
-                                                "Failed to recover Bitget order book snapshot for checksum validation error on {instrument_id}: {e:?}"
-                                            );
-                                        }
-                                        continue;
-                                    }
+                        let deltas = if wants_deltas {
+                            match parse_ws_orderbook_deltas(
+                                &book,
+                                &instrument,
+                                event.action.as_deref(),
+                                Some(ts_init),
+                            ) {
+                                Ok(deltas) => Some(deltas),
+                                Err(e) => {
+                                    log::error!(
+                                        "Failed to parse Bitget WebSocket book deltas: {e:?}"
+                                    );
+                                    continue;
                                 }
+                            }
+                        } else {
+                            None
+                        };
 
-                                if let Some(seq) = book.seq {
-                                    record_book_sequence(book_sequences, instrument_id, seq);
+                        match apply_and_validate_spot_book_checksum(
+                            product_type,
+                            instrument_id,
+                            &book,
+                            event.action.as_deref(),
+                            book_checksum_states,
+                        ) {
+                            Ok(BookChecksumDecision::Valid) => {}
+                            Ok(BookChecksumDecision::Recover) => {
+                                let depth = recovery_book_depth(
+                                    book_depths,
+                                    instrument_id,
+                                    wants_deltas,
+                                    wants_depth10,
+                                );
+                                if let Err(e) = recover_book_snapshot(
+                                    http.clone(),
+                                    product_type,
+                                    &instrument,
+                                    depth,
+                                    sender,
+                                    book_sequences,
+                                    book_checksum_states,
+                                    book_depth10_states,
+                                    wants_deltas,
+                                    wants_depth10,
+                                    ts_init,
+                                )
+                                .await
+                                {
+                                    log::error!(
+                                        "Failed to recover Bitget order book snapshot for checksum mismatch on {instrument_id}: {e:?}"
+                                    );
                                 }
-                                send_data(sender, Data::Deltas(OrderBookDeltas_API::new(deltas)));
+                                continue;
                             }
                             Err(e) => {
-                                log::error!("Failed to parse Bitget WebSocket book update: {e:?}");
+                                log::error!(
+                                    "Failed to validate Bitget Spot book checksum for {instrument_id}: {e:?}"
+                                );
+                                let depth = recovery_book_depth(
+                                    book_depths,
+                                    instrument_id,
+                                    wants_deltas,
+                                    wants_depth10,
+                                );
+                                if let Err(e) = recover_book_snapshot(
+                                    http.clone(),
+                                    product_type,
+                                    &instrument,
+                                    depth,
+                                    sender,
+                                    book_sequences,
+                                    book_checksum_states,
+                                    book_depth10_states,
+                                    wants_deltas,
+                                    wants_depth10,
+                                    ts_init,
+                                )
+                                .await
+                                {
+                                    log::error!(
+                                        "Failed to recover Bitget order book snapshot for checksum validation error on {instrument_id}: {e:?}"
+                                    );
+                                }
+                                continue;
                             }
+                        }
+
+                        if wants_depth10 {
+                            let mut state = if event
+                                .action
+                                .as_deref()
+                                .is_some_and(|value| value.eq_ignore_ascii_case("snapshot"))
+                            {
+                                BitgetBookDepth10State::default()
+                            } else {
+                                book_depth10_states
+                                    .get_cloned(&instrument_id)
+                                    .unwrap_or_default()
+                            };
+
+                            let result = if event
+                                .action
+                                .as_deref()
+                                .is_some_and(|value| value.eq_ignore_ascii_case("snapshot"))
+                            {
+                                state.apply_snapshot(&book)
+                            } else {
+                                state.apply_update(&book)
+                            };
+
+                            match result {
+                                Ok(()) => {
+                                    let ts_event = ws_book_ts_event(&book, ts_init);
+                                    let sequence = ws_book_sequence(&book, ts_event);
+                                    book_depth10_states.insert(instrument_id, state.clone());
+                                    if let Err(e) = emit_depth10_from_state(
+                                        sender,
+                                        &state,
+                                        &instrument,
+                                        sequence,
+                                        ts_event,
+                                        ts_init,
+                                    ) {
+                                        log::error!(
+                                            "Failed to emit Bitget order book depth10 for {instrument_id}: {e:?}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "Failed to update Bitget order book depth10 state for {instrument_id}: {e:?}"
+                                    );
+                                }
+                            }
+                        }
+
+                        if let Some(seq) = book.seq {
+                            record_book_sequence(book_sequences, instrument_id, seq);
+                        }
+
+                        if let Some(deltas) = deltas {
+                            send_data(sender, Data::Deltas(OrderBookDeltas_API::new(deltas)));
                         }
                     }
                     BookSyncDecision::Recover => {
@@ -582,7 +966,12 @@ async fn handle_bitget_ws_message(
                             book.pseq,
                             book.seq,
                         );
-                        let depth = book_depths.get_cloned(&instrument_id).flatten();
+                        let depth = recovery_book_depth(
+                            book_depths,
+                            instrument_id,
+                            wants_deltas,
+                            wants_depth10,
+                        );
                         if let Err(e) = recover_book_snapshot(
                             http.clone(),
                             product_type,
@@ -591,6 +980,9 @@ async fn handle_bitget_ws_message(
                             sender,
                             book_sequences,
                             book_checksum_states,
+                            book_depth10_states,
+                            wants_deltas,
+                            wants_depth10,
                             ts_init,
                         )
                         .await
@@ -610,7 +1002,7 @@ async fn handle_bitget_ws_message(
                 }
             }
         }
-        topic if topic.starts_with("candle") => {
+        "kline" => {
             let topic_key = arg.topic_key();
             let Some(bar_type) = bar_types.get_cloned(&topic_key) else {
                 log::warn!("No Bitget bar type cached for WebSocket topic: {topic_key}");
@@ -629,18 +1021,19 @@ async fn handle_bitget_ws_message(
             }
         }
         "ticker" => {
-            let (wants_mark, wants_index, wants_funding) = ticker_subs
+            let (wants_quote, wants_mark, wants_index, wants_funding) = ticker_subs
                 .load()
                 .get(&instrument_id)
-                .map_or((false, false, false), |subs| {
+                .map_or((false, false, false, false), |subs| {
                     (
+                        subs.contains(TICKER_SUB_QUOTE),
                         subs.contains(TICKER_SUB_MARK),
                         subs.contains(TICKER_SUB_INDEX),
                         subs.contains(TICKER_SUB_FUNDING),
                     )
                 });
 
-            if !(wants_mark || wants_index || wants_funding) {
+            if !(wants_quote || wants_mark || wants_index || wants_funding) {
                 return;
             }
 
@@ -652,23 +1045,31 @@ async fn handle_bitget_ws_message(
                         continue;
                     }
                 };
+                let ticker_ts = event.ts.as_deref();
+
+                if wants_quote {
+                    match parse_ws_quote_tick(&ticker, &instrument, ticker_ts, Some(ts_init)) {
+                        Ok(quote) => send_data(sender, Data::Quote(quote)),
+                        Err(e) => log::debug!("Skipping Bitget quote ticker update: {e:?}"),
+                    }
+                }
 
                 if wants_mark {
-                    match parse_ws_mark_price(&ticker, &instrument, Some(ts_init)) {
+                    match parse_ws_mark_price(&ticker, &instrument, ticker_ts, Some(ts_init)) {
                         Ok(update) => send_data(sender, Data::MarkPriceUpdate(update)),
                         Err(e) => log::debug!("Skipping Bitget mark price ticker update: {e:?}"),
                     }
                 }
 
                 if wants_index {
-                    match parse_ws_index_price(&ticker, &instrument, Some(ts_init)) {
+                    match parse_ws_index_price(&ticker, &instrument, ticker_ts, Some(ts_init)) {
                         Ok(update) => send_data(sender, Data::IndexPriceUpdate(update)),
                         Err(e) => log::debug!("Skipping Bitget index price ticker update: {e:?}"),
                     }
                 }
 
                 if wants_funding {
-                    match parse_ws_funding_rate(&ticker, &instrument, Some(ts_init)) {
+                    match parse_ws_funding_rate(&ticker, &instrument, ticker_ts, Some(ts_init)) {
                         Ok(update) => {
                             if let Err(e) = sender.send(DataEvent::FundingRate(update)) {
                                 log::error!("Failed to send Bitget funding rate event: {e}");
@@ -702,7 +1103,13 @@ pub struct BitgetDataClient {
     book_sequences: Arc<AtomicMap<InstrumentId, i64>>,
     book_depths: Arc<AtomicMap<InstrumentId, Option<u32>>>,
     book_checksum_states: Arc<AtomicMap<InstrumentId, BitgetBookChecksumState>>,
+    book_depth10_states: Arc<AtomicMap<InstrumentId, BitgetBookDepth10State>>,
+    book_subs: Arc<AtomicMap<InstrumentId, AHashSet<&'static str>>>,
     ticker_subs: Arc<AtomicMap<InstrumentId, AHashSet<&'static str>>>,
+    instrument_status_subs: Arc<AtomicSet<InstrumentId>>,
+    status_cache: Arc<AtomicMap<InstrumentId, MarketStatusAction>>,
+    tasks: Vec<JoinHandle<()>>,
+    cancellation_token: CancellationToken,
     clock: &'static AtomicTime,
 }
 
@@ -751,7 +1158,13 @@ impl BitgetDataClient {
             book_sequences: Arc::new(AtomicMap::new()),
             book_depths: Arc::new(AtomicMap::new()),
             book_checksum_states: Arc::new(AtomicMap::new()),
+            book_depth10_states: Arc::new(AtomicMap::new()),
+            book_subs: Arc::new(AtomicMap::new()),
             ticker_subs: Arc::new(AtomicMap::new()),
+            instrument_status_subs: Arc::new(AtomicSet::new()),
+            status_cache: Arc::new(AtomicMap::new()),
+            tasks: Vec::new(),
+            cancellation_token: CancellationToken::new(),
             clock: get_atomic_clock_realtime(),
         })
     }
@@ -782,6 +1195,12 @@ impl BitgetDataClient {
         }
     }
 
+    fn abort_tasks(&mut self) {
+        for handle in self.tasks.drain(..) {
+            handle.abort();
+        }
+    }
+
     fn start_ws_dispatch(&mut self) -> anyhow::Result<()> {
         if self.ws_task.is_some() {
             return Ok(());
@@ -799,6 +1218,8 @@ impl BitgetDataClient {
         let book_sequences = Arc::clone(&self.book_sequences);
         let book_depths = Arc::clone(&self.book_depths);
         let book_checksum_states = Arc::clone(&self.book_checksum_states);
+        let book_depth10_states = Arc::clone(&self.book_depth10_states);
+        let book_subs = Arc::clone(&self.book_subs);
         let ticker_subs = Arc::clone(&self.ticker_subs);
         let clock = self.clock;
 
@@ -814,6 +1235,8 @@ impl BitgetDataClient {
                     &book_sequences,
                     &book_depths,
                     &book_checksum_states,
+                    &book_depth10_states,
+                    &book_subs,
                     &ticker_subs,
                     clock,
                 )
@@ -846,6 +1269,16 @@ impl BitgetDataClient {
         Ok(())
     }
 
+    fn ensure_ticker_subscription(
+        &self,
+        instrument_id: InstrumentId,
+        data_kind: &str,
+    ) -> anyhow::Result<()> {
+        self.configured_product_type_for(instrument_id)
+            .with_context(|| format!("Bitget {data_kind} subscription"))?;
+        Ok(())
+    }
+
     fn add_ticker_sub(&self, instrument_id: InstrumentId, sub: &'static str) -> bool {
         let mut should_subscribe = false;
         self.ticker_subs.rcu(|m| {
@@ -859,6 +1292,30 @@ impl BitgetDataClient {
     fn remove_ticker_sub(&self, instrument_id: InstrumentId, sub: &'static str) -> bool {
         let mut should_unsubscribe = false;
         self.ticker_subs.rcu(|m| {
+            if let Some(entry) = m.get_mut(&instrument_id) {
+                entry.remove(sub);
+                should_unsubscribe = entry.is_empty();
+                if should_unsubscribe {
+                    m.remove(&instrument_id);
+                }
+            }
+        });
+        should_unsubscribe
+    }
+
+    fn add_book_sub(&self, instrument_id: InstrumentId, sub: &'static str) -> bool {
+        let mut should_subscribe = false;
+        self.book_subs.rcu(|m| {
+            let entry = m.entry(instrument_id).or_default();
+            should_subscribe = entry.is_empty();
+            entry.insert(sub);
+        });
+        should_subscribe
+    }
+
+    fn remove_book_sub(&self, instrument_id: InstrumentId, sub: &'static str) -> bool {
+        let mut should_unsubscribe = false;
+        self.book_subs.rcu(|m| {
             if let Some(entry) = m.get_mut(&instrument_id) {
                 entry.remove(sub);
                 should_unsubscribe = entry.is_empty();
@@ -894,6 +1351,25 @@ impl BitgetDataClient {
         Ok(())
     }
 
+    fn subscribe_ticker_quote(&mut self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        self.ensure_ticker_subscription(instrument_id, "quote")?;
+
+        if self.add_ticker_sub(instrument_id, TICKER_SUB_QUOTE) {
+            let raw_symbol = raw_symbol_for_instrument(instrument_id);
+            let ws = self.ws_client.clone();
+            self.spawn_ws(
+                async move {
+                    ws.subscribe_ticker(raw_symbol)
+                        .await
+                        .context("ticker subscription for quote")
+                },
+                "quote",
+            );
+        }
+
+        Ok(())
+    }
+
     fn unsubscribe_ticker_derived(
         &mut self,
         instrument_id: InstrumentId,
@@ -918,6 +1394,25 @@ impl BitgetDataClient {
         Ok(())
     }
 
+    fn unsubscribe_ticker_quote(&mut self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        self.ensure_ticker_subscription(instrument_id, "quote")?;
+
+        if self.remove_ticker_sub(instrument_id, TICKER_SUB_QUOTE) {
+            let raw_symbol = raw_symbol_for_instrument(instrument_id);
+            let ws = self.ws_client.clone();
+            self.spawn_ws(
+                async move {
+                    ws.unsubscribe_ticker(raw_symbol)
+                        .await
+                        .context("ticker unsubscription for quote")
+                },
+                "quote",
+            );
+        }
+
+        Ok(())
+    }
+
     fn spawn_ws<F>(&self, future: F, action: &'static str)
     where
         F: Future<Output = anyhow::Result<()>> + Send + 'static,
@@ -927,6 +1422,57 @@ impl BitgetDataClient {
                 log::error!("Bitget WebSocket {action} failed: {e:?}");
             }
         });
+    }
+
+    fn spawn_instrument_status_polling(&mut self, interval_secs: u64) {
+        let http = self.http_client.clone();
+        let product_type = self.config.product_type;
+        let status_cache = Arc::clone(&self.status_cache);
+        let status_subs = Arc::clone(&self.instrument_status_subs);
+        let sender = self.data_sender.clone();
+        let clock = self.clock;
+        let cancel = self.cancellation_token.clone();
+
+        let handle = get_runtime().spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+            interval.tick().await;
+
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => {
+                        log::debug!("Bitget instrument status polling task cancelled");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        if status_subs.load().is_empty() {
+                            continue;
+                        }
+
+                        let ts_init = clock.get_time_ns();
+                        match http.request_instrument_statuses(product_type).await {
+                            Ok(new_statuses) => {
+                                let mut cache = (**status_cache.load()).clone();
+                                let subs = status_subs.load();
+                                diff_and_emit_instrument_statuses(
+                                    &new_statuses,
+                                    &mut cache,
+                                    &subs,
+                                    &sender,
+                                    ts_init,
+                                    ts_init,
+                                );
+                                status_cache.store(cache);
+                            }
+                            Err(e) => {
+                                log::warn!("Bitget instrument status poll failed: {e:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        self.tasks.push(handle);
     }
 }
 
@@ -945,17 +1491,26 @@ impl DataClient for BitgetDataClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        self.cancellation_token.cancel();
+        self.abort_tasks();
         self.abort_ws_task();
         self.is_connected.store(false, Ordering::Relaxed);
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
+        self.cancellation_token.cancel();
+        self.abort_tasks();
         self.abort_ws_task();
         self.book_sequences.store(Default::default());
         self.book_depths.store(Default::default());
         self.book_checksum_states.store(Default::default());
+        self.book_depth10_states.store(Default::default());
+        self.book_subs.store(Default::default());
         self.ticker_subs.store(Default::default());
+        self.instrument_status_subs.store(Default::default());
+        self.status_cache.store(Default::default());
+        self.cancellation_token = CancellationToken::new();
         self.is_connected.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -982,6 +1537,7 @@ impl DataClient for BitgetDataClient {
         let raw_symbol = raw_symbol_for_instrument(instrument_id);
         let depth = cmd.depth.map(|depth| depth.get() as u32);
         self.book_depths.insert(instrument_id, depth);
+        let should_subscribe = self.add_book_sub(instrument_id, BOOK_SUB_DELTAS);
         let http = self.http_client.clone();
         let instruments = Arc::clone(&self.instruments);
         let book_sequences = Arc::clone(&self.book_sequences);
@@ -1020,11 +1576,81 @@ impl DataClient for BitgetDataClient {
                     record_book_sequence(&book_sequences, instrument_id, sequence);
                 }
                 send_data(&sender, Data::Deltas(OrderBookDeltas_API::new(snapshot)));
-                ws.subscribe_books(raw_symbol)
-                    .await
-                    .context("books subscription")
+                if should_subscribe {
+                    ws.subscribe_books(raw_symbol)
+                        .await
+                        .context("books subscription")?;
+                }
+                Ok(())
             },
             "books subscription",
+        );
+
+        Ok(())
+    }
+
+    fn subscribe_book_depth10(&mut self, cmd: SubscribeBookDepth10) -> anyhow::Result<()> {
+        if cmd.book_type != BookType::L2_MBP {
+            anyhow::bail!("Bitget only supports L2_MBP order book depth10");
+        }
+
+        let product_type = self.configured_product_type_for(cmd.instrument_id)?;
+        let instrument_id = cmd.instrument_id;
+        let raw_symbol = raw_symbol_for_instrument(instrument_id);
+        let should_subscribe = self.add_book_sub(instrument_id, BOOK_SUB_DEPTH10);
+        let http = self.http_client.clone();
+        let instruments = Arc::clone(&self.instruments);
+        let book_sequences = Arc::clone(&self.book_sequences);
+        let book_checksum_states = Arc::clone(&self.book_checksum_states);
+        let book_depth10_states = Arc::clone(&self.book_depth10_states);
+        let sender = self.data_sender.clone();
+        let clock = self.clock;
+        let ws = self.ws_client.clone();
+
+        self.spawn_ws(
+            async move {
+                let ts_init = clock.get_time_ns();
+                let instrument = get_or_fetch_instrument(
+                    http.clone(),
+                    instruments,
+                    product_type,
+                    instrument_id,
+                    ts_init,
+                )
+                .await?;
+                let (raw_snapshot, snapshot) = request_orderbook_snapshot_raw(
+                    &http,
+                    product_type,
+                    &instrument,
+                    Some(BITGET_DEPTH10_DEPTH),
+                    ts_init,
+                )
+                .await
+                .context("REST order book depth10 snapshot")?;
+                store_spot_book_checksum_snapshot(
+                    product_type,
+                    instrument_id,
+                    &raw_snapshot,
+                    &book_checksum_states,
+                )?;
+                if let Ok(sequence) = i64::try_from(snapshot.sequence) {
+                    record_book_sequence(&book_sequences, instrument_id, sequence);
+                }
+                emit_depth10_snapshot(
+                    &sender,
+                    &instrument,
+                    &raw_snapshot,
+                    &book_depth10_states,
+                    ts_init,
+                )?;
+                if should_subscribe {
+                    ws.subscribe_books(raw_symbol)
+                        .await
+                        .context("books subscription for depth10")?;
+                }
+                Ok(())
+            },
+            "books depth10 subscription",
         );
 
         Ok(())
@@ -1047,6 +1673,10 @@ impl DataClient for BitgetDataClient {
         Ok(())
     }
 
+    fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
+        self.subscribe_ticker_quote(cmd.instrument_id)
+    }
+
     fn subscribe_mark_prices(&mut self, cmd: SubscribeMarkPrices) -> anyhow::Result<()> {
         self.subscribe_ticker_derived(cmd.instrument_id, TICKER_SUB_MARK, "mark price")
     }
@@ -1057,6 +1687,30 @@ impl DataClient for BitgetDataClient {
 
     fn subscribe_funding_rates(&mut self, cmd: SubscribeFundingRates) -> anyhow::Result<()> {
         self.subscribe_ticker_derived(cmd.instrument_id, TICKER_SUB_FUNDING, "funding rate")
+    }
+
+    fn subscribe_instrument_status(
+        &mut self,
+        cmd: SubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        self.configured_product_type_for(cmd.instrument_id)?;
+        let instrument_id = cmd.instrument_id;
+        self.instrument_status_subs.insert(instrument_id);
+
+        if let Some(action) = self.status_cache.get_cloned(&instrument_id) {
+            let ts_init = self.clock.get_time_ns();
+            emit_instrument_status(&self.data_sender, instrument_id, action, ts_init, ts_init);
+        }
+
+        Ok(())
+    }
+
+    fn subscribe_instrument_close(&mut self, cmd: SubscribeInstrumentClose) -> anyhow::Result<()> {
+        self.configured_product_type_for(cmd.instrument_id)?;
+        log::warn!(
+            "Bitget instrument close subscriptions are not supported: v3 UTA instruments expose status but not an instrument close price"
+        );
+        Ok(())
     }
 
     fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
@@ -1070,9 +1724,7 @@ impl DataClient for BitgetDataClient {
             spec.step.get() as u64,
         )?;
         let raw_symbol = raw_symbol_for_instrument(instrument_id);
-        let channel = format!("candle{interval}");
-        let topic_key =
-            BitgetWsArg::new(product_type, channel, Some(raw_symbol.clone())).topic_key();
+        let topic_key = BitgetWsArg::kline(product_type, raw_symbol.clone(), interval).topic_key();
         self.bar_types.insert(topic_key, bar_type);
 
         let ws = self.ws_client.clone();
@@ -1090,19 +1742,55 @@ impl DataClient for BitgetDataClient {
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
         self.configured_product_type_for(cmd.instrument_id)?;
-        self.book_sequences.remove(&cmd.instrument_id);
+        let should_unsubscribe = self.remove_book_sub(cmd.instrument_id, BOOK_SUB_DELTAS);
+        if should_unsubscribe {
+            self.book_sequences.remove(&cmd.instrument_id);
+            self.book_checksum_states.remove(&cmd.instrument_id);
+            self.book_depth10_states.remove(&cmd.instrument_id);
+        }
         self.book_depths.remove(&cmd.instrument_id);
-        self.book_checksum_states.remove(&cmd.instrument_id);
         let raw_symbol = raw_symbol_for_instrument(cmd.instrument_id);
         let ws = self.ws_client.clone();
 
         self.spawn_ws(
             async move {
-                ws.unsubscribe_books(raw_symbol)
-                    .await
-                    .context("books unsubscription")
+                if should_unsubscribe {
+                    ws.unsubscribe_books(raw_symbol)
+                        .await
+                        .context("books unsubscription")?;
+                }
+                Ok(())
             },
             "books unsubscription",
+        );
+
+        Ok(())
+    }
+
+    fn unsubscribe_book_depth10(&mut self, cmd: &UnsubscribeBookDepth10) -> anyhow::Result<()> {
+        self.configured_product_type_for(cmd.instrument_id)?;
+        let should_unsubscribe = self.remove_book_sub(cmd.instrument_id, BOOK_SUB_DEPTH10);
+        if should_unsubscribe {
+            self.book_sequences.remove(&cmd.instrument_id);
+            self.book_checksum_states.remove(&cmd.instrument_id);
+            self.book_depth10_states.remove(&cmd.instrument_id);
+            self.book_depths.remove(&cmd.instrument_id);
+        } else {
+            self.book_depth10_states.remove(&cmd.instrument_id);
+        }
+        let raw_symbol = raw_symbol_for_instrument(cmd.instrument_id);
+        let ws = self.ws_client.clone();
+
+        self.spawn_ws(
+            async move {
+                if should_unsubscribe {
+                    ws.unsubscribe_books(raw_symbol)
+                        .await
+                        .context("books depth10 unsubscription")?;
+                }
+                Ok(())
+            },
+            "books depth10 unsubscription",
         );
 
         Ok(())
@@ -1125,6 +1813,10 @@ impl DataClient for BitgetDataClient {
         Ok(())
     }
 
+    fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
+        self.unsubscribe_ticker_quote(cmd.instrument_id)
+    }
+
     fn unsubscribe_mark_prices(&mut self, cmd: &UnsubscribeMarkPrices) -> anyhow::Result<()> {
         self.unsubscribe_ticker_derived(cmd.instrument_id, TICKER_SUB_MARK, "mark price")
     }
@@ -1135,6 +1827,23 @@ impl DataClient for BitgetDataClient {
 
     fn unsubscribe_funding_rates(&mut self, cmd: &UnsubscribeFundingRates) -> anyhow::Result<()> {
         self.unsubscribe_ticker_derived(cmd.instrument_id, TICKER_SUB_FUNDING, "funding rate")
+    }
+
+    fn unsubscribe_instrument_status(
+        &mut self,
+        cmd: &UnsubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        self.configured_product_type_for(cmd.instrument_id)?;
+        self.instrument_status_subs.remove(&cmd.instrument_id);
+        Ok(())
+    }
+
+    fn unsubscribe_instrument_close(
+        &mut self,
+        cmd: &UnsubscribeInstrumentClose,
+    ) -> anyhow::Result<()> {
+        self.configured_product_type_for(cmd.instrument_id)?;
+        Ok(())
     }
 
     fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
@@ -1148,9 +1857,7 @@ impl DataClient for BitgetDataClient {
             spec.step.get() as u64,
         )?;
         let raw_symbol = raw_symbol_for_instrument(instrument_id);
-        let channel = format!("candle{interval}");
-        let topic_key =
-            BitgetWsArg::new(product_type, channel, Some(raw_symbol.clone())).topic_key();
+        let topic_key = BitgetWsArg::kline(product_type, raw_symbol.clone(), interval).topic_key();
         self.bar_types.remove(&topic_key);
 
         let ws = self.ws_client.clone();
@@ -1167,11 +1874,24 @@ impl DataClient for BitgetDataClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
+        if self.cancellation_token.is_cancelled() {
+            self.cancellation_token = CancellationToken::new();
+        }
+
         let ts_init = self.clock.get_time_ns();
         let instruments = self
             .http_client
             .request_instruments(self.config.product_type, ts_init)
             .await?;
+
+        match self
+            .http_client
+            .request_instrument_statuses(self.config.product_type)
+            .await
+        {
+            Ok(statuses) => self.status_cache.store(statuses),
+            Err(e) => log::warn!("Failed to seed Bitget instrument status cache: {e:?}"),
+        }
 
         for instrument in instruments {
             upsert_instrument(&self.instruments, instrument.clone());
@@ -1185,19 +1905,34 @@ impl DataClient for BitgetDataClient {
             .await
             .context("connect Bitget public WebSocket")?;
         self.start_ws_dispatch()?;
+
+        if let Some(interval_secs) = self.config.instrument_poll_interval_secs
+            && interval_secs > 0
+        {
+            self.spawn_instrument_status_polling(interval_secs);
+        }
+
         self.is_connected.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.cancellation_token.cancel();
         if let Err(e) = self.ws_client.disconnect().await {
             log::warn!("Error disconnecting Bitget WebSocket: {e:?}");
         }
+        self.abort_tasks();
         self.abort_ws_task();
         self.bar_types.store(Default::default());
         self.book_sequences.store(Default::default());
         self.book_depths.store(Default::default());
+        self.book_checksum_states.store(Default::default());
+        self.book_depth10_states.store(Default::default());
+        self.book_subs.store(Default::default());
         self.ticker_subs.store(Default::default());
+        self.instrument_status_subs.store(Default::default());
+        self.status_cache.store(Default::default());
+        self.cancellation_token = CancellationToken::new();
         self.is_connected.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -1905,6 +2640,57 @@ mod tests {
     }
 
     #[rstest]
+    fn book_sub_state_shares_underlying_exchange_subscription() {
+        let client = client(BitgetProductType::Spot);
+        let instrument_id = InstrumentId::from("BTCUSDT.BITGET");
+
+        assert!(client.add_book_sub(instrument_id, BOOK_SUB_DELTAS));
+        assert!(!client.add_book_sub(instrument_id, BOOK_SUB_DEPTH10));
+        assert!(!client.remove_book_sub(instrument_id, BOOK_SUB_DELTAS));
+        assert!(client.book_subs.contains_key(&instrument_id));
+        assert!(client.remove_book_sub(instrument_id, BOOK_SUB_DEPTH10));
+        assert!(!client.book_subs.contains_key(&instrument_id));
+    }
+
+    #[rstest]
+    fn instrument_status_diff_emits_only_subscribed_changes() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let subscribed_id = InstrumentId::from("BTCUSDT.BITGET");
+        let unsubscribed_id = InstrumentId::from("ETHUSDT.BITGET");
+        let mut cached = AHashMap::new();
+        cached.insert(subscribed_id, MarketStatusAction::Trading);
+        cached.insert(unsubscribed_id, MarketStatusAction::Trading);
+        let mut new_statuses = AHashMap::new();
+        new_statuses.insert(subscribed_id, MarketStatusAction::Halt);
+        new_statuses.insert(unsubscribed_id, MarketStatusAction::Halt);
+        let subscriptions = [subscribed_id].into_iter().collect();
+
+        diff_and_emit_instrument_statuses(
+            &new_statuses,
+            &mut cached,
+            &subscriptions,
+            &sender,
+            UnixNanos::new(10),
+            UnixNanos::new(11),
+        );
+
+        match receiver.try_recv().unwrap() {
+            DataEvent::InstrumentStatus(status) => {
+                assert_eq!(status.instrument_id, subscribed_id);
+                assert_eq!(status.action, MarketStatusAction::Halt);
+                assert_eq!(status.is_trading, Some(false));
+            }
+            event => panic!("expected instrument status, got {event:?}"),
+        }
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(cached.get(&subscribed_id), Some(&MarketStatusAction::Halt));
+        assert_eq!(
+            cached.get(&unsubscribed_id),
+            Some(&MarketStatusAction::Halt)
+        );
+    }
+
+    #[rstest]
     fn futures_ticker_subscription_rejects_spot_product() {
         let client = client(BitgetProductType::Spot);
         let err = client
@@ -1936,6 +2722,8 @@ mod tests {
         let book_sequences = Arc::new(AtomicMap::new());
         let book_depths = Arc::new(AtomicMap::new());
         let book_checksum_states = Arc::new(AtomicMap::new());
+        let book_depth10_states = Arc::new(AtomicMap::new());
+        let book_subs = Arc::new(AtomicMap::new());
         let ticker_subs = Arc::new(AtomicMap::new());
         let instrument = btcusdt_spot();
         let instrument_id = instrument.id();
@@ -1943,6 +2731,7 @@ mod tests {
         instruments.insert(instrument_id, instrument);
         book_sequences.insert(instrument_id, 10);
         book_depths.insert(instrument_id, Some(50));
+        book_subs.insert(instrument_id, [BOOK_SUB_DELTAS].into_iter().collect());
 
         let message = BitgetWsMessage::Data(crate::websocket::messages::BitgetWsEvent {
             event: None,
@@ -1960,6 +2749,7 @@ mod tests {
                 "checksum": 1,
                 "ts": "1700000000000"
             })],
+            ts: None,
             code: None,
             msg: None,
         });
@@ -1974,6 +2764,8 @@ mod tests {
             &book_sequences,
             &book_depths,
             &book_checksum_states,
+            &book_depth10_states,
+            &book_subs,
             &ticker_subs,
             get_atomic_clock_realtime(),
         )
@@ -1990,6 +2782,87 @@ mod tests {
             }
             event => panic!("expected recovered snapshot deltas, got {event:?}"),
         }
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn books_ws_dispatch_emits_depth10_when_requested() {
+        let http = BitgetHttpClient::new_with_env(
+            None,
+            None,
+            None,
+            Some("http://localhost".to_string()),
+            1,
+            None,
+        )
+        .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let instruments = Arc::new(AtomicMap::new());
+        let bar_types = Arc::new(AtomicMap::new());
+        let book_sequences = Arc::new(AtomicMap::new());
+        let book_depths = Arc::new(AtomicMap::new());
+        let book_checksum_states = Arc::new(AtomicMap::new());
+        let book_depth10_states = Arc::new(AtomicMap::new());
+        let book_subs = Arc::new(AtomicMap::new());
+        let ticker_subs = Arc::new(AtomicMap::new());
+        let instrument = btcusdt_spot();
+        let instrument_id = instrument.id();
+
+        instruments.insert(instrument_id, instrument);
+        book_subs.insert(instrument_id, [BOOK_SUB_DEPTH10].into_iter().collect());
+
+        let message = BitgetWsMessage::Data(crate::websocket::messages::BitgetWsEvent {
+            event: None,
+            action: Some("snapshot".to_string()),
+            arg: Some(BitgetWsArg::new(
+                BitgetProductType::Spot,
+                "books",
+                Some("BTCUSDT".to_string()),
+            )),
+            data: vec![json!({
+                "b": [["100.00", "1.000000"], ["99.00", "3.000000"]],
+                "a": [["101.00", "2.000000"]],
+                "seq": 42,
+                "pseq": 0,
+                "ts": "1700000000000"
+            })],
+            ts: None,
+            code: None,
+            msg: None,
+        });
+
+        handle_bitget_ws_message(
+            message,
+            &sender,
+            &http,
+            BitgetProductType::Spot,
+            &instruments,
+            &bar_types,
+            &book_sequences,
+            &book_depths,
+            &book_checksum_states,
+            &book_depth10_states,
+            &book_subs,
+            &ticker_subs,
+            get_atomic_clock_realtime(),
+        )
+        .await;
+
+        match receiver.try_recv().unwrap() {
+            DataEvent::Data(Data::Depth10(depth)) => {
+                assert_eq!(depth.instrument_id, instrument_id);
+                assert_eq!(depth.sequence, 42);
+                assert_eq!(depth.ts_event, UnixNanos::from_millis(1_700_000_000_000));
+                assert_eq!(depth.bids[0].price.to_string(), "100.00");
+                assert_eq!(depth.bids[0].size.to_string(), "1.000000");
+                assert_eq!(depth.asks[0].price.to_string(), "101.00");
+                assert_eq!(depth.asks[0].size.to_string(), "2.000000");
+                assert_eq!(depth.bid_counts[0], 1);
+                assert_eq!(depth.ask_counts[0], 1);
+            }
+            event => panic!("expected order book depth10, got {event:?}"),
+        }
+        assert!(book_depth10_states.contains_key(&instrument_id));
         assert!(receiver.try_recv().is_err());
     }
 
@@ -2152,7 +3025,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticker_ws_dispatch_emits_requested_mark_index_and_funding_updates() {
+    async fn ticker_ws_dispatch_emits_requested_quote_mark_index_and_funding_updates() {
         let http = BitgetHttpClient::new_with_env(
             None,
             None,
@@ -2168,6 +3041,8 @@ mod tests {
         let book_sequences = Arc::new(AtomicMap::new());
         let book_depths = Arc::new(AtomicMap::new());
         let book_checksum_states = Arc::new(AtomicMap::new());
+        let book_depth10_states = Arc::new(AtomicMap::new());
+        let book_subs = Arc::new(AtomicMap::new());
         let ticker_subs = Arc::new(AtomicMap::new());
         let instrument = btcusdt_perp();
         let instrument_id = instrument.id();
@@ -2175,9 +3050,14 @@ mod tests {
         instruments.insert(instrument_id, instrument);
         ticker_subs.insert(
             instrument_id,
-            [TICKER_SUB_MARK, TICKER_SUB_INDEX, TICKER_SUB_FUNDING]
-                .into_iter()
-                .collect(),
+            [
+                TICKER_SUB_QUOTE,
+                TICKER_SUB_MARK,
+                TICKER_SUB_INDEX,
+                TICKER_SUB_FUNDING,
+            ]
+            .into_iter()
+            .collect(),
         );
 
         let message = BitgetWsMessage::Data(crate::websocket::messages::BitgetWsEvent {
@@ -2190,12 +3070,17 @@ mod tests {
             )),
             data: vec![json!({
                 "symbol": "BTCUSDT",
+                "lastPrice": "100.1",
+                "bid1Price": "100.0",
+                "bid1Size": "1.5",
+                "ask1Price": "100.4",
+                "ask1Size": "2.5",
                 "markPrice": "100.2",
                 "indexPrice": "100.3",
                 "fundingRate": "0.0001",
-                "nextFundingTime": "1700003600000",
-                "ts": "1700000000000"
+                "nextFundingTime": "1700003600000"
             })],
+            ts: Some("1700000000000".to_string()),
             code: None,
             msg: None,
         });
@@ -2210,10 +3095,23 @@ mod tests {
             &book_sequences,
             &book_depths,
             &book_checksum_states,
+            &book_depth10_states,
+            &book_subs,
             &ticker_subs,
             get_atomic_clock_realtime(),
         )
         .await;
+
+        match receiver.try_recv().unwrap() {
+            DataEvent::Data(Data::Quote(quote)) => {
+                assert_eq!(quote.instrument_id, instrument_id);
+                assert_eq!(quote.bid_price.to_string(), "100.0");
+                assert_eq!(quote.ask_price.to_string(), "100.4");
+                assert_eq!(quote.bid_size.to_string(), "1.500");
+                assert_eq!(quote.ask_size.to_string(), "2.500");
+            }
+            event => panic!("expected quote tick, got {event:?}"),
+        }
 
         match receiver.try_recv().unwrap() {
             DataEvent::Data(Data::MarkPriceUpdate(update)) => {

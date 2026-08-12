@@ -267,7 +267,7 @@ mod tests {
         assert!(!config.has_api_credentials());
         assert_eq!(config.product_type, BitgetProductType::UsdtFutures);
         assert_eq!(config.http_base_url(), "https://api.bitget.com");
-        assert_eq!(config.ws_public_url(), "wss://ws.bitget.com/v2/ws/public");
+        assert_eq!(config.ws_public_url(), "wss://ws.bitget.com/v3/ws/public");
         assert_eq!(config.heartbeat_interval_secs, 30);
     }
 
@@ -277,7 +277,7 @@ mod tests {
 
         assert!(!config.has_api_credentials());
         assert_eq!(config.product_type, BitgetProductType::UsdtFutures);
-        assert_eq!(config.ws_private_url(), "wss://ws.bitget.com/v2/ws/private");
+        assert_eq!(config.ws_private_url(), "wss://ws.bitget.com/v3/ws/private");
         assert_eq!(config.reconnect_reconciliation_lookback_mins, Some(60));
     }
 

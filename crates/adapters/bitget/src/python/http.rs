@@ -214,6 +214,34 @@ impl BitgetHttpClient {
         })
     }
 
+    /// Fetches instrument info and returns the current status of each symbol.
+    #[pyo3(name = "request_instrument_statuses")]
+    fn py_request_instrument_statuses<'py>(
+        &self,
+        py: Python<'py>,
+        product_type: BitgetProductType,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let statuses = client
+                .request_instrument_statuses(product_type)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let dict = PyDict::new(py);
+                for (instrument_id, action) in statuses {
+                    dict.set_item(
+                        instrument_id.into_bound_py_any(py)?,
+                        action.into_bound_py_any(py)?,
+                    )?;
+                }
+                Ok(dict.into_any().unbind())
+            })
+        })
+    }
+
     /// Requests an order book snapshot and returns Nautilus order book deltas.
     #[pyo3(name = "request_orderbook_snapshot")]
     #[pyo3(signature = (product_type, instrument_id, limit = None, ts_init_ns = None))]

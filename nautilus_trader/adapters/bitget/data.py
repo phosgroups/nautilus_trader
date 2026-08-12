@@ -71,9 +71,14 @@ from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import DataType
 from nautilus_trader.model.data import FundingRateUpdate
+from nautilus_trader.model.data import IndexPriceUpdate
+from nautilus_trader.model.data import InstrumentStatus
+from nautilus_trader.model.data import MarkPriceUpdate
 from nautilus_trader.model.data import OrderBookDeltas
 from nautilus_trader.model.data import TradeTick
+from nautilus_trader.model.data import capsule_to_data
 from nautilus_trader.model.enums import BookType
+from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.enums import PriceType
 from nautilus_trader.model.enums import book_type_to_str
 from nautilus_trader.model.identifiers import ClientId
@@ -115,12 +120,17 @@ class BitgetDataClient(LiveMarketDataClient):
         self._http_client = client
         self._instrument_provider: BitgetInstrumentProvider = instrument_provider
         self._product_type = config.product_type
+        self._instrument_status_poll_secs: int | None = config.instrument_poll_interval_secs
+        self._instrument_status_task: asyncio.Task | None = None
+        self._instrument_status_subs: set[InstrumentId] = set()
+        self._status_cache: dict[InstrumentId, MarketStatusAction] = {}
         self._ws_client = nautilus_pyo3.BitgetWebSocketClient.new_public(
             product_type=self._product_type,
             environment=self._environment,
             url=config.base_url_ws_public,
             heartbeat_secs=30,
             proxy_url=config.proxy_url,
+            http_url=config.base_url_http,
         )
 
         self._log.info(f"product_type={self._product_type}", LogColor.BLUE)
@@ -141,20 +151,32 @@ class BitgetDataClient(LiveMarketDataClient):
         self._cache_instruments()
         self._send_all_instruments_to_data_engine()
 
-        await self._ws_client.connect()
+        await self._ws_client.connect(loop_=self._loop, callback=self._handle_msg)
         await self._ws_client.wait_until_active(timeout_secs=30.0)
         self._log.info(f"Connected to public websocket {self._ws_client.url}", LogColor.BLUE)
-        self.create_task(self._consume_ws_events(), log_msg="bitget_public_ws_consume")
+
+        if self._instrument_status_poll_secs:
+            await self._seed_instrument_status_cache()
+            self._instrument_status_task = self.create_task(
+                self._poll_instrument_statuses(self._instrument_status_poll_secs),
+            )
 
     async def _disconnect(self) -> None:
         self._http_client.cancel_all_requests()
+
+        if self._instrument_status_task:
+            self._log.debug("Canceling task 'poll_instrument_statuses'")
+            self._instrument_status_task.cancel()
+            self._instrument_status_task = None
 
         if not self._ws_client.is_closed():
             await self._ws_client.close()
             self._log.info(f"Disconnected from {self._ws_client.url}", LogColor.BLUE)
 
     def _cache_instruments(self) -> None:
-        self._http_client.cache_instruments(self._instrument_provider.instruments_pyo3())
+        instruments_pyo3 = self._instrument_provider.instruments_pyo3()
+        self._http_client.cache_instruments(instruments_pyo3)
+        self._ws_client.cache_instruments(instruments_pyo3)
 
         for currency in self._instrument_provider.currencies().values():
             self._cache.add_currency(currency)
@@ -169,17 +191,6 @@ class BitgetDataClient(LiveMarketDataClient):
         for instrument in self._instrument_provider.get_all().values():
             self._handle_data(instrument)
 
-    async def _consume_ws_events(self) -> None:
-        while self.is_connected or not self._ws_client.is_closed():
-            event = await self._ws_client.next_event()
-            if event is None:
-                if self._ws_client.is_closed():
-                    return
-                await asyncio.sleep(0.1)
-                continue
-
-            self._handle_ws_event(event)
-
     def _handle_ws_event(self, event: Any) -> None:
         if not isinstance(event, dict):
             self._log.debug(f"Ignoring Bitget websocket event {event!r}")
@@ -193,6 +204,37 @@ class BitgetDataClient(LiveMarketDataClient):
         else:
             self._log.debug(f"Received Bitget websocket data: {event}")
 
+    def _handle_msg(self, msg: Any) -> None:
+        try:
+            if nautilus_pyo3.is_pycapsule(msg):
+                data = capsule_to_data(msg)
+                self._handle_data(data)
+                return
+
+            if isinstance(msg, nautilus_pyo3.MarkPriceUpdate):
+                self._handle_data(MarkPriceUpdate.from_pyo3(msg))
+                return
+
+            if isinstance(msg, nautilus_pyo3.IndexPriceUpdate):
+                self._handle_data(IndexPriceUpdate.from_pyo3(msg))
+                return
+
+            if isinstance(msg, nautilus_pyo3.FundingRateUpdate):
+                self._handle_data(FundingRateUpdate.from_pyo3(msg))
+                return
+
+            if isinstance(msg, nautilus_pyo3.InstrumentStatus):
+                self._handle_data(InstrumentStatus.from_pyo3(msg))
+                return
+
+            if isinstance(msg, dict):
+                self._handle_ws_event(msg)
+                return
+
+            self._log.debug(f"Ignoring Bitget websocket message {msg!r}")
+        except Exception as e:
+            self._log.exception("Error handling Bitget websocket message", e)
+
     async def _ensure_instrument(self, instrument_id: InstrumentId) -> Instrument | None:
         instrument = self._instrument_provider.find(instrument_id) or self._cache.instrument(
             instrument_id,
@@ -204,6 +246,9 @@ class BitgetDataClient(LiveMarketDataClient):
         instrument = self._instrument_provider.find(instrument_id)
         if instrument is not None:
             self._cache.add_instrument(instrument)
+            pyo3_instrument = instrument.to_pyo3()
+            self._http_client.cache_instrument(pyo3_instrument)
+            self._ws_client.cache_instrument(pyo3_instrument)
         return instrument
 
     @staticmethod
@@ -231,48 +276,63 @@ class BitgetDataClient(LiveMarketDataClient):
             )
             return
 
-        raw_symbol = self._raw_symbol(command.instrument_id)
-        await self._ws_client.subscribe_books(raw_symbol)
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        depth = command.depth or None
+        await self._ws_client.subscribe_book_deltas(pyo3_instrument_id, depth=depth)
 
     async def _subscribe_order_book_depth(self, command: SubscribeOrderBook) -> None:
-        await self._subscribe_order_book_deltas(command)
+        if command.book_type != BookType.L2_MBP:
+            self._log.warning(
+                f"Book type {book_type_to_str(command.book_type)} not supported by Bitget",
+            )
+            return
+
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.subscribe_book_depth10(pyo3_instrument_id)
 
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
-        raw_symbol = self._raw_symbol(command.instrument_id)
-        await self._ws_client.subscribe_ticker(raw_symbol)
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.subscribe_quotes(pyo3_instrument_id)
 
     async def _subscribe_trade_ticks(self, command: SubscribeTradeTicks) -> None:
         raw_symbol = self._raw_symbol(command.instrument_id)
         await self._ws_client.subscribe_trades(raw_symbol)
 
     async def _subscribe_mark_prices(self, command: SubscribeMarkPrices) -> None:
-        raw_symbol = self._raw_symbol(command.instrument_id)
-        await self._ws_client.subscribe_ticker(raw_symbol)
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.subscribe_mark_prices(pyo3_instrument_id)
 
     async def _subscribe_index_prices(self, command: SubscribeIndexPrices) -> None:
-        raw_symbol = self._raw_symbol(command.instrument_id)
-        await self._ws_client.subscribe_ticker(raw_symbol)
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.subscribe_index_prices(pyo3_instrument_id)
 
     async def _subscribe_funding_rates(self, command: SubscribeFundingRates) -> None:
-        raw_symbol = self._raw_symbol(command.instrument_id)
-        await self._ws_client.subscribe_ticker(raw_symbol)
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.subscribe_funding_rates(pyo3_instrument_id)
 
     async def _subscribe_bars(self, command: SubscribeBars) -> None:
-        interval = command.params.get("interval") if command.params else None
-        if interval is None:
-            self._log.warning(
-                "Bitget candle subscriptions require params['interval'] until BarType mapping is exposed",
-            )
-            return
-
-        raw_symbol = self._raw_symbol(command.bar_type.instrument_id)
-        await self._ws_client.subscribe_candles(raw_symbol, str(interval))
+        pyo3_bar_type = nautilus_pyo3.BarType.from_str(str(command.bar_type))
+        await self._ws_client.subscribe_bars(pyo3_bar_type)
 
     async def _subscribe_instrument_status(self, command: SubscribeInstrumentStatus) -> None:
-        pass
+        self._log.debug(
+            f"subscribe_instrument_status: {command.instrument_id} "
+            "(status changes detected via periodic v3 UTA instrument polling)",
+        )
+        self._instrument_status_subs.add(command.instrument_id)
+        action = self._status_cache.get(command.instrument_id)
+        if action is not None:
+            self._emit_instrument_status(
+                command.instrument_id,
+                action,
+                self._clock.timestamp_ns(),
+            )
 
     async def _subscribe_instrument_close(self, command: SubscribeInstrumentClose) -> None:
-        pass
+        self._log.warning(
+            f"Bitget instrument close subscription is not supported for {command.instrument_id}: "
+            "v3 UTA instruments expose status but not an instrument close price",
+        )
 
     async def _subscribe_option_greeks(self, command: SubscribeOptionGreeks) -> None:
         self._log.warning("Bitget option greeks subscriptions are not supported")
@@ -287,34 +347,43 @@ class BitgetDataClient(LiveMarketDataClient):
         pass
 
     async def _unsubscribe_order_book_deltas(self, command: UnsubscribeOrderBook) -> None:
-        pass
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.unsubscribe_book_deltas(pyo3_instrument_id)
 
     async def _unsubscribe_order_book_depth(self, command: UnsubscribeOrderBook) -> None:
-        pass
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.unsubscribe_book_depth10(pyo3_instrument_id)
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
-        pass
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.unsubscribe_quotes(pyo3_instrument_id)
 
     async def _unsubscribe_trade_ticks(self, command: UnsubscribeTradeTicks) -> None:
-        pass
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.unsubscribe_trade_ticks(pyo3_instrument_id)
 
     async def _unsubscribe_mark_prices(self, command: UnsubscribeMarkPrices) -> None:
-        pass
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.unsubscribe_mark_prices(pyo3_instrument_id)
 
     async def _unsubscribe_index_prices(self, command: UnsubscribeIndexPrices) -> None:
-        pass
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.unsubscribe_index_prices(pyo3_instrument_id)
 
     async def _unsubscribe_funding_rates(self, command: UnsubscribeFundingRates) -> None:
-        pass
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.unsubscribe_funding_rates(pyo3_instrument_id)
 
     async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
-        pass
+        pyo3_bar_type = nautilus_pyo3.BarType.from_str(str(command.bar_type))
+        await self._ws_client.unsubscribe_bars(pyo3_bar_type)
 
     async def _unsubscribe_instrument_status(self, command: UnsubscribeInstrumentStatus) -> None:
-        pass
+        self._log.debug(f"unsubscribe_instrument_status: {command.instrument_id}")
+        self._instrument_status_subs.discard(command.instrument_id)
 
     async def _unsubscribe_instrument_close(self, command: UnsubscribeInstrumentClose) -> None:
-        pass
+        self._log.debug(f"unsubscribe_instrument_close: {command.instrument_id} (unsupported)")
 
     async def _unsubscribe_option_greeks(self, command: UnsubscribeOptionGreeks) -> None:
         pass
@@ -458,6 +527,80 @@ class BitgetDataClient(LiveMarketDataClient):
     async def _request_forward_prices(self, request: RequestForwardPrices) -> None:
         self._log.warning("Bitget forward prices are not supported")
         self._handle_forward_prices([], request.id, request.params or {})
+
+    async def _seed_instrument_status_cache(self) -> None:
+        try:
+            statuses = await self._http_client.request_instrument_statuses(self._product_type)
+            self._status_cache.update(statuses)
+        except Exception as e:
+            self._log.warning(f"Failed to seed Bitget instrument status cache: {e}")
+        self._log.info(
+            f"Seeded Bitget instrument status cache with {len(self._status_cache)} entries",
+            LogColor.BLUE,
+        )
+
+    async def _poll_instrument_statuses(self, interval_secs: int) -> None:
+        while True:
+            try:
+                await asyncio.sleep(interval_secs)
+
+                if not self._instrument_status_subs:
+                    continue
+
+                try:
+                    new_statuses = await self._http_client.request_instrument_statuses(
+                        self._product_type,
+                    )
+                except Exception as e:
+                    self._log.warning(f"Bitget instrument status poll failed: {e}")
+                    continue
+
+                self._diff_and_emit_statuses(new_statuses)
+            except asyncio.CancelledError:
+                self._log.debug("Canceled task 'poll_instrument_statuses'")
+                return
+
+    def _diff_and_emit_statuses(
+        self,
+        new_statuses: dict[InstrumentId, MarketStatusAction],
+    ) -> None:
+        now = self._clock.timestamp_ns()
+
+        for instrument_id, new_action in new_statuses.items():
+            cached = self._status_cache.get(instrument_id)
+            if cached is None or cached != new_action:
+                self._status_cache[instrument_id] = new_action
+                if instrument_id in self._instrument_status_subs:
+                    self._emit_instrument_status(instrument_id, new_action, now)
+
+        removed = [iid for iid in self._status_cache if iid not in new_statuses]
+        for instrument_id in removed:
+            del self._status_cache[instrument_id]
+            if instrument_id in self._instrument_status_subs:
+                self._emit_instrument_status(
+                    instrument_id,
+                    MarketStatusAction.NOT_AVAILABLE_FOR_TRADING,
+                    now,
+                )
+
+    def _emit_instrument_status(
+        self,
+        instrument_id: InstrumentId,
+        action: MarketStatusAction,
+        ts_ns: int,
+    ) -> None:
+        status = InstrumentStatus(
+            instrument_id=instrument_id,
+            action=action,
+            ts_event=ts_ns,
+            ts_init=ts_ns,
+            reason=None,
+            trading_event=None,
+            is_trading=action == MarketStatusAction.TRADING,
+            is_quoting=None,
+            is_short_sell_restricted=None,
+        )
+        self._handle_data(status)
 
     async def _request_order_book_snapshot_response(
         self,

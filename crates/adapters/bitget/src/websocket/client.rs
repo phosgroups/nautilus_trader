@@ -569,9 +569,9 @@ impl BitgetWebSocketClient {
             .await
     }
 
-    /// Subscribes to a candlestick channel for a raw Bitget symbol.
+    /// Subscribes to the v3 UTA kline topic for a raw Bitget symbol.
     ///
-    /// Pass intervals such as `"1m"` or `"1H"`; the topic sent to Bitget is `candle{interval}`.
+    /// Pass intervals such as `"1m"` or `"1H"`.
     ///
     /// # Errors
     ///
@@ -581,9 +581,10 @@ impl BitgetWebSocketClient {
         raw_symbol: impl Into<String>,
         interval: impl AsRef<str>,
     ) -> BitgetWsResult<()> {
-        self.subscribe(vec![self.arg(
-            format!("candle{}", interval.as_ref()),
-            Some(raw_symbol.into()),
+        self.subscribe(vec![BitgetWsArg::kline(
+            self.product_type,
+            raw_symbol.into(),
+            interval.as_ref().to_string(),
         )])
         .await
     }
@@ -598,9 +599,10 @@ impl BitgetWebSocketClient {
         raw_symbol: impl Into<String>,
         interval: impl AsRef<str>,
     ) -> BitgetWsResult<()> {
-        self.unsubscribe(vec![self.arg(
-            format!("candle{}", interval.as_ref()),
-            Some(raw_symbol.into()),
+        self.unsubscribe(vec![BitgetWsArg::kline(
+            self.product_type,
+            raw_symbol.into(),
+            interval.as_ref().to_string(),
         )])
         .await
     }
@@ -646,8 +648,7 @@ impl BitgetWebSocketClient {
     /// Returns an error if the subscribe command cannot be sent or the private session is not
     /// authenticated.
     pub async fn subscribe_fills(&self) -> BitgetWsResult<()> {
-        self.subscribe_private_channel("fill", Some("default".to_string()))
-            .await
+        self.subscribe_private_channel("fill", None).await
     }
 
     /// Subscribes to the private positions channel.
@@ -985,6 +986,33 @@ mod tests {
         assert_eq!(value["args"].as_array().unwrap().len(), 2);
         assert_eq!(value["args"][0]["instType"], "spot");
         assert_eq!(value["args"][1]["instType"], "usdt-futures");
+    }
+
+    #[rstest]
+    fn subscribe_payload_uses_v3_kline_arg_shape() {
+        let payload = subscribe_payload(vec![BitgetWsArg::kline(
+            BitgetProductType::UsdtFutures,
+            "BTCUSDT",
+            "1m",
+        )])
+        .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+
+        assert_eq!(value["op"], "subscribe");
+        assert_eq!(value["args"][0]["instType"], "usdt-futures");
+        assert_eq!(value["args"][0]["topic"], "kline");
+        assert_eq!(value["args"][0]["symbol"], "BTCUSDT");
+        assert_eq!(value["args"][0]["interval"], "1m");
+    }
+
+    #[rstest]
+    fn private_fill_payload_omits_legacy_default_symbol() {
+        let payload = subscribe_payload(vec![BitgetWsArg::private("fill", None)]).unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+
+        assert_eq!(value["args"][0]["instType"], "UTA");
+        assert_eq!(value["args"][0]["topic"], "fill");
+        assert!(value["args"][0].get("symbol").is_none());
     }
 
     #[rstest]

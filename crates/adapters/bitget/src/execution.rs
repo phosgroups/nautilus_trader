@@ -1951,6 +1951,7 @@ mod tests {
             action: Some("snapshot".to_string()),
             arg: Some(BitgetWsArg::private(topic, None)),
             data,
+            ts: None,
             code: None,
             msg: None,
         })

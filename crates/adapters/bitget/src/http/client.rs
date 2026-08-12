@@ -24,6 +24,7 @@ use std::{
     },
 };
 
+use ahash::AHashMap;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "python")]
@@ -31,6 +32,7 @@ use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{AtomicMap, UnixNanos, consts::NAUTILUS_USER_AGENT};
 use nautilus_model::{
     data::{Bar, BarType, FundingRateUpdate, OrderBookDeltas, TradeTick},
+    enums::MarketStatusAction,
     events::AccountState,
     identifiers::{AccountId, InstrumentId},
     instruments::{Instrument, InstrumentAny},
@@ -70,8 +72,8 @@ use crate::common::{
         BitgetModifyOrderRequest, BitgetSubmitOrderRequest,
     },
     parse::{
-        bar_spec_to_bitget_interval_for_product, parse_candle_bar, parse_funding_rate,
-        parse_market_trade, parse_mix_account_state, parse_orderbook_snapshot,
+        bar_spec_to_bitget_interval_for_product, bitget_symbol_status_action, parse_candle_bar,
+        parse_funding_rate, parse_market_trade, parse_mix_account_state, parse_orderbook_snapshot,
         parse_spot_account_state, parse_spot_instrument, parse_usdt_perp_instrument,
     },
     symbol::extract_raw_symbol,
@@ -1474,6 +1476,53 @@ impl BitgetHttpClient {
         };
 
         Ok(instruments)
+    }
+
+    /// Requests instrument statuses for the configured Bitget product type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails.
+    pub async fn request_instrument_statuses(
+        &self,
+        product_type: BitgetProductType,
+    ) -> anyhow::Result<AHashMap<InstrumentId, MarketStatusAction>> {
+        let mut statuses = AHashMap::new();
+
+        match product_type {
+            BitgetProductType::Spot => {
+                for definition in self.raw.request_spot_symbols().await? {
+                    let instrument_id =
+                        crate::common::symbol::BitgetSymbol::spot(&definition.symbol)?
+                            .to_instrument_id();
+                    statuses.insert(
+                        instrument_id,
+                        bitget_symbol_status_action(definition.status.as_deref()),
+                    );
+                }
+            }
+            BitgetProductType::UsdtFutures => {
+                for definition in self.raw.request_usdt_futures_contracts().await? {
+                    if definition
+                        .contract_type
+                        .as_deref()
+                        .is_some_and(|s| !s.eq_ignore_ascii_case("perpetual"))
+                    {
+                        continue;
+                    }
+
+                    let instrument_id =
+                        crate::common::symbol::BitgetSymbol::usdt_perp(&definition.symbol)?
+                            .to_instrument_id();
+                    statuses.insert(
+                        instrument_id,
+                        bitget_symbol_status_action(definition.symbol_status.as_deref()),
+                    );
+                }
+            }
+        }
+
+        Ok(statuses)
     }
 
     /// Requests an order book snapshot and converts it to Nautilus deltas.

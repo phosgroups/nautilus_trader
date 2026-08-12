@@ -35,10 +35,10 @@ pub static BITGET_CLIENT_ID: LazyLock<ClientId> =
 pub const BITGET_HTTP_URL: &str = "https://api.bitget.com";
 
 /// Bitget public WebSocket URL.
-pub const BITGET_WS_PUBLIC_URL: &str = "wss://ws.bitget.com/v2/ws/public";
+pub const BITGET_WS_PUBLIC_URL: &str = "wss://ws.bitget.com/v3/ws/public";
 
 /// Bitget private WebSocket URL.
-pub const BITGET_WS_PRIVATE_URL: &str = "wss://ws.bitget.com/v2/ws/private";
+pub const BITGET_WS_PRIVATE_URL: &str = "wss://ws.bitget.com/v3/ws/private";
 
 /// Bitget demo public WebSocket URL.
 pub const BITGET_WS_DEMO_PUBLIC_URL: &str = "wss://wspap.bitget.com/v3/ws/public";

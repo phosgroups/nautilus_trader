@@ -51,6 +51,24 @@ where
     }
 }
 
+fn deserialize_optional_string_or_number<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+
+    match value {
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(Value::Number(value)) => Ok(Some(value.to_string())),
+        Some(Value::Null) | None => Ok(None),
+        Some(value) => Err(serde::de::Error::custom(format!(
+            "expected Bitget field as a string or number, got {value}",
+        ))),
+    }
+}
+
 /// Bitget WebSocket operation.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -74,6 +92,9 @@ pub struct BitgetWsArg {
     /// Raw Bitget symbol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
+    /// Optional v3 UTA kline interval, e.g. `1m` or `1H`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval: Option<String>,
     /// Optional coin selector for account-like topics.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coin: Option<String>,
@@ -91,6 +112,23 @@ impl BitgetWsArg {
             inst_type: product_type.as_ws_public_inst_type().to_string(),
             topic: topic.into(),
             symbol,
+            interval: None,
+            coin: None,
+        }
+    }
+
+    /// Creates a new public v3 UTA kline topic argument for a Bitget product/symbol/interval.
+    #[must_use]
+    pub fn kline(
+        product_type: BitgetProductType,
+        symbol: impl Into<String>,
+        interval: impl Into<String>,
+    ) -> Self {
+        Self {
+            inst_type: product_type.as_ws_public_inst_type().to_string(),
+            topic: "kline".to_string(),
+            symbol: Some(symbol.into()),
+            interval: Some(interval.into()),
             coin: None,
         }
     }
@@ -102,6 +140,7 @@ impl BitgetWsArg {
             inst_type: "UTA".to_string(),
             topic: topic.into(),
             symbol,
+            interval: None,
             coin: None,
         }
     }
@@ -113,6 +152,7 @@ impl BitgetWsArg {
             inst_type: "UTA".to_string(),
             topic: "account".to_string(),
             symbol: None,
+            interval: None,
             coin: None,
         }
     }
@@ -120,11 +160,19 @@ impl BitgetWsArg {
     /// Returns a stable key for de-duplicating and replaying subscriptions.
     #[must_use]
     pub fn topic_key(&self) -> String {
-        match (&self.symbol, &self.coin) {
-            (Some(symbol), _) => format!("{}:{}:{symbol}", self.inst_type, self.topic),
-            (None, Some(coin)) => format!("{}:{}:coin:{coin}", self.inst_type, self.topic),
-            (None, None) => format!("{}:{}:", self.inst_type, self.topic),
-        }
+        let symbol = self.symbol.as_deref().unwrap_or("");
+        let interval = self
+            .interval
+            .as_deref()
+            .map(|interval| format!(":interval:{interval}"))
+            .unwrap_or_default();
+        let coin = self
+            .coin
+            .as_deref()
+            .map(|coin| format!(":coin:{coin}"))
+            .unwrap_or_default();
+
+        format!("{}:{}:{symbol}{interval}{coin}", self.inst_type, self.topic)
     }
 }
 
@@ -212,6 +260,9 @@ pub struct BitgetWsEvent<T> {
     /// Payload data.
     #[serde(default)]
     pub data: Vec<T>,
+    /// Event timestamp in milliseconds.
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_number")]
+    pub ts: Option<String>,
     /// Optional error code.
     #[serde(default, deserialize_with = "deserialize_optional_code")]
     pub code: Option<String>,
@@ -386,7 +437,19 @@ pub struct BitgetTickerData {
     pub symbol: Option<String>,
     /// Last traded price.
     #[serde(default, rename = "lastPrice")]
-    pub last_pr: Option<String>,
+    pub last_price: Option<String>,
+    /// Best bid price.
+    #[serde(default, rename = "bid1Price")]
+    pub bid1_price: Option<String>,
+    /// Best bid size.
+    #[serde(default, rename = "bid1Size")]
+    pub bid1_size: Option<String>,
+    /// Best ask price.
+    #[serde(default, rename = "ask1Price")]
+    pub ask1_price: Option<String>,
+    /// Best ask size.
+    #[serde(default, rename = "ask1Size")]
+    pub ask1_size: Option<String>,
     /// Mark price for derivatives.
     #[serde(default, rename = "markPrice")]
     pub mark_price: Option<String>,
@@ -399,9 +462,6 @@ pub struct BitgetTickerData {
     /// Next funding timestamp in milliseconds.
     #[serde(default)]
     pub next_funding_time: Option<String>,
-    /// Event timestamp in milliseconds.
-    #[serde(default)]
-    pub ts: Option<String>,
 }
 
 /// Bitget private order payload.
@@ -699,6 +759,7 @@ mod tests {
             inst_type: "usdt-futures".to_string(),
             topic: "books".to_string(),
             symbol: Some("BTCUSDT".to_string()),
+            interval: None,
             coin: None,
         }])
         .unwrap();
@@ -709,6 +770,29 @@ mod tests {
         assert_eq!(value["args"][0]["instType"], "usdt-futures");
         assert_eq!(value["args"][0]["topic"], "books");
         assert_eq!(value["args"][0]["symbol"], "BTCUSDT");
+    }
+
+    #[rstest]
+    fn kline_arg_serializes_v3_shape() {
+        let command = BitgetWsCommand::subscribe(vec![BitgetWsArg::kline(
+            BitgetProductType::UsdtFutures,
+            "BTCUSDT",
+            "1m",
+        )])
+        .unwrap();
+
+        let value = serde_json::to_value(command).unwrap();
+
+        assert_eq!(value["args"][0]["instType"], "usdt-futures");
+        assert_eq!(value["args"][0]["topic"], "kline");
+        assert_eq!(value["args"][0]["symbol"], "BTCUSDT");
+        assert_eq!(value["args"][0]["interval"], "1m");
+        assert!(
+            !value["args"][0]["topic"]
+                .as_str()
+                .unwrap()
+                .starts_with("candle")
+        );
     }
 
     #[rstest]
@@ -743,6 +827,13 @@ mod tests {
         );
 
         assert_eq!(arg.topic_key(), "usdt-futures:publicTrade:BTCUSDT");
+    }
+
+    #[rstest]
+    fn kline_arg_topic_key_includes_interval() {
+        let arg = BitgetWsArg::kline(BitgetProductType::UsdtFutures, "BTCUSDT", "1m");
+
+        assert_eq!(arg.topic_key(), "usdt-futures:kline:BTCUSDT:interval:1m");
     }
 
     #[rstest]
@@ -840,20 +931,28 @@ mod tests {
     }
 
     #[rstest]
-    fn ticker_data_accepts_derivative_prices() {
+    fn ticker_data_accepts_uta_prices() {
         let raw = r#"{
             "symbol":"BTCUSDT",
             "lastPrice":"100.1",
+            "bid1Price":"100.0",
+            "bid1Size":"1.5",
+            "ask1Price":"100.4",
+            "ask1Size":"2.5",
             "markPrice":"100.2",
             "indexPrice":"100.3",
             "fundingRate":"0.0001",
-            "nextFundingTime":"1700003600000",
-            "ts":"1700000000000"
+            "nextFundingTime":"1700003600000"
         }"#;
 
         let ticker: BitgetTickerData = serde_json::from_str(raw).unwrap();
 
         assert_eq!(ticker.symbol.as_deref(), Some("BTCUSDT"));
+        assert_eq!(ticker.last_price.as_deref(), Some("100.1"));
+        assert_eq!(ticker.bid1_price.as_deref(), Some("100.0"));
+        assert_eq!(ticker.bid1_size.as_deref(), Some("1.5"));
+        assert_eq!(ticker.ask1_price.as_deref(), Some("100.4"));
+        assert_eq!(ticker.ask1_size.as_deref(), Some("2.5"));
         assert_eq!(ticker.mark_price.as_deref(), Some("100.2"));
         assert_eq!(ticker.index_price.as_deref(), Some("100.3"));
         assert_eq!(ticker.funding_rate.as_deref(), Some("0.0001"));

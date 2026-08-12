@@ -31,7 +31,7 @@ use nautilus_bitget::{
     config::{BitgetDataClientConfig, BitgetExecClientConfig},
     factories::{BitgetDataClientFactory, BitgetExecutionClientFactory},
     http::{client::BitgetHttpClient, models::BitgetMixContract},
-    python,
+    python::{self, websocket::PyBitgetWebSocketClient},
 };
 use nautilus_common::{cache::Cache, clock::TestClock};
 use nautilus_core::UnixNanos;
@@ -43,7 +43,7 @@ use nautilus_model::{
 use nautilus_system::get_global_pyo3_registry;
 use pyo3::{
     Py, PyAny, PyResult, Python,
-    types::{PyAnyMethods, PyModule},
+    types::{PyAnyMethods, PyModule, PyModuleMethods},
 };
 use rstest::rstest;
 use serde_json::json;
@@ -78,6 +78,7 @@ fn bitget_http_client_exposes_common_python_methods() {
             "get_cached_symbols",
             "cache_instrument",
             "cache_instruments",
+            "request_instrument_statuses",
             "request_orderbook_snapshot",
             "request_trades",
             "request_funding_rates",
@@ -101,6 +102,54 @@ fn bitget_http_client_exposes_common_python_methods() {
         client
             .call_method0("cancel_all_requests")
             .expect("cancel_all_requests should be callable");
+    });
+}
+
+#[rstest]
+fn bitget_ws_client_exposes_native_data_bridge_methods() {
+    Python::initialize();
+
+    Python::attach(|py| {
+        let module = PyModule::new(py, "bitget").expect("Bitget module should be created");
+        module
+            .add_class::<PyBitgetWebSocketClient>()
+            .expect("Bitget WebSocket class should register");
+        let cls = module
+            .getattr("BitgetWebSocketClient")
+            .expect("BitgetWebSocketClient should be registered");
+        let client = cls
+            .call_method1(
+                "new_public",
+                (BitgetProductType::UsdtFutures, BitgetEnvironment::Mainnet),
+            )
+            .expect("BitgetWebSocketClient.new_public should construct");
+
+        for method in [
+            "cache_instrument",
+            "cache_instruments",
+            "subscribe_book_deltas",
+            "subscribe_book_depth10",
+            "subscribe_bars",
+            "subscribe_quotes",
+            "subscribe_mark_prices",
+            "subscribe_index_prices",
+            "subscribe_funding_rates",
+            "unsubscribe_book_deltas",
+            "unsubscribe_book_depth10",
+            "unsubscribe_trade_ticks",
+            "unsubscribe_bars",
+            "unsubscribe_quotes",
+            "unsubscribe_mark_prices",
+            "unsubscribe_index_prices",
+            "unsubscribe_funding_rates",
+        ] {
+            assert!(
+                client
+                    .hasattr(method)
+                    .expect("attribute lookup should succeed"),
+                "BitgetWebSocketClient missing Python method {method}",
+            );
+        }
     });
 }
 

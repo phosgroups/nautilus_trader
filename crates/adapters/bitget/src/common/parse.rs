@@ -22,11 +22,12 @@ use nautilus_core::{UUID4, datetime::NANOSECONDS_IN_MILLISECOND, nanos::UnixNano
 use nautilus_model::{
     data::{
         Bar, BarType, BookOrder, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate,
-        OrderBookDelta, OrderBookDeltas, TradeTick,
+        OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        depth::DEPTH10_LEN,
     },
     enums::{
-        AccountType, AggressorSide, BarAggregation, BookAction, LiquiditySide, OrderSide,
-        OrderStatus, OrderType, PositionSideSpecified, RecordFlag, TimeInForce,
+        AccountType, AggressorSide, BarAggregation, BookAction, LiquiditySide, MarketStatusAction,
+        OrderSide, OrderStatus, OrderType, PositionSideSpecified, RecordFlag, TimeInForce,
     },
     events::AccountState,
     identifiers::{AccountId, ClientOrderId, PositionId, Symbol, TradeId, VenueOrderId},
@@ -105,6 +106,15 @@ fn parse_quantity_with_precision(
     );
     Quantity::new_checked(value, precision)
         .map_err(|e| anyhow::anyhow!("invalid quantity for {field}: {raw:?}: {e}"))
+}
+
+fn empty_book_order(side: OrderSide, price_precision: u8, size_precision: u8) -> BookOrder {
+    BookOrder::new(
+        side,
+        Price::zero(price_precision),
+        Quantity::zero(size_precision),
+        0,
+    )
 }
 
 fn parse_millis_timestamp(raw: &str, field: &str) -> anyhow::Result<UnixNanos> {
@@ -582,6 +592,27 @@ pub fn parse_usdt_perp_instrument(
     Ok(InstrumentAny::CryptoPerpetual(instrument))
 }
 
+/// Maps a Bitget UTA instrument status token to a Nautilus market status action.
+#[must_use]
+pub fn bitget_symbol_status_action(status: Option<&str>) -> MarketStatusAction {
+    match status
+        .map(normalize_bitget_token)
+        .unwrap_or_else(|| "unknown".to_string())
+        .as_str()
+    {
+        "online" | "normal" | "trading" => MarketStatusAction::Trading,
+        "gray" | "pre_online" | "preonline" | "pre_launch" | "prelaunch" => {
+            MarketStatusAction::PreOpen
+        }
+        "limit_open" | "limitopen" | "restricted" => MarketStatusAction::Pause,
+        "maintain" | "maintenance" | "halt" | "halted" | "suspend" | "suspended" => {
+            MarketStatusAction::Halt
+        }
+        "offline" | "delisted" | "closed" | "close" => MarketStatusAction::Close,
+        _ => MarketStatusAction::NotAvailableForTrading,
+    }
+}
+
 /// Parses a Bitget REST order book snapshot into Nautilus order book deltas.
 pub fn parse_orderbook_snapshot(
     snapshot: &BitgetOrderBookSnapshot,
@@ -668,6 +699,50 @@ pub fn parse_orderbook_snapshot(
 
     OrderBookDeltas::new_checked(instrument_id, deltas)
         .context("failed to assemble OrderBookDeltas from Bitget snapshot")
+}
+
+/// Parses a Bitget REST/WebSocket book snapshot into Nautilus top-10 depth.
+pub fn parse_orderbook_depth10_snapshot(
+    bids_raw: &[(String, String)],
+    asks_raw: &[(String, String)],
+    instrument: &InstrumentAny,
+    sequence: u64,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderBookDepth10> {
+    let price_precision = instrument.price_precision();
+    let size_precision = instrument.size_precision();
+    let mut bids = [empty_book_order(OrderSide::Buy, price_precision, size_precision); DEPTH10_LEN];
+    let mut asks =
+        [empty_book_order(OrderSide::Sell, price_precision, size_precision); DEPTH10_LEN];
+    let mut bid_counts = [0_u32; DEPTH10_LEN];
+    let mut ask_counts = [0_u32; DEPTH10_LEN];
+
+    for (idx, (price_raw, size_raw)) in bids_raw.iter().take(DEPTH10_LEN).enumerate() {
+        let price = parse_price_with_precision(price_raw, price_precision, "depth10.bid.price")?;
+        let size = parse_quantity_with_precision(size_raw, size_precision, "depth10.bid.size")?;
+        bids[idx] = BookOrder::new(OrderSide::Buy, price, size, 0);
+        bid_counts[idx] = 1;
+    }
+
+    for (idx, (price_raw, size_raw)) in asks_raw.iter().take(DEPTH10_LEN).enumerate() {
+        let price = parse_price_with_precision(price_raw, price_precision, "depth10.ask.price")?;
+        let size = parse_quantity_with_precision(size_raw, size_precision, "depth10.ask.size")?;
+        asks[idx] = BookOrder::new(OrderSide::Sell, price, size, 0);
+        ask_counts[idx] = 1;
+    }
+
+    Ok(OrderBookDepth10::new(
+        instrument.id(),
+        bids,
+        asks,
+        bid_counts,
+        ask_counts,
+        RecordFlag::F_SNAPSHOT as u8,
+        sequence,
+        ts_event,
+        ts_init,
+    ))
 }
 
 /// Parses a Bitget WebSocket order book push into Nautilus order book deltas.
@@ -1177,25 +1252,70 @@ pub fn parse_funding_rate(
     ))
 }
 
-fn ticker_ts(
-    ticker: &BitgetTickerData,
+fn parse_ticker_ts(
+    ticker_ts: Option<&str>,
     ts_init: Option<UnixNanos>,
     field: &str,
 ) -> anyhow::Result<UnixNanos> {
-    match ticker
-        .ts
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
+    match ticker_ts.filter(|value| !value.trim().is_empty()) {
         Some(ts) => parse_millis_timestamp(ts, field),
         None => ts_init.context("Bitget ticker update did not include ts"),
     }
+}
+
+/// Parses a Bitget WebSocket ticker into a Nautilus [`QuoteTick`].
+pub fn parse_ws_quote_tick(
+    ticker: &BitgetTickerData,
+    instrument: &InstrumentAny,
+    ticker_ts: Option<&str>,
+    ts_init: Option<UnixNanos>,
+) -> anyhow::Result<QuoteTick> {
+    let bid_price_raw = ticker
+        .bid1_price
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .context("Bitget ticker update did not include bid1Price")?;
+    let ask_price_raw = ticker
+        .ask1_price
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .context("Bitget ticker update did not include ask1Price")?;
+    let bid_size_raw = ticker
+        .bid1_size
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .context("Bitget ticker update did not include bid1Size")?;
+    let ask_size_raw = ticker
+        .ask1_size
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .context("Bitget ticker update did not include ask1Size")?;
+
+    let price_precision = instrument.price_precision();
+    let size_precision = instrument.size_precision();
+    let bid_price = parse_price_with_precision(bid_price_raw, price_precision, "ticker.bid1Price")?;
+    let ask_price = parse_price_with_precision(ask_price_raw, price_precision, "ticker.ask1Price")?;
+    let bid_size = parse_quantity_with_precision(bid_size_raw, size_precision, "ticker.bid1Size")?;
+    let ask_size = parse_quantity_with_precision(ask_size_raw, size_precision, "ticker.ask1Size")?;
+    let ts_event = parse_ticker_ts(ticker_ts, ts_init, "ticker.ts")?;
+    let ts_init = ts_init.unwrap_or(ts_event);
+
+    Ok(QuoteTick::new(
+        instrument.id(),
+        bid_price,
+        ask_price,
+        bid_size,
+        ask_size,
+        ts_event,
+        ts_init,
+    ))
 }
 
 /// Parses a Bitget WebSocket ticker into a Nautilus [`MarkPriceUpdate`].
 pub fn parse_ws_mark_price(
     ticker: &BitgetTickerData,
     instrument: &InstrumentAny,
+    ticker_ts: Option<&str>,
     ts_init: Option<UnixNanos>,
 ) -> anyhow::Result<MarkPriceUpdate> {
     let raw = ticker
@@ -1204,7 +1324,7 @@ pub fn parse_ws_mark_price(
         .filter(|value| !value.trim().is_empty())
         .context("Bitget ticker update did not include markPrice")?;
     let price = parse_price_with_precision(raw, instrument.price_precision(), "ticker.markPrice")?;
-    let ts_event = ticker_ts(ticker, ts_init, "ticker.ts")?;
+    let ts_event = parse_ticker_ts(ticker_ts, ts_init, "ticker.ts")?;
     let ts_init = ts_init.unwrap_or(ts_event);
 
     Ok(MarkPriceUpdate::new(
@@ -1219,6 +1339,7 @@ pub fn parse_ws_mark_price(
 pub fn parse_ws_index_price(
     ticker: &BitgetTickerData,
     instrument: &InstrumentAny,
+    ticker_ts: Option<&str>,
     ts_init: Option<UnixNanos>,
 ) -> anyhow::Result<IndexPriceUpdate> {
     let raw = ticker
@@ -1227,7 +1348,7 @@ pub fn parse_ws_index_price(
         .filter(|value| !value.trim().is_empty())
         .context("Bitget ticker update did not include indexPrice")?;
     let price = parse_price_with_precision(raw, instrument.price_precision(), "ticker.indexPrice")?;
-    let ts_event = ticker_ts(ticker, ts_init, "ticker.ts")?;
+    let ts_event = parse_ticker_ts(ticker_ts, ts_init, "ticker.ts")?;
     let ts_init = ts_init.unwrap_or(ts_event);
 
     Ok(IndexPriceUpdate::new(
@@ -1242,6 +1363,7 @@ pub fn parse_ws_index_price(
 pub fn parse_ws_funding_rate(
     ticker: &BitgetTickerData,
     instrument: &InstrumentAny,
+    ticker_ts: Option<&str>,
     ts_init: Option<UnixNanos>,
 ) -> anyhow::Result<FundingRateUpdate> {
     let raw = ticker
@@ -1257,7 +1379,7 @@ pub fn parse_ws_funding_rate(
         .filter(|value| !value.trim().is_empty())
         .map(|value| parse_millis_timestamp(value, "ticker.nextFundingTime"))
         .transpose()?;
-    let ts_event = ticker_ts(ticker, ts_init, "ticker.ts")?;
+    let ts_event = parse_ticker_ts(ticker_ts, ts_init, "ticker.ts")?;
     let ts_init = ts_init.unwrap_or(ts_event);
 
     Ok(FundingRateUpdate::new(
@@ -1963,19 +2085,31 @@ mod tests {
         let instrument = parse_usdt_perp_instrument(&definition, TS, TS).unwrap();
         let ticker = BitgetTickerData {
             symbol: Some("BTCUSDT".to_string()),
+            last_price: Some("100.1".to_string()),
+            bid1_price: Some("100.0".to_string()),
+            bid1_size: Some("1.5".to_string()),
+            ask1_price: Some("100.4".to_string()),
+            ask1_size: Some("2.5".to_string()),
             mark_price: Some("100.2".to_string()),
             index_price: Some("100.3".to_string()),
             funding_rate: Some("0.0001".to_string()),
             next_funding_time: Some("1700003600000".to_string()),
-            ts: Some("1700000000000".to_string()),
-            ..Default::default()
         };
 
-        let mark = parse_ws_mark_price(&ticker, &instrument, Some(TS)).unwrap();
-        let index = parse_ws_index_price(&ticker, &instrument, Some(TS)).unwrap();
-        let funding = parse_ws_funding_rate(&ticker, &instrument, Some(TS)).unwrap();
+        let quote =
+            parse_ws_quote_tick(&ticker, &instrument, Some("1700000000000"), Some(TS)).unwrap();
+        let mark =
+            parse_ws_mark_price(&ticker, &instrument, Some("1700000000000"), Some(TS)).unwrap();
+        let index =
+            parse_ws_index_price(&ticker, &instrument, Some("1700000000000"), Some(TS)).unwrap();
+        let funding =
+            parse_ws_funding_rate(&ticker, &instrument, Some("1700000000000"), Some(TS)).unwrap();
 
         assert_eq!(mark.instrument_id.to_string(), "BTCUSDT-PERP.BITGET");
+        assert_eq!(quote.bid_price.to_string(), "100.0");
+        assert_eq!(quote.ask_price.to_string(), "100.4");
+        assert_eq!(quote.bid_size.to_string(), "1.500");
+        assert_eq!(quote.ask_size.to_string(), "2.500");
         assert_eq!(mark.value.precision, 1);
         assert_eq!(index.value.precision, 1);
         assert_eq!(funding.rate, Decimal::from_str("0.0001").unwrap());
