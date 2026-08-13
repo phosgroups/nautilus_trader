@@ -1,0 +1,210 @@
+name: phos-pr-build
+
+# phos PR build verification (ADR-0015, TASK-0028)
+# Trigger: PR -> main -> dual-platform build + smoke test, no publish
+# NOTE: This repo is a fork, so GitHub does not allow referencing private actions
+# (phosgroups/phos-actions). Build logic is inlined here.
+# Version = pyproject version + VERSION_SUFFIX (repo variable, e.g. +phos) + .{short-sha}.{run_number}
+#   -> unique per run, e.g. 1.230.0+phos.a1b2c3d.42 (PEP 440 local version).
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: phos-pr-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.14"
+  VERSION_SUFFIX: ${{ vars.VERSION_SUFFIX }}
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Get uv version
+        id: uv-version
+        run: echo "version=$(bash scripts/uv-version.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Setup uv with pinned version
+        run: |
+          uv self update "${{ steps.uv-version.outputs.version }}" || true
+          uv --version
+
+      - name: Update version suffix (pyproject.toml)
+        if: ${{ env.VERSION_SUFFIX != '' }}
+        run: |
+          set -euo pipefail
+          current=$(grep '^version = ' pyproject.toml | cut -d '"' -f2)
+          SHORT_SHA="${GITHUB_SHA::7}"
+          RUN_NUMBER="${{ github.run_number }}"
+          new="${current}${VERSION_SUFFIX}.${SHORT_SHA}.${RUN_NUMBER}"
+          sed -i.bak "s/^version = \".*\"/version = \"${new}\"/" pyproject.toml && rm -f pyproject.toml.bak
+          echo "Version: ${current} -> ${new}"
+        env:
+          VERSION_SUFFIX: ${{ env.VERSION_SUFFIX }}
+
+      - name: Setup Linux build deps
+        run: |
+          sudo apt-get update -o Acquire::Retries=5
+          sudo apt-get install -y curl clang lld git make pkg-config ripgrep python3-dev libpython3-dev -o Acquire::Retries=5
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Setup Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build wheel (Linux x86_64)
+        run: |
+          uv build --wheel
+          ls -lh dist/
+
+      - name: Verify wheel name
+        run: |
+          ls dist/*.whl | grep -q 'nautilus_trader-' \
+            || { echo "::error::wheel name does not contain nautilus_trader-"; exit 1; }
+          echo "wheel OK: $(ls dist/*.whl)"
+
+      - name: Smoke test (wheel metadata version)
+        run: |
+          set -euo pipefail
+          WHL=$(ls dist/nautilus_trader-*.whl | head -1)
+          VER=$(basename "$WHL" | sed -E 's/^nautilus_trader-([^-]+)-.*/\1/')
+          echo "Wheel version: ${VER}"
+          if [ -n "${VERSION_SUFFIX}" ]; then
+            SHORT_SHA="${GITHUB_SHA::7}"
+            RUN_NUMBER="${{ github.run_number }}"
+            EXPECTED="${VERSION_SUFFIX//-/.}.${SHORT_SHA}.${RUN_NUMBER}"
+            case "$VER" in
+              *"${EXPECTED}"*) echo "version suffix present: OK" ;;
+              *) echo "::error::expected version to contain ${EXPECTED}, got ${VER}"; exit 1 ;;
+            esac
+          fi
+        env:
+          VERSION_SUFFIX: ${{ env.VERSION_SUFFIX }}
+
+      - name: Write build summary (not published)
+        run: |
+          {
+            echo "## :test_tube: Build verification (NOT published)"
+            echo ""
+            echo "| Package | Version | Platform |"
+            echo "|---|---|---|"
+            for WHL in dist/nautilus_trader-*.whl; do
+              VER=$(basename "$WHL" | sed -E 's/^nautilus_trader-([^-]+)-.*/\1/')
+              PLAT=$(basename "$WHL" | sed -E 's/^nautilus_trader-[^-]+-[^-]+-[^-]+-([^.]+)\.whl/\1/')
+              echo "| nautilus-trader | \`${VER}\` | \`${PLAT}\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Get uv version
+        id: uv-version
+        run: echo "version=$(bash scripts/uv-version.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Setup uv with pinned version
+        run: |
+          uv self update "${{ steps.uv-version.outputs.version }}" || true
+          uv --version
+
+      - name: Update version suffix (pyproject.toml)
+        if: ${{ env.VERSION_SUFFIX != '' }}
+        run: |
+          set -euo pipefail
+          current=$(grep '^version = ' pyproject.toml | cut -d '"' -f2)
+          SHORT_SHA="${GITHUB_SHA::7}"
+          RUN_NUMBER="${{ github.run_number }}"
+          new="${current}${VERSION_SUFFIX}.${SHORT_SHA}.${RUN_NUMBER}"
+          sed -i.bak "s/^version = \".*\"/version = \"${new}\"/" pyproject.toml && rm -f pyproject.toml.bak
+          echo "Version: ${current} -> ${new}"
+        env:
+          VERSION_SUFFIX: ${{ env.VERSION_SUFFIX }}
+
+      - name: Setup Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build wheel (macOS arm64)
+        run: |
+          export PYO3_PYTHON=python3.14
+          export RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup"
+          if [ "$(uname -m)" = "arm64" ]; then
+            export ARCHFLAGS="-arch arm64"
+          fi
+          uv build --wheel
+          ls -lh dist/
+
+      - name: Verify wheel name
+        run: |
+          ls dist/*.whl | grep -q 'nautilus_trader-' \
+            || { echo "::error::wheel name does not contain nautilus_trader-"; exit 1; }
+          echo "wheel OK: $(ls dist/*.whl)"
+
+      - name: Smoke test (wheel metadata version)
+        run: |
+          set -euo pipefail
+          WHL=$(ls dist/nautilus_trader-*.whl | head -1)
+          VER=$(basename "$WHL" | sed -E 's/^nautilus_trader-([^-]+)-.*/\1/')
+          echo "Wheel version: ${VER}"
+          if [ -n "${VERSION_SUFFIX}" ]; then
+            SHORT_SHA="${GITHUB_SHA::7}"
+            RUN_NUMBER="${{ github.run_number }}"
+            EXPECTED="${VERSION_SUFFIX//-/.}.${SHORT_SHA}.${RUN_NUMBER}"
+            case "$VER" in
+              *"${EXPECTED}"*) echo "version suffix present: OK" ;;
+              *) echo "::error::expected version to contain ${EXPECTED}, got ${VER}"; exit 1 ;;
+            esac
+          fi
+        env:
+          VERSION_SUFFIX: ${{ env.VERSION_SUFFIX }}
+
+      - name: Write build summary (not published)
+        run: |
+          {
+            echo "## :test_tube: Build verification (NOT published)"
+            echo ""
+            echo "| Package | Version | Platform |"
+            echo "|---|---|---|"
+            for WHL in dist/nautilus_trader-*.whl; do
+              VER=$(basename "$WHL" | sed -E 's/^nautilus_trader-([^-]+)-.*/\1/')
+              PLAT=$(basename "$WHL" | sed -E 's/^nautilus_trader-[^-]+-[^-]+-[^-]+-([^.]+)\.whl/\1/')
+              echo "| nautilus-trader | \`${VER}\` | \`${PLAT}\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
