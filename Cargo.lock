@@ -5540,6 +5540,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "nautilus-bitget"
+version = "0.60.0"
+dependencies = [
+ "ahash 0.8.12",
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "aws-lc-rs",
+ "axum",
+ "base64",
+ "bon",
+ "chrono",
+ "dotenvy",
+ "futures-util",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-network",
+ "nautilus-system",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "pyo3-stub-gen",
+ "rstest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "strum 0.28.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "toml 1.1.2+spec-1.1.0",
+ "ustr",
+ "zeroize",
+]
+
+[[package]]
 name = "nautilus-bitmex"
 version = "0.60.0"
 dependencies = [
@@ -6642,6 +6682,7 @@ dependencies = [
  "nautilus-backtest",
  "nautilus-betfair",
  "nautilus-binance",
+ "nautilus-bitget",
  "nautilus-bitmex",
  "nautilus-blockchain",
  "nautilus-bybit",
