@@ -19,7 +19,7 @@ pub mod websocket;
 #[cfg(feature = "python")]
 pub mod python;
 
-pub use common::enums::GateioProductType;
+pub use common::enums::{GateioEnvironment, GateioProductType};
 pub use config::{GateioDataClientConfig, GateioExecClientConfig};
 pub use data::{GateioFuturesDataClient, GateioSpotDataClient};
 pub use execution::{GateioFuturesExecutionClient, GateioSpotExecutionClient};

@@ -27,6 +27,49 @@ pub enum GateioProductType {
     UsdtPerpetual,
 }
 
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "PascalCase")]
+#[strum(serialize_all = "PascalCase", ascii_case_insensitive)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        rename_all = "SCREAMING_SNAKE_CASE",
+        module = "nautilus_trader.core.nautilus_pyo3.gateio",
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.gateio")
+)]
+pub enum GateioEnvironment {
+    #[default]
+    Live,
+    Testnet,
+}
+
+impl GateioEnvironment {
+    #[must_use]
+    pub const fn is_testnet(self) -> bool {
+        matches!(self, Self::Testnet)
+    }
+}
+
 impl GateioProductType {
     #[must_use]
     pub const fn is_derivative(self) -> bool {

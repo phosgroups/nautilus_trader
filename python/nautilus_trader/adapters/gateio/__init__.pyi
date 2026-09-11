@@ -8,13 +8,14 @@ from nautilus_trader import model
 __all__ = [
     "GateioDataClientConfig",
     "GateioDataClientFactory",
+    "GateioEnvironment",
     "GateioExecClientConfig",
     "GateioExecutionClientFactory",
     "GateioProductType",
     "gateio_extract_raw_symbol",
+    "gateio_product_type_from_symbol",
     "get_gateio_http_base_url",
     "get_gateio_ws_url",
-    "gateio_product_type_from_symbol",
 ]
 
 @typing.final
@@ -22,8 +23,10 @@ class GateioDataClientConfig:
     def __init__(
         self,
         product_type: GateioProductType | None = None,
+        environment: GateioEnvironment | None = None,
         api_key: str | None = None,
         api_secret: str | None = None,
+        instrument_ids: list[model.InstrumentId] | None = None,
         base_url_http: str | None = None,
         base_url_ws: str | None = None,
         proxy_url: str | None = None,
@@ -31,6 +34,8 @@ class GateioDataClientConfig:
         max_retries: int | None = None,
         heartbeat_interval_secs: int | None = None,
     ) -> None: ...
+    @property
+    def instrument_ids(self) -> list[model.InstrumentId] | None: ...
 
 @typing.final
 class GateioDataClientFactory:
@@ -44,15 +49,20 @@ class GateioExecClientConfig:
         trader_id: model.TraderId,
         account_id: model.AccountId,
         product_type: GateioProductType | None = None,
+        environment: GateioEnvironment | None = None,
         api_key: str | None = None,
         api_secret: str | None = None,
+        instrument_ids: list[model.InstrumentId] | None = None,
         base_url_http: str | None = None,
         base_url_ws: str | None = None,
         proxy_url: str | None = None,
         http_timeout_secs: int | None = None,
         max_retries: int | None = None,
         heartbeat_interval_secs: int | None = None,
+        reconnect_reconciliation_lookback_mins: int | None = 60,
     ) -> None: ...
+    @property
+    def instrument_ids(self) -> list[model.InstrumentId] | None: ...
 
 @typing.final
 class GateioExecutionClientFactory:
@@ -60,13 +70,22 @@ class GateioExecutionClientFactory:
     def name(self) -> str: ...
 
 @typing.final
+class GateioEnvironment(enum.Enum):
+    LIVE = ...
+    TESTNET = ...
+
+@typing.final
 class GateioProductType(enum.Enum):
     SPOT = ...
     USDT_PERPETUAL = ...
 
-def get_gateio_http_base_url(base_url: str | None = None) -> str: ...
+def get_gateio_http_base_url(
+    base_url: str | None = None, environment: GateioEnvironment | None = None
+) -> str: ...
 def get_gateio_ws_url(
-    product_type: GateioProductType | None = None, base_url: str | None = None
+    product_type: GateioProductType | None = None,
+    base_url: str | None = None,
+    environment: GateioEnvironment | None = None,
 ) -> str: ...
 def gateio_extract_raw_symbol(symbol: str) -> str: ...
 def gateio_product_type_from_symbol(symbol: str) -> GateioProductType: ...

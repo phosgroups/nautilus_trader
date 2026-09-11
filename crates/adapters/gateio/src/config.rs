@@ -1,8 +1,11 @@
-use nautilus_model::identifiers::{AccountId, TraderId};
+use nautilus_model::identifiers::{AccountId, InstrumentId, TraderId};
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 
-use crate::common::{enums::GateioProductType, urls};
+use crate::common::{
+    enums::{GateioEnvironment, GateioProductType},
+    urls,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
@@ -17,8 +20,11 @@ use crate::common::{enums::GateioProductType, urls};
 pub struct GateioDataClientConfig {
     #[builder(default = GateioProductType::Spot)]
     pub product_type: GateioProductType,
+    #[builder(default)]
+    pub environment: GateioEnvironment,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
+    pub instrument_ids: Option<Vec<InstrumentId>>,
     pub base_url_http: Option<String>,
     pub base_url_ws: Option<String>,
     pub proxy_url: Option<String>,
@@ -55,14 +61,18 @@ impl GateioDataClientConfig {
 
     #[must_use]
     pub fn http_base_url(&self) -> String {
-        urls::http_base_url(self.base_url_http.as_deref())
+        urls::http_base_url_for(
+            self.base_url_http.as_deref(),
+            self.product_type,
+            self.environment,
+        )
     }
 
     #[must_use]
     pub fn ws_url(&self) -> String {
         self.base_url_ws
             .clone()
-            .unwrap_or_else(|| urls::ws_url(self.product_type).to_string())
+            .unwrap_or_else(|| urls::ws_url(self.product_type, self.environment).to_string())
     }
 }
 
@@ -83,8 +93,11 @@ pub struct GateioExecClientConfig {
     pub account_id: AccountId,
     #[builder(default = GateioProductType::Spot)]
     pub product_type: GateioProductType,
+    #[builder(default)]
+    pub environment: GateioEnvironment,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
+    pub instrument_ids: Option<Vec<InstrumentId>>,
     pub base_url_http: Option<String>,
     pub base_url_ws: Option<String>,
     pub proxy_url: Option<String>,
@@ -94,13 +107,18 @@ pub struct GateioExecClientConfig {
     pub max_retries: u32,
     #[builder(default = 10)]
     pub heartbeat_interval_secs: u64,
+    /// Lookback window in minutes for REST reconciliation after a private
+    /// WebSocket reconnect. `None` disables historical order and fill queries.
+    pub reconnect_reconciliation_lookback_mins: Option<u64>,
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
 
 impl Default for GateioExecClientConfig {
     fn default() -> Self {
-        Self::builder().build()
+        let mut config = Self::builder().build();
+        config.reconnect_reconciliation_lookback_mins = Some(60);
+        config
     }
 }
 
@@ -121,13 +139,17 @@ impl GateioExecClientConfig {
 
     #[must_use]
     pub fn http_base_url(&self) -> String {
-        urls::http_base_url(self.base_url_http.as_deref())
+        urls::http_base_url_for(
+            self.base_url_http.as_deref(),
+            self.product_type,
+            self.environment,
+        )
     }
 
     #[must_use]
     pub fn ws_url(&self) -> String {
         self.base_url_ws
             .clone()
-            .unwrap_or_else(|| urls::ws_url(self.product_type).to_string())
+            .unwrap_or_else(|| urls::ws_url(self.product_type, self.environment).to_string())
     }
 }

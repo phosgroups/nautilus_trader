@@ -46,10 +46,11 @@ use crate::{
     common::{
         consts::{
             GATEIO_FUTURES_BOOK_TICKER_WS_CHANNEL, GATEIO_FUTURES_CANDLES_WS_CHANNEL,
-            GATEIO_FUTURES_ORDER_BOOK_WS_CHANNEL, GATEIO_FUTURES_TICKER_WS_CHANNEL,
-            GATEIO_FUTURES_TRADES_WS_CHANNEL, GATEIO_SPOT_CANDLES_WS_CHANNEL,
-            GATEIO_SPOT_ORDER_BOOK_WS_CHANNEL, GATEIO_SPOT_TICKER_WS_CHANNEL,
-            GATEIO_SPOT_TRADES_WS_CHANNEL, GATEIO_VENUE,
+            GATEIO_FUTURES_ORDER_BOOK_UPDATE_WS_CHANNEL, GATEIO_FUTURES_ORDER_BOOK_WS_CHANNEL,
+            GATEIO_FUTURES_TICKER_WS_CHANNEL, GATEIO_FUTURES_TRADES_WS_CHANNEL,
+            GATEIO_SPOT_BOOK_TICKER_WS_CHANNEL, GATEIO_SPOT_CANDLES_WS_CHANNEL,
+            GATEIO_SPOT_ORDER_BOOK_UPDATE_WS_CHANNEL, GATEIO_SPOT_ORDER_BOOK_WS_CHANNEL,
+            GATEIO_SPOT_TICKER_WS_CHANNEL, GATEIO_SPOT_TRADES_WS_CHANNEL, GATEIO_VENUE,
         },
         enums::GateioProductType,
         parse::{
@@ -63,7 +64,7 @@ use crate::{
         client::GateioHttpClient,
         models::{GateioCandle, GateioOrderBook, GateioTicker, GateioTrade},
     },
-    websocket::{GateioWebSocketClient, GateioWsMessage},
+    websocket::{GATEIO_INTERNAL_RECONNECTED_CHANNEL, GateioWebSocketClient, GateioWsMessage},
 };
 
 /// Live market data client for one Gate.io product family.
@@ -77,6 +78,8 @@ pub struct GateioDataClient {
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     bar_types: Arc<AtomicMap<String, BarType>>,
     book_subscriptions: Arc<Mutex<HashMap<InstrumentId, Vec<String>>>>,
+    book_states: Arc<Mutex<HashMap<String, GateioBookState>>>,
+    ticker_subscriptions: Arc<Mutex<HashMap<String, usize>>>,
     tasks: Vec<JoinHandle<()>>,
     ws_task: Option<JoinHandle<()>>,
     cancellation_token: CancellationToken,
@@ -95,6 +98,7 @@ enum GateioDataChannel {
     Trades,
     Tickers,
     OrderBook,
+    OrderBookUpdate,
     Candlesticks,
 }
 
@@ -103,11 +107,14 @@ impl GateioDataChannel {
         match channel {
             GATEIO_SPOT_TRADES_WS_CHANNEL | GATEIO_FUTURES_TRADES_WS_CHANNEL => Some(Self::Trades),
             GATEIO_SPOT_TICKER_WS_CHANNEL
+            | GATEIO_SPOT_BOOK_TICKER_WS_CHANNEL
             | GATEIO_FUTURES_TICKER_WS_CHANNEL
             | GATEIO_FUTURES_BOOK_TICKER_WS_CHANNEL => Some(Self::Tickers),
             GATEIO_SPOT_ORDER_BOOK_WS_CHANNEL | GATEIO_FUTURES_ORDER_BOOK_WS_CHANNEL => {
                 Some(Self::OrderBook)
             }
+            GATEIO_SPOT_ORDER_BOOK_UPDATE_WS_CHANNEL
+            | GATEIO_FUTURES_ORDER_BOOK_UPDATE_WS_CHANNEL => Some(Self::OrderBookUpdate),
             GATEIO_SPOT_CANDLES_WS_CHANNEL | GATEIO_FUTURES_CANDLES_WS_CHANNEL => {
                 Some(Self::Candlesticks)
             }
@@ -154,6 +161,8 @@ impl GateioDataClient {
             instruments: Arc::new(AtomicMap::new()),
             bar_types: Arc::new(AtomicMap::new()),
             book_subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            book_states: Arc::new(Mutex::new(HashMap::new())),
+            ticker_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             tasks: Vec::new(),
             ws_task: None,
             cancellation_token: CancellationToken::new(),
@@ -208,6 +217,10 @@ impl GateioDataClient {
         let payload = std::iter::once(raw_symbol(instrument_id))
             .chain(extra)
             .collect();
+        self.queue_subscription_payload(channel, payload);
+    }
+
+    fn queue_subscription_payload(&mut self, channel: &'static str, payload: Vec<String>) {
         let ws = self.ws_client.clone();
         self.queue(async move {
             if let Err(error) = ws.subscribe(channel, payload, false).await {
@@ -216,30 +229,69 @@ impl GateioDataClient {
         });
     }
 
+    fn acquire_ticker_subscription(&self, instrument_id: InstrumentId) -> anyhow::Result<bool> {
+        let raw = raw_symbol(instrument_id);
+        let mut subscriptions = self
+            .ticker_subscriptions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Gate.io ticker subscription lock poisoned"))?;
+        let count = subscriptions.entry(raw).or_default();
+        let first = *count == 0;
+        *count += 1;
+        Ok(first)
+    }
+
+    fn release_ticker_subscription(&self, instrument_id: InstrumentId) -> anyhow::Result<bool> {
+        let raw = raw_symbol(instrument_id);
+        let mut subscriptions = self
+            .ticker_subscriptions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Gate.io ticker subscription lock poisoned"))?;
+        let Some(count) = subscriptions.get_mut(&raw) else {
+            return Ok(false);
+        };
+        if *count <= 1 {
+            subscriptions.remove(&raw);
+            Ok(true)
+        } else {
+            *count -= 1;
+            Ok(false)
+        }
+    }
+
     fn start_ws_dispatch(&mut self) -> anyhow::Result<()> {
         if self.ws_task.is_some() {
             return Ok(());
         }
-        let mut receiver = self
-            .ws_client
-            .take_event_receiver()
-            .context("Gate.io WebSocket event receiver was already taken")?;
+        let mut receiver = self.ws_client.take_event_receiver();
         let sender = self.data_sender.clone();
         let instruments = Arc::clone(&self.instruments);
         let bar_types = Arc::clone(&self.bar_types);
+        let book_states = Arc::clone(&self.book_states);
+        let http_client = self.http_client.clone();
         let product_type = self.config.product_type;
         let clock = self.clock;
 
         self.ws_task = Some(get_runtime().spawn(async move {
-            while let Some(message) = receiver.recv().await {
-                dispatch_ws_message(
-                    message,
-                    &sender,
-                    &instruments,
-                    &bar_types,
-                    product_type,
-                    clock,
-                );
+            loop {
+                match receiver.recv().await {
+                    Ok(message) => dispatch_ws_message(
+                        message,
+                        &sender,
+                        &instruments,
+                        &bar_types,
+                        &book_states,
+                        &http_client,
+                        product_type,
+                        clock,
+                    ),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        log::warn!(
+                            "Gate.io market-data WebSocket receiver lagged by {count} messages"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
         }));
         Ok(())
@@ -279,6 +331,26 @@ fn raw_from_value(value: &serde_json::Value, product_type: GateioProductType) ->
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string)
         })
+        .or_else(|| {
+            value
+                .get("n")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.split_once('_'))
+                .map(|(_, symbol)| symbol.to_string())
+        })
+}
+
+fn candle_metadata(
+    value: &serde_json::Value,
+    product_type: GateioProductType,
+) -> Option<(String, String)> {
+    let name = value.get("n").and_then(serde_json::Value::as_str);
+    if let Some((interval, raw_symbol)) = name.and_then(|value| value.split_once('_')) {
+        return Some((interval.to_string(), raw_symbol.to_string()));
+    }
+    let interval = name?.to_string();
+    let raw_symbol = raw_from_value(value, product_type)?;
+    Some((interval, raw_symbol))
 }
 
 fn bar_key(raw_symbol: &str, interval: &str) -> String {
@@ -297,22 +369,289 @@ fn bar_spec_from_interval(interval: &str) -> Option<BarSpecification> {
     Some(BarSpecification::new(step, aggregation, PriceType::Last))
 }
 
-fn order_book_subscription_payload(
+fn candle_subscription_payload(
+    product_type: GateioProductType,
+    raw_symbol: String,
+    interval: String,
+) -> Vec<String> {
+    match product_type {
+        // Gate.io Spot and Futures both use [interval, symbol].
+        GateioProductType::Spot => vec![interval, raw_symbol],
+        GateioProductType::UsdtPerpetual => vec![interval, raw_symbol],
+    }
+}
+
+fn order_book_update_subscription_payload(
     product_type: GateioProductType,
     instrument_id: InstrumentId,
-    depth: Option<u32>,
 ) -> Vec<String> {
-    let raw = raw_symbol(instrument_id);
-    let level = match depth.unwrap_or(20) {
-        0..=5 => "5",
-        6..=10 => "10",
-        11..=20 => "20",
-        21..=50 => "50",
-        _ => "100",
-    };
+    let symbol = raw_symbol(instrument_id);
     match product_type {
-        GateioProductType::Spot => vec![raw, level.to_string(), "100ms".to_string()],
-        GateioProductType::UsdtPerpetual => vec![raw, level.to_string(), "0".to_string()],
+        // Spot v4 uses [currency_pair, frequency].
+        GateioProductType::Spot => vec![symbol, "100ms".to_string()],
+        // Futures v4 uses [contract, frequency, depth].
+        GateioProductType::UsdtPerpetual => {
+            vec![symbol, "100ms".to_string(), "100".to_string()]
+        }
+    }
+}
+
+const MAX_BOOK_BUFFERED_UPDATES: usize = 4096;
+
+#[derive(Debug, Default)]
+struct GateioBookState {
+    initialized: bool,
+    syncing: bool,
+    generation: u64,
+    last_sequence: u64,
+    buffered: Vec<GateioOrderBook>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BookUpdateRange {
+    first: u64,
+    last: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BookUpdateAction {
+    Apply,
+    Stale,
+    Gap,
+}
+
+#[derive(Debug)]
+struct BookReplayPlan {
+    updates: Vec<GateioOrderBook>,
+    last_sequence: u64,
+}
+
+#[derive(Debug)]
+struct BookReplayGap {
+    remaining: Vec<GateioOrderBook>,
+}
+
+fn book_update_range(book: &GateioOrderBook) -> Option<BookUpdateRange> {
+    let first = book.first_sequence?;
+    let last = book.sequence?;
+    if first == 0 || last == 0 || first > last {
+        return None;
+    }
+    Some(BookUpdateRange { first, last })
+}
+
+fn classify_book_update(last_sequence: u64, range: BookUpdateRange) -> BookUpdateAction {
+    let next_sequence = last_sequence.saturating_add(1);
+    if range.last < next_sequence {
+        BookUpdateAction::Stale
+    } else if range.first > next_sequence {
+        BookUpdateAction::Gap
+    } else {
+        BookUpdateAction::Apply
+    }
+}
+
+fn sort_book_updates(updates: &mut [GateioOrderBook]) {
+    updates.sort_by_key(|update| {
+        book_update_range(update).map_or((u64::MAX, u64::MAX), |range| (range.first, range.last))
+    });
+}
+
+fn prepare_book_replay(
+    snapshot_sequence: u64,
+    mut buffered: Vec<GateioOrderBook>,
+) -> Result<BookReplayPlan, BookReplayGap> {
+    sort_book_updates(&mut buffered);
+    let mut replay = Vec::new();
+    let mut last_sequence = snapshot_sequence;
+
+    for (index, update) in buffered.iter().cloned().enumerate() {
+        let Some(range) = book_update_range(&update) else {
+            return Err(BookReplayGap {
+                remaining: buffered[index..].to_vec(),
+            });
+        };
+
+        match classify_book_update(last_sequence, range) {
+            BookUpdateAction::Stale => {}
+            BookUpdateAction::Gap => {
+                return Err(BookReplayGap {
+                    remaining: buffered[index..].to_vec(),
+                });
+            }
+            BookUpdateAction::Apply => {
+                last_sequence = range.last;
+                replay.push(update);
+            }
+        }
+    }
+
+    Ok(BookReplayPlan {
+        updates: replay,
+        last_sequence,
+    })
+}
+
+fn send_book_deltas(
+    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    deltas: nautilus_model::data::OrderBookDeltas,
+) {
+    let _ = sender.send(DataEvent::Data(Data::Deltas(
+        nautilus_model::data::OrderBookDeltas_API::new(deltas),
+    )));
+}
+
+fn schedule_book_sync(
+    raw: String,
+    generation: u64,
+    product_type: GateioProductType,
+    sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    book_states: Arc<Mutex<HashMap<String, GateioBookState>>>,
+    http_client: GateioHttpClient,
+    clock: &'static AtomicTime,
+) {
+    get_runtime().spawn(async move {
+        synchronize_book(
+            &raw,
+            generation,
+            product_type,
+            &sender,
+            &instruments,
+            book_states.as_ref(),
+            &http_client,
+            clock,
+        )
+        .await;
+    });
+}
+
+async fn synchronize_book(
+    raw: &str,
+    generation: u64,
+    product_type: GateioProductType,
+    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    instruments: &AtomicMap<InstrumentId, InstrumentAny>,
+    book_states: &Mutex<HashMap<String, GateioBookState>>,
+    http_client: &GateioHttpClient,
+    clock: &'static AtomicTime,
+) {
+    let Some(instrument) = instrument_for_raw(instruments, raw) else {
+        log::warn!("Gate.io order-book sync has no cached instrument for {raw}");
+        if let Ok(mut states) = book_states.lock()
+            && let Some(state) = states.get_mut(raw)
+        {
+            state.syncing = false;
+        }
+        return;
+    };
+
+    for attempt in 0..5 {
+        if let Ok(states) = book_states.lock()
+            && states
+                .get(raw)
+                .is_none_or(|state| state.generation != generation)
+        {
+            return;
+        }
+        let (snapshot_deltas, snapshot_sequence) = match http_client
+            .order_book_with_sequence(&instrument, product_type, Some(100), clock.get_time_ns())
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                log::warn!(
+                    "Gate.io order-book snapshot failed for {raw} (attempt {}): {error}",
+                    attempt + 1
+                );
+                continue;
+            }
+        };
+        if snapshot_sequence == 0 {
+            log::warn!("Gate.io order-book snapshot for {raw} did not include an update id");
+            continue;
+        }
+
+        let Ok(mut states) = book_states.lock() else {
+            log::warn!("Gate.io order-book state lock poisoned for {raw}");
+            return;
+        };
+        let Some(state) = states.get_mut(raw) else {
+            return;
+        };
+        if state.generation != generation {
+            return;
+        }
+        let buffered = std::mem::take(&mut state.buffered);
+        let replay = match prepare_book_replay(snapshot_sequence, buffered) {
+            Ok(replay) => replay,
+            Err(gap) => {
+                state.initialized = false;
+                state.buffered = gap.remaining;
+                continue;
+            }
+        };
+        state.initialized = true;
+        state.syncing = false;
+        state.last_sequence = replay.last_sequence;
+
+        send_book_deltas(sender, snapshot_deltas);
+        for update in replay.updates {
+            match crate::common::parse::parse_book_update(&update, &instrument, clock.get_time_ns())
+            {
+                Ok(deltas) => send_book_deltas(sender, deltas),
+                Err(error) => {
+                    log::warn!("Failed to replay Gate.io order-book update for {raw}: {error}")
+                }
+            }
+        }
+        drop(states);
+        return;
+    }
+
+    log::error!("Gate.io order-book sync could not establish a contiguous stream for {raw}");
+    if let Ok(mut states) = book_states.lock()
+        && let Some(state) = states.get_mut(raw)
+    {
+        state.syncing = false;
+    }
+}
+
+fn schedule_reconnect_book_syncs(
+    product_type: GateioProductType,
+    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    book_states: &Arc<Mutex<HashMap<String, GateioBookState>>>,
+    http_client: &GateioHttpClient,
+    clock: &'static AtomicTime,
+) {
+    let Ok(mut states) = book_states.lock() else {
+        log::warn!("Gate.io order-book state lock poisoned during WebSocket recovery");
+        return;
+    };
+    let generations = states
+        .iter_mut()
+        .map(|(raw, state)| {
+            state.initialized = false;
+            state.syncing = true;
+            state.buffered.clear();
+            state.generation = state.generation.saturating_add(1);
+            (raw.clone(), state.generation)
+        })
+        .collect::<Vec<_>>();
+    drop(states);
+
+    for (raw, generation) in generations {
+        schedule_book_sync(
+            raw,
+            generation,
+            product_type,
+            sender.clone(),
+            Arc::clone(instruments),
+            Arc::clone(book_states),
+            http_client.clone(),
+            clock,
+        );
     }
 }
 
@@ -322,10 +661,12 @@ fn timestamp_from_ws(
 ) -> nautilus_core::UnixNanos {
     message
         .time_ms
+        .filter(|value| *value > 0)
         .and_then(|millis| crate::common::parse::timestamp_nanos(millis).ok())
         .or_else(|| {
             message
                 .time
+                .filter(|value| *value > 0)
                 .and_then(|seconds| seconds.checked_mul(1_000))
                 .and_then(|millis| crate::common::parse::timestamp_nanos(millis).ok())
         })
@@ -335,11 +676,26 @@ fn timestamp_from_ws(
 fn dispatch_ws_message(
     message: GateioWsMessage,
     sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    instruments: &AtomicMap<InstrumentId, InstrumentAny>,
+    instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     bar_types: &AtomicMap<String, BarType>,
+    book_states: &Arc<Mutex<HashMap<String, GateioBookState>>>,
+    http_client: &GateioHttpClient,
     product_type: GateioProductType,
     clock: &'static AtomicTime,
 ) {
+    if message.channel == GATEIO_INTERNAL_RECONNECTED_CHANNEL {
+        log::info!("Gate.io market-data WebSocket subscriptions restored; resyncing order books");
+        schedule_reconnect_book_syncs(
+            product_type,
+            sender,
+            instruments,
+            book_states,
+            http_client,
+            clock,
+        );
+        return;
+    }
+
     let Some(channel) = GateioDataChannel::parse(&message.channel) else {
         return;
     };
@@ -379,76 +735,77 @@ fn dispatch_ws_message(
             if event != GateioWsEvent::Update {
                 return;
             }
-            let value = message
+            let rows = message
                 .result
                 .as_array()
-                .and_then(|rows| rows.first())
-                .unwrap_or(&message.result);
-            let Ok(ticker) = serde_json::from_value::<GateioTicker>(value.clone()) else {
-                return;
-            };
-            let raw = raw_from_value(value, product_type)
-                .or_else(|| ticker.currency_pair.clone())
-                .or_else(|| ticker.contract.clone());
-            let Some(instrument) = raw
-                .as_deref()
-                .and_then(|value| instrument_for_raw(instruments, value))
-            else {
-                return;
-            };
-            let Some(bid) = ticker.highest_bid.as_deref() else {
-                return;
-            };
-            let Some(ask) = ticker.lowest_ask.as_deref() else {
-                return;
-            };
-            let quote = match parse_quote(
-                bid,
-                ask,
-                ticker.highest_size.as_deref().unwrap_or("0"),
-                ticker.lowest_size.as_deref().unwrap_or("0"),
-                &instrument,
-                ts_event,
-                ts_init,
-            ) {
-                Ok(quote) => quote,
-                Err(error) => {
-                    log::debug!("Failed to parse Gate.io quote update: {error}");
-                    return;
-                }
-            };
-            let _ = sender.send(DataEvent::Data(Data::Quote(quote)));
+                .map_or_else(|| vec![&message.result], |rows| rows.iter().collect());
+            for value in rows {
+                let Ok(ticker) = serde_json::from_value::<GateioTicker>(value.clone()) else {
+                    continue;
+                };
+                let raw = raw_from_value(value, product_type)
+                    .or_else(|| ticker.currency_pair.clone())
+                    .or_else(|| ticker.contract.clone());
+                let Some(instrument) = raw
+                    .as_deref()
+                    .and_then(|value| instrument_for_raw(instruments, value))
+                else {
+                    continue;
+                };
 
-            if product_type.is_derivative() {
-                if let Some(mark_price) = ticker.mark_price.as_deref()
-                    && let Ok(update) = parse_mark_price(mark_price, &instrument, ts_event, ts_init)
+                if let (Some(bid), Some(ask)) =
+                    (ticker.highest_bid.as_deref(), ticker.lowest_ask.as_deref())
                 {
-                    let _ = sender.send(DataEvent::Data(Data::MarkPriceUpdate(update)));
-                }
-                if let Some(index_price) = ticker.index_price.as_deref()
-                    && let Ok(update) =
-                        parse_index_price(index_price, &instrument, ts_event, ts_init)
-                {
-                    let _ = sender.send(DataEvent::Data(Data::IndexPriceUpdate(update)));
-                }
-                if let Some(funding_rate) = ticker.funding_rate.as_deref()
-                    && let Ok(rate) = rust_decimal::Decimal::from_str(funding_rate)
-                {
-                    let next_funding_ns = ticker
-                        .funding_next_apply
-                        .map(crate::common::parse::timestamp_nanos)
-                        .transpose()
-                        .ok()
-                        .flatten();
-                    let update = FundingRateUpdate::new(
-                        instrument.id(),
-                        rate,
-                        None,
-                        next_funding_ns,
+                    match parse_quote(
+                        bid,
+                        ask,
+                        ticker.highest_size.as_deref().unwrap_or("0"),
+                        ticker.lowest_size.as_deref().unwrap_or("0"),
+                        &instrument,
                         ts_event,
                         ts_init,
-                    );
-                    let _ = sender.send(DataEvent::FundingRate(update));
+                    ) {
+                        Ok(quote) => {
+                            let _ = sender.send(DataEvent::Data(Data::Quote(quote)));
+                        }
+                        Err(error) => {
+                            log::debug!("Failed to parse Gate.io quote update: {error}")
+                        }
+                    }
+                }
+
+                if product_type.is_derivative() {
+                    if let Some(mark_price) = ticker.mark_price.as_deref()
+                        && let Ok(update) =
+                            parse_mark_price(mark_price, &instrument, ts_event, ts_init)
+                    {
+                        let _ = sender.send(DataEvent::Data(Data::MarkPriceUpdate(update)));
+                    }
+                    if let Some(index_price) = ticker.index_price.as_deref()
+                        && let Ok(update) =
+                            parse_index_price(index_price, &instrument, ts_event, ts_init)
+                    {
+                        let _ = sender.send(DataEvent::Data(Data::IndexPriceUpdate(update)));
+                    }
+                    if let Some(funding_rate) = ticker.funding_rate.as_deref()
+                        && let Ok(rate) = rust_decimal::Decimal::from_str(funding_rate)
+                    {
+                        let next_funding_ns = ticker
+                            .funding_next_apply
+                            .map(crate::common::parse::timestamp_nanos)
+                            .transpose()
+                            .ok()
+                            .flatten();
+                        let update = FundingRateUpdate::new(
+                            instrument.id(),
+                            rate,
+                            None,
+                            next_funding_ns,
+                            ts_event,
+                            ts_init,
+                        );
+                        let _ = sender.send(DataEvent::FundingRate(update));
+                    }
                 }
             }
         }
@@ -475,12 +832,12 @@ fn dispatch_ws_message(
                 Err(error) => log::debug!("Failed to parse Gate.io full order book: {error}"),
             }
         }
-        GateioDataChannel::Candlesticks => {
+        GateioDataChannel::OrderBookUpdate => {
             if event != GateioWsEvent::Update {
                 return;
             }
             let value = message.result.clone();
-            let Ok(candle) = serde_json::from_value::<GateioCandle>(value.clone()) else {
+            let Ok(book) = serde_json::from_value::<GateioOrderBook>(value.clone()) else {
                 return;
             };
             let Some(raw) = raw_from_value(&value, product_type) else {
@@ -489,20 +846,108 @@ fn dispatch_ws_message(
             let Some(instrument) = instrument_for_raw(instruments, &raw) else {
                 return;
             };
-            let Some(interval) = value.get("n").and_then(serde_json::Value::as_str) else {
-                return;
-            };
-            let Some(bar_type) = bar_types.get_cloned(&bar_key(&raw, interval)).or_else(|| {
-                bar_spec_from_interval(interval)
-                    .map(|spec| BarType::new(instrument.id(), spec, AggregationSource::External))
-            }) else {
-                return;
-            };
-            match parse_candle(&candle, &instrument, bar_type, ts_init) {
-                Ok(bar) => {
-                    let _ = sender.send(DataEvent::Data(Data::Bar(bar)));
+
+            let mut resync_generation = None;
+            let mut should_publish = false;
+            if let Ok(mut states) = book_states.lock() {
+                let Some(state) = states.get_mut(&raw) else {
+                    return;
+                };
+                if !state.initialized || state.syncing {
+                    if state.buffered.len() >= MAX_BOOK_BUFFERED_UPDATES {
+                        state.buffered.clear();
+                        log::warn!(
+                            "Gate.io order-book buffer overflow for {raw}; waiting for a fresh snapshot"
+                        );
+                    }
+                    state.buffered.push(book);
+                    return;
                 }
-                Err(error) => log::debug!("Failed to parse Gate.io candle update: {error}"),
+                match book_update_range(&book) {
+                    None => {
+                        state.initialized = false;
+                        state.syncing = true;
+                        state.generation = state.generation.saturating_add(1);
+                        if state.buffered.len() >= MAX_BOOK_BUFFERED_UPDATES {
+                            state.buffered.clear();
+                        }
+                        state.buffered.push(book.clone());
+                        resync_generation = Some(state.generation);
+                    }
+                    Some(range) => match classify_book_update(state.last_sequence, range) {
+                        BookUpdateAction::Stale => return,
+                        BookUpdateAction::Gap => {
+                            state.initialized = false;
+                            state.syncing = true;
+                            state.generation = state.generation.saturating_add(1);
+                            if state.buffered.len() >= MAX_BOOK_BUFFERED_UPDATES {
+                                state.buffered.clear();
+                            }
+                            state.buffered.push(book.clone());
+                            resync_generation = Some(state.generation);
+                        }
+                        BookUpdateAction::Apply => {
+                            state.last_sequence = range.last;
+                            should_publish = true;
+                        }
+                    },
+                }
+            } else {
+                log::warn!("Gate.io order-book state lock poisoned for {raw}");
+                return;
+            }
+
+            if let Some(generation) = resync_generation {
+                schedule_book_sync(
+                    raw,
+                    generation,
+                    product_type,
+                    sender.clone(),
+                    Arc::clone(instruments),
+                    Arc::clone(book_states),
+                    http_client.clone(),
+                    clock,
+                );
+            } else if should_publish {
+                match crate::common::parse::parse_book_update(&book, &instrument, ts_init) {
+                    Ok(deltas) => send_book_deltas(sender, deltas),
+                    Err(error) => log::debug!("Failed to parse Gate.io order-book update: {error}"),
+                }
+            }
+        }
+        GateioDataChannel::Candlesticks => {
+            if event != GateioWsEvent::Update {
+                return;
+            }
+            let rows = message
+                .result
+                .as_array()
+                .map_or_else(|| vec![&message.result], |rows| rows.iter().collect());
+            for value in rows {
+                let Ok(candle) = serde_json::from_value::<GateioCandle>(value.clone()) else {
+                    continue;
+                };
+                let Some((interval, raw)) = candle_metadata(value, product_type) else {
+                    continue;
+                };
+                let Some(instrument) = instrument_for_raw(instruments, &raw) else {
+                    continue;
+                };
+                let Some(bar_type) =
+                    bar_types.get_cloned(&bar_key(&raw, &interval)).or_else(|| {
+                        bar_spec_from_interval(&interval).map(|spec| {
+                            BarType::new(instrument.id(), spec, AggregationSource::External)
+                        })
+                    })
+                else {
+                    continue;
+                };
+                match parse_candle(&candle, &instrument, bar_type, ts_init) {
+                    Ok(bar) => {
+                        let _ = sender.send(DataEvent::Data(Data::Bar(bar)));
+                    }
+                    Err(error) => log::debug!("Failed to parse Gate.io candle update: {error}"),
+                }
             }
         }
     }
@@ -511,6 +956,15 @@ fn dispatch_ws_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn book_update(first: Option<u64>, last: Option<u64>) -> GateioOrderBook {
+        GateioOrderBook {
+            update: Some(1_700_000_000_000),
+            first_sequence: first,
+            sequence: last,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn parses_supported_market_data_channels() {
@@ -553,17 +1007,143 @@ mod tests {
     }
 
     #[test]
-    fn builds_full_book_subscription_payloads() {
+    fn builds_order_book_update_subscription_payloads() {
         let spot = InstrumentId::from("BTC_USDT.GATEIO");
         let perpetual = InstrumentId::from("BTC_USDT-PERP.GATEIO");
         assert_eq!(
-            order_book_subscription_payload(GateioProductType::Spot, spot, Some(10)),
-            vec!["BTC_USDT", "10", "100ms"]
+            order_book_update_subscription_payload(GateioProductType::Spot, spot),
+            vec!["BTC_USDT", "100ms"]
         );
         assert_eq!(
-            order_book_subscription_payload(GateioProductType::UsdtPerpetual, perpetual, Some(20)),
-            vec!["BTC_USDT", "20", "0"]
+            order_book_update_subscription_payload(GateioProductType::UsdtPerpetual, perpetual),
+            vec!["BTC_USDT", "100ms", "100"]
         );
+    }
+
+    #[test]
+    fn builds_product_specific_candle_subscription_payloads() {
+        assert_eq!(
+            candle_subscription_payload(
+                GateioProductType::Spot,
+                "BTC_USDT".to_string(),
+                "1m".to_string(),
+            ),
+            vec!["1m", "BTC_USDT"]
+        );
+        assert_eq!(
+            candle_subscription_payload(
+                GateioProductType::UsdtPerpetual,
+                "BTC_USDT".to_string(),
+                "1m".to_string(),
+            ),
+            vec!["1m", "BTC_USDT"]
+        );
+    }
+
+    #[test]
+    fn extracts_only_gateio_order_book_update_range_fields() {
+        let update = book_update(Some(101), Some(102));
+        assert_eq!(
+            book_update_range(&update),
+            Some(BookUpdateRange {
+                first: 101,
+                last: 102
+            })
+        );
+
+        assert_eq!(book_update_range(&book_update(None, Some(102))), None);
+        assert_eq!(book_update_range(&book_update(Some(101), None)), None);
+        assert_eq!(book_update_range(&book_update(Some(0), Some(102))), None);
+        assert_eq!(book_update_range(&book_update(Some(103), Some(102))), None);
+    }
+
+    #[test]
+    fn classifies_gateio_order_book_update_windows() {
+        assert_eq!(
+            classify_book_update(
+                100,
+                BookUpdateRange {
+                    first: 101,
+                    last: 101
+                }
+            ),
+            BookUpdateAction::Apply
+        );
+        assert_eq!(
+            classify_book_update(
+                100,
+                BookUpdateRange {
+                    first: 99,
+                    last: 101
+                }
+            ),
+            BookUpdateAction::Apply
+        );
+        assert_eq!(
+            classify_book_update(
+                100,
+                BookUpdateRange {
+                    first: 99,
+                    last: 100
+                }
+            ),
+            BookUpdateAction::Stale
+        );
+        assert_eq!(
+            classify_book_update(
+                100,
+                BookUpdateRange {
+                    first: 102,
+                    last: 103
+                }
+            ),
+            BookUpdateAction::Gap
+        );
+    }
+
+    #[test]
+    fn replays_cached_order_book_updates_from_snapshot_boundary() {
+        let plan = prepare_book_replay(
+            100,
+            vec![
+                book_update(Some(102), Some(102)),
+                book_update(Some(99), Some(100)),
+                book_update(Some(99), Some(101)),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(plan.updates.len(), 2);
+        assert_eq!(plan.updates[0].first_sequence, Some(99));
+        assert_eq!(plan.updates[0].sequence, Some(101));
+        assert_eq!(plan.updates[1].first_sequence, Some(102));
+        assert_eq!(plan.updates[1].sequence, Some(102));
+        assert_eq!(plan.last_sequence, 102);
+    }
+
+    #[test]
+    fn rejects_cached_order_book_gap_after_snapshot() {
+        let gap = prepare_book_replay(
+            100,
+            vec![
+                book_update(Some(99), Some(100)),
+                book_update(Some(102), Some(103)),
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(gap.remaining.len(), 1);
+        assert_eq!(gap.remaining[0].first_sequence, Some(102));
+        assert_eq!(gap.remaining[0].sequence, Some(103));
+    }
+
+    #[test]
+    fn rejects_cached_order_book_update_without_sequence() {
+        let gap = prepare_book_replay(100, vec![book_update(None, None)]).unwrap_err();
+
+        assert_eq!(gap.remaining.len(), 1);
+        assert_eq!(gap.remaining[0].update, Some(1_700_000_000_000));
+        assert_eq!(book_update_range(&gap.remaining[0]), None);
     }
 }
 
@@ -583,6 +1163,7 @@ impl DataClient for GateioDataClient {
 
     fn stop(&mut self) -> anyhow::Result<()> {
         self.cancellation_token.cancel();
+        self.ws_client.stop();
         self.abort_tasks();
         self.is_connected.store(false, Ordering::Release);
         Ok(())
@@ -595,6 +1176,14 @@ impl DataClient for GateioDataClient {
         self.book_subscriptions
             .lock()
             .map_err(|_| anyhow::anyhow!("Gate.io order-book subscription lock poisoned"))?
+            .clear();
+        self.book_states
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Gate.io order-book state lock poisoned"))?
+            .clear();
+        self.ticker_subscriptions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Gate.io ticker subscription lock poisoned"))?
             .clear();
         self.cancellation_token = CancellationToken::new();
         Ok(())
@@ -620,7 +1209,11 @@ impl DataClient for GateioDataClient {
         let ts = self.clock.get_time_ns();
         let instruments = self
             .http_client
-            .instruments(self.config.product_type, ts)
+            .instruments_for(
+                self.config.product_type,
+                self.config.instrument_ids.as_deref(),
+                ts,
+            )
             .await
             .context("failed to load Gate.io instruments")?;
         for instrument in instruments {
@@ -647,7 +1240,7 @@ impl DataClient for GateioDataClient {
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
         self.ensure_product(cmd.instrument_id)?;
         let channel = match self.config.product_type {
-            GateioProductType::Spot => GATEIO_SPOT_TICKER_WS_CHANNEL,
+            GateioProductType::Spot => GATEIO_SPOT_BOOK_TICKER_WS_CHANNEL,
             GateioProductType::UsdtPerpetual => GATEIO_FUTURES_BOOK_TICKER_WS_CHANNEL,
         };
         self.queue_subscription(channel, cmd.instrument_id, vec![]);
@@ -673,22 +1266,54 @@ impl DataClient for GateioDataClient {
         self.ensure_product(cmd.instrument_id)?;
         let product_type = self.config.product_type;
         let instrument_id = cmd.instrument_id;
-        let depth = cmd.depth.map(|value| value.get() as u32);
-        let payload = order_book_subscription_payload(product_type, instrument_id, depth);
+        let payload = order_book_update_subscription_payload(product_type, instrument_id);
         self.book_subscriptions
             .lock()
             .map_err(|_| anyhow::anyhow!("Gate.io order-book subscription lock poisoned"))?
             .insert(instrument_id, payload.clone());
+        let raw = raw_symbol(instrument_id);
+        self.book_states
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Gate.io order-book state lock poisoned"))?
+            .insert(
+                raw.clone(),
+                GateioBookState {
+                    syncing: true,
+                    ..Default::default()
+                },
+            );
         let channel = if product_type == GateioProductType::Spot {
-            GATEIO_SPOT_ORDER_BOOK_WS_CHANNEL
+            GATEIO_SPOT_ORDER_BOOK_UPDATE_WS_CHANNEL
         } else {
-            GATEIO_FUTURES_ORDER_BOOK_WS_CHANNEL
+            GATEIO_FUTURES_ORDER_BOOK_UPDATE_WS_CHANNEL
         };
         let ws = self.ws_client.clone();
+        let sender = self.data_sender.clone();
+        let instruments = Arc::clone(&self.instruments);
+        let book_states = Arc::clone(&self.book_states);
+        let http_client = self.http_client.clone();
+        let clock = self.clock;
         self.queue(async move {
             if let Err(error) = ws.subscribe(channel, payload, false).await {
-                log::warn!("Gate.io full order-book subscription failed: {error}");
+                log::warn!("Gate.io order-book update subscription failed: {error}");
+                if let Ok(mut states) = book_states.lock()
+                    && let Some(state) = states.get_mut(&raw)
+                {
+                    state.syncing = false;
+                }
+                return;
             }
+            synchronize_book(
+                &raw,
+                0,
+                product_type,
+                &sender,
+                &instruments,
+                &book_states,
+                &http_client,
+                clock,
+            )
+            .await;
         });
         Ok(())
     }
@@ -723,9 +1348,13 @@ impl DataClient for GateioDataClient {
             crate::common::consts::GATEIO_FUTURES_CANDLES_WS_CHANNEL
         };
         let instrument_id = cmd.bar_type.instrument_id();
+        let raw = raw_symbol(instrument_id);
         self.bar_types
-            .insert(bar_key(&raw_symbol(instrument_id), &interval), cmd.bar_type);
-        self.queue_subscription(channel, instrument_id, vec![interval]);
+            .insert(bar_key(&raw, &interval), cmd.bar_type);
+        self.queue_subscription_payload(
+            channel,
+            candle_subscription_payload(self.config.product_type, raw, interval),
+        );
         Ok(())
     }
 
@@ -734,27 +1363,23 @@ impl DataClient for GateioDataClient {
             self.config.product_type.is_derivative(),
             "Gate.io mark prices are only available for perpetual instruments"
         );
-        self.subscribe_quotes(SubscribeQuotes {
-            instrument_id: cmd.instrument_id,
-            client_id: cmd.client_id,
-            venue: cmd.venue,
-            command_id: cmd.command_id,
-            ts_init: cmd.ts_init,
-            correlation_id: cmd.correlation_id,
-            params: cmd.params.clone(),
-        })
+        self.ensure_product(cmd.instrument_id)?;
+        if self.acquire_ticker_subscription(cmd.instrument_id)? {
+            self.queue_subscription(GATEIO_FUTURES_TICKER_WS_CHANNEL, cmd.instrument_id, vec![]);
+        }
+        Ok(())
     }
 
     fn subscribe_index_prices(&mut self, cmd: SubscribeIndexPrices) -> anyhow::Result<()> {
-        self.subscribe_mark_prices(SubscribeMarkPrices {
-            instrument_id: cmd.instrument_id,
-            client_id: cmd.client_id,
-            venue: cmd.venue,
-            command_id: cmd.command_id,
-            ts_init: cmd.ts_init,
-            correlation_id: cmd.correlation_id,
-            params: cmd.params.clone(),
-        })
+        anyhow::ensure!(
+            self.config.product_type.is_derivative(),
+            "Gate.io index prices are only available for perpetual instruments"
+        );
+        self.ensure_product(cmd.instrument_id)?;
+        if self.acquire_ticker_subscription(cmd.instrument_id)? {
+            self.queue_subscription(GATEIO_FUTURES_TICKER_WS_CHANNEL, cmd.instrument_id, vec![]);
+        }
+        Ok(())
     }
 
     fn subscribe_funding_rates(&mut self, cmd: SubscribeFundingRates) -> anyhow::Result<()> {
@@ -762,15 +1387,11 @@ impl DataClient for GateioDataClient {
             self.config.product_type.is_derivative(),
             "Gate.io funding rates are only available for perpetual instruments"
         );
-        self.subscribe_quotes(SubscribeQuotes {
-            instrument_id: cmd.instrument_id,
-            client_id: cmd.client_id,
-            venue: cmd.venue,
-            command_id: cmd.command_id,
-            ts_init: cmd.ts_init,
-            correlation_id: cmd.correlation_id,
-            params: cmd.params.clone(),
-        })
+        self.ensure_product(cmd.instrument_id)?;
+        if self.acquire_ticker_subscription(cmd.instrument_id)? {
+            self.queue_subscription(GATEIO_FUTURES_TICKER_WS_CHANNEL, cmd.instrument_id, vec![]);
+        }
+        Ok(())
     }
 
     fn unsubscribe_quotes(
@@ -780,7 +1401,10 @@ impl DataClient for GateioDataClient {
         self.ensure_product(cmd.instrument_id)?;
         let ws = self.ws_client.clone();
         let raw = raw_symbol(cmd.instrument_id);
-        let channel = GateioWebSocketClient::ticker_channel(self.config.product_type);
+        let channel = match self.config.product_type {
+            GateioProductType::Spot => GATEIO_SPOT_BOOK_TICKER_WS_CHANNEL,
+            GateioProductType::UsdtPerpetual => GATEIO_FUTURES_BOOK_TICKER_WS_CHANNEL,
+        };
         self.queue(async move {
             let _ = ws.unsubscribe(channel, vec![raw], false).await;
         });
@@ -811,12 +1435,15 @@ impl DataClient for GateioDataClient {
             .ok()
             .and_then(|mut subscriptions| subscriptions.remove(&cmd.instrument_id))
             .unwrap_or_else(|| {
-                order_book_subscription_payload(self.config.product_type, cmd.instrument_id, None)
+                order_book_update_subscription_payload(self.config.product_type, cmd.instrument_id)
             });
+        if let Ok(mut states) = self.book_states.lock() {
+            states.remove(raw_symbol(cmd.instrument_id).as_str());
+        }
         let channel = if self.config.product_type == GateioProductType::Spot {
-            GATEIO_SPOT_ORDER_BOOK_WS_CHANNEL
+            GATEIO_SPOT_ORDER_BOOK_UPDATE_WS_CHANNEL
         } else {
-            GATEIO_FUTURES_ORDER_BOOK_WS_CHANNEL
+            GATEIO_FUTURES_ORDER_BOOK_UPDATE_WS_CHANNEL
         };
         self.queue(async move {
             let _ = ws.unsubscribe(channel, payload, false).await;
@@ -853,8 +1480,10 @@ impl DataClient for GateioDataClient {
         } else {
             crate::common::consts::GATEIO_FUTURES_CANDLES_WS_CHANNEL
         };
+        let payload =
+            candle_subscription_payload(self.config.product_type, raw.clone(), interval.clone());
         self.queue(async move {
-            let _ = ws.unsubscribe(channel, vec![raw, interval], false).await;
+            let _ = ws.unsubscribe(channel, payload, false).await;
         });
         Ok(())
     }
@@ -867,15 +1496,17 @@ impl DataClient for GateioDataClient {
             self.config.product_type.is_derivative(),
             "Gate.io mark prices are only available for perpetual instruments"
         );
-        self.unsubscribe_quotes(&nautilus_common::messages::data::UnsubscribeQuotes {
-            instrument_id: cmd.instrument_id,
-            client_id: cmd.client_id,
-            venue: cmd.venue,
-            command_id: cmd.command_id,
-            ts_init: cmd.ts_init,
-            correlation_id: cmd.correlation_id,
-            params: cmd.params.clone(),
-        })
+        self.ensure_product(cmd.instrument_id)?;
+        if self.release_ticker_subscription(cmd.instrument_id)? {
+            let ws = self.ws_client.clone();
+            let raw = raw_symbol(cmd.instrument_id);
+            self.queue(async move {
+                let _ = ws
+                    .unsubscribe(GATEIO_FUTURES_TICKER_WS_CHANNEL, vec![raw], false)
+                    .await;
+            });
+        }
+        Ok(())
     }
 
     fn unsubscribe_index_prices(&mut self, cmd: &UnsubscribeIndexPrices) -> anyhow::Result<()> {
@@ -1117,6 +1748,8 @@ impl DataClient for GateioDataClient {
                     product_type,
                     bar_type,
                     limit,
+                    start,
+                    end,
                     clock.get_time_ns(),
                 )
                 .await

@@ -10,8 +10,12 @@ pub static GATEIO_CLIENT_ID: LazyLock<ClientId> =
     LazyLock::new(|| ClientId::new(Ustr::from(GATEIO)));
 
 pub const GATEIO_REST_URL: &str = "https://api.gateio.ws/api/v4";
+pub const GATEIO_SPOT_TESTNET_REST_URL: &str = "https://api-testnet.gateapi.io";
+pub const GATEIO_FUTURES_TESTNET_REST_URL: &str = "https://api-testnet.gateapi.io";
 pub const GATEIO_SPOT_WS_URL: &str = "wss://api.gateio.ws/ws/v4/";
+pub const GATEIO_SPOT_TESTNET_WS_URL: &str = "wss://ws-testnet.gate.com/v4/ws/spot";
 pub const GATEIO_FUTURES_WS_URL: &str = "wss://fx-ws.gateio.ws/v4/ws/usdt";
+pub const GATEIO_FUTURES_TESTNET_WS_URL: &str = "wss://ws-testnet.gate.com/v4/ws/futures/usdt";
 pub const GATEIO_SPOT_PING_WS_CHANNEL: &str = "spot.ping";
 pub const GATEIO_FUTURES_PING_WS_CHANNEL: &str = "futures.ping";
 
@@ -35,8 +39,12 @@ pub const GATEIO_FUTURES_ORDERS_WS_CHANNEL: &str = "futures.orders";
 pub const GATEIO_FUTURES_USER_TRADES_WS_CHANNEL: &str = "futures.usertrades";
 pub const GATEIO_FUTURES_BALANCES_WS_CHANNEL: &str = "futures.balances";
 pub const GATEIO_FUTURES_POSITIONS_WS_CHANNEL: &str = "futures.positions";
+pub const GATEIO_FUTURES_LIQUIDATES_WS_CHANNEL: &str = "futures.liquidates";
+pub const GATEIO_FUTURES_AUTO_DELEVERAGES_WS_CHANNEL: &str = "futures.auto_deleverages";
+pub const GATEIO_FUTURES_POSITION_CLOSES_WS_CHANNEL: &str = "futures.position_closes";
 
 pub const SPOT_CURRENCY_PAIRS: &str = "/spot/currency_pairs";
+pub const ACCOUNT_DETAIL: &str = "/account/detail";
 pub const SPOT_ORDER_BOOK: &str = "/spot/order_book";
 pub const SPOT_TRADES: &str = "/spot/trades";
 pub const SPOT_CANDLESTICKS: &str = "/spot/candlesticks";
@@ -57,6 +65,8 @@ pub const FUTURES_POSITIONS: &str = "/futures/usdt/positions";
 pub const FUTURES_ORDERS: &str = "/futures/usdt/orders";
 pub const FUTURES_PRICE_ORDERS: &str = "/futures/usdt/price_orders";
 pub const FUTURES_MY_TRADES: &str = "/futures/usdt/my_trades";
+pub const FUTURES_ORDERS_TIMERANGE: &str = "/futures/usdt/orders_timerange";
+pub const FUTURES_MY_TRADES_TIMERANGE: &str = "/futures/usdt/my_trades_timerange";
 
 pub const GATEIO_KEY_HEADER: &str = "KEY";
 pub const GATEIO_SIGN_HEADER: &str = "SIGN";

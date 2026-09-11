@@ -1,5 +1,6 @@
 use std::fmt;
 
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{self, Visitor},
@@ -131,25 +132,26 @@ where
         other => other.to_string(),
     };
     let parsed = raw
-        .parse::<f64>()
+        .parse::<Decimal>()
         .map_err(|error| de::Error::custom(format!("invalid timestamp {raw:?}: {error}")))?;
-    if !parsed.is_finite() || parsed < 0.0 {
+    if parsed < Decimal::ZERO {
         return Err(de::Error::custom(format!(
-            "timestamp must be finite and non-negative, was {raw:?}"
+            "timestamp must be non-negative, was {raw:?}"
         )));
     }
 
-    let millis = if parsed < 100_000_000_000.0 {
-        parsed * 1_000.0
+    let millis = if parsed < Decimal::from(100_000_000_000_i64) {
+        parsed * Decimal::from(1_000_u64)
     } else {
         parsed
     };
-    if millis > i64::MAX as f64 {
+    let millis = millis.round_dp(0);
+    if millis > Decimal::from(i64::MAX) {
         return Err(de::Error::custom(format!(
             "timestamp is too large, was {raw:?}"
         )));
     }
-    Ok(Some(millis.round() as i64))
+    Ok(millis.to_i64())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -360,13 +362,13 @@ pub struct GateioOrderBook {
         deserialize_with = "optional_u64_or_number"
     )]
     pub first_sequence: Option<u64>,
-    #[serde(default)]
+    #[serde(default, alias = "s")]
     pub currency_pair: Option<String>,
     #[serde(default)]
     pub contract: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "b")]
     pub bids: Vec<GateioLevel>,
-    #[serde(default)]
+    #[serde(default, alias = "a")]
     pub asks: Vec<GateioLevel>,
 }
 
@@ -440,13 +442,19 @@ impl<'de> Deserialize<'de> for GateioCandle {
                 .map(|value| value.to_string().trim_matches('"').to_string())
         };
         let timestamp = get(0)?
-            .parse::<f64>()
+            .parse::<Decimal>()
             .map_err(|e| de::Error::custom(e.to_string()))?;
         Ok(Self {
-            timestamp_ms: if timestamp < 100_000_000_000.0 {
-                (timestamp * 1_000.0) as i64
+            timestamp_ms: if timestamp < Decimal::from(100_000_000_000_i64) {
+                (timestamp * Decimal::from(1_000_u64))
+                    .round_dp(0)
+                    .to_i64()
+                    .ok_or_else(|| de::Error::custom("invalid candle timestamp"))?
             } else {
-                timestamp as i64
+                timestamp
+                    .round_dp(0)
+                    .to_i64()
+                    .ok_or_else(|| de::Error::custom("invalid candle timestamp"))?
             },
             volume: get(1)?,
             close: get(2)?,
@@ -481,6 +489,51 @@ pub struct GateioTicker {
     pub funding_rate: Option<String>,
     #[serde(default, deserialize_with = "optional_timestamp_millis")]
     pub funding_next_apply: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct GateioBalanceUpdate {
+    #[serde(default, deserialize_with = "optional_string_or_number")]
+    pub id: Option<String>,
+    #[serde(
+        default,
+        alias = "timestamp_ms",
+        deserialize_with = "optional_timestamp_millis"
+    )]
+    pub time_ms: Option<i64>,
+    #[serde(
+        default,
+        alias = "timestamp",
+        deserialize_with = "optional_timestamp_millis"
+    )]
+    pub time: Option<i64>,
+    #[serde(default, deserialize_with = "optional_string_or_number")]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub currency: String,
+    #[serde(default, deserialize_with = "string_or_number")]
+    pub balance: String,
+    #[serde(default, deserialize_with = "optional_string_or_number")]
+    pub total: Option<String>,
+    #[serde(default, deserialize_with = "optional_string_or_number")]
+    pub available: Option<String>,
+    #[serde(
+        default,
+        alias = "freeze",
+        alias = "locked",
+        deserialize_with = "optional_string_or_number"
+    )]
+    pub locked: Option<String>,
+    #[serde(default, deserialize_with = "optional_string_or_number")]
+    pub freeze_change: Option<String>,
+    #[serde(default, deserialize_with = "string_or_number")]
+    pub change: String,
+    #[serde(default, rename = "type")]
+    pub type_: Option<String>,
+    #[serde(default)]
+    pub change_type: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -525,9 +578,19 @@ pub struct GateioPosition {
     pub entry_price: String,
     #[serde(default, deserialize_with = "string_or_number")]
     pub mark_price: String,
-    #[serde(default, deserialize_with = "optional_timestamp_millis")]
+    #[serde(default, deserialize_with = "optional_string_or_number")]
+    pub update_id: Option<String>,
+    #[serde(
+        default,
+        alias = "time_ms",
+        deserialize_with = "optional_timestamp_millis"
+    )]
     pub update_time: Option<i64>,
-    #[serde(default, deserialize_with = "optional_timestamp_millis")]
+    #[serde(
+        default,
+        alias = "time",
+        deserialize_with = "optional_timestamp_millis"
+    )]
     pub create_time: Option<i64>,
 }
 
@@ -561,10 +624,26 @@ pub struct GateioOrder {
     pub time_in_force: Option<String>,
     #[serde(default)]
     pub finish_as: Option<String>,
-    #[serde(default, deserialize_with = "optional_timestamp_millis")]
+    #[serde(
+        default,
+        alias = "create_time",
+        deserialize_with = "optional_timestamp_millis"
+    )]
     pub create_time_ms: Option<i64>,
-    #[serde(default, deserialize_with = "optional_timestamp_millis")]
+    #[serde(
+        default,
+        alias = "update_time",
+        deserialize_with = "optional_timestamp_millis"
+    )]
     pub update_time_ms: Option<i64>,
+    #[serde(
+        default,
+        alias = "finish_time",
+        deserialize_with = "optional_timestamp_millis"
+    )]
+    pub finish_time_ms: Option<i64>,
+    #[serde(default, deserialize_with = "optional_string_or_number")]
+    pub update_id: Option<String>,
     #[serde(default, deserialize_with = "optional_string_or_number")]
     pub fill_price: Option<String>,
     #[serde(default, deserialize_with = "optional_string_or_number")]
@@ -587,11 +666,24 @@ pub struct GateioOrder {
     pub is_liq: Option<bool>,
     #[serde(default)]
     pub auto_size: Option<String>,
+    #[serde(default)]
+    pub close: Option<bool>,
+    #[serde(default)]
+    pub is_close: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct GateioSpotOpenOrders {
+    pub currency_pair: String,
+    #[serde(default)]
+    pub total: Option<u64>,
+    #[serde(default)]
+    pub orders: Vec<GateioOrder>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct GateioUserTrade {
-    #[serde(default, deserialize_with = "string_or_number")]
+    #[serde(default, alias = "trade_id", deserialize_with = "string_or_number")]
     pub id: String,
     #[serde(default, deserialize_with = "string_or_number")]
     pub order_id: String,
@@ -609,6 +701,10 @@ pub struct GateioUserTrade {
     pub fee: Option<String>,
     #[serde(default)]
     pub fee_currency: Option<String>,
+    #[serde(default, deserialize_with = "optional_string_or_number")]
+    pub rebated_fee: Option<String>,
+    #[serde(default)]
+    pub rebated_fee_currency: Option<String>,
     #[serde(default, deserialize_with = "optional_timestamp_millis")]
     pub create_time_ms: Option<i64>,
     #[serde(default, deserialize_with = "optional_timestamp_millis")]
@@ -627,6 +723,12 @@ pub struct GateioErrorResponse {
     pub label: String,
     #[serde(default)]
     pub message: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct GateioAccountDetail {
+    #[serde(default, alias = "user_id", deserialize_with = "string_or_number")]
+    pub user_id: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -712,6 +814,25 @@ mod tests {
             .size,
             "-3"
         );
+    }
+
+    #[test]
+    fn deserializes_spot_balance_freeze_alias() {
+        let update = serde_json::from_value::<GateioBalanceUpdate>(serde_json::json!({
+            "timestamp": "1700000000",
+            "timestamp_ms": "1700000000123",
+            "currency": "USDT",
+            "change": "-1.5",
+            "total": "98.5",
+            "available": "90",
+            "freeze": "8.5",
+            "freeze_change": "1.5"
+        }))
+        .unwrap();
+        assert_eq!(update.time_ms, Some(1_700_000_000_123));
+        assert_eq!(update.time, Some(1_700_000_000_000));
+        assert_eq!(update.locked.as_deref(), Some("8.5"));
+        assert_eq!(update.freeze_change.as_deref(), Some("1.5"));
     }
 
     #[test]

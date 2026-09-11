@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -17,7 +17,7 @@ use nautilus_model::{
 };
 use nautilus_network::http::{HttpClient, Method, USER_AGENT};
 use nautilus_network::retry::{RetryConfig, RetryManager};
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
@@ -36,14 +36,21 @@ use crate::{
     http::{
         error::GateioHttpError,
         models::{
-            GateioAccount, GateioCandle, GateioContract, GateioErrorResponse, GateioFundingRate,
-            GateioOrder, GateioOrderAmendRequest, GateioOrderBook, GateioOrderRequest,
-            GateioPosition, GateioSpotPair, GateioTrade, GateioUserTrade,
+            GateioAccount, GateioAccountDetail, GateioCandle, GateioContract, GateioErrorResponse,
+            GateioFundingRate, GateioOrder, GateioOrderAmendRequest, GateioOrderBook,
+            GateioOrderRequest, GateioPosition, GateioSpotOpenOrders, GateioSpotPair, GateioTrade,
+            GateioUserTrade,
         },
     },
 };
 
 const RATE_KEY: &str = "gateio:global";
+const PAGINATION_LIMIT: u32 = 1000;
+const SPOT_OPEN_ORDER_LIMIT: u32 = 100;
+const SPOT_CANDLE_MAX_LIMIT: u32 = 1000;
+const FUTURES_CANDLE_MAX_LIMIT: u32 = 2000;
+const MAX_SPOT_TRADE_RANGE_SECS: i64 = 30 * 24 * 60 * 60;
+const MAX_PAGINATION_PAGES: u32 = 10_000;
 
 #[derive(Clone)]
 pub struct GateioRawHttpClient {
@@ -250,9 +257,36 @@ impl GateioRawHttpClient {
             .await
     }
 
+    pub async fn spot_pair(&self, symbol: &str) -> Result<GateioSpotPair, GateioHttpError> {
+        self.send(
+            Method::GET,
+            &format!("{SPOT_CURRENCY_PAIRS}/{symbol}"),
+            &[],
+            None,
+            false,
+        )
+        .await
+    }
+
+    pub async fn account_detail(&self) -> Result<GateioAccountDetail, GateioHttpError> {
+        self.send(Method::GET, ACCOUNT_DETAIL, &[], None, true)
+            .await
+    }
+
     pub async fn contracts(&self) -> Result<Vec<GateioContract>, GateioHttpError> {
         self.send(Method::GET, FUTURES_CONTRACTS, &[], None, false)
             .await
+    }
+
+    pub async fn contract(&self, symbol: &str) -> Result<GateioContract, GateioHttpError> {
+        self.send(
+            Method::GET,
+            &format!("{FUTURES_CONTRACTS}/{symbol}"),
+            &[],
+            None,
+            false,
+        )
+        .await
     }
 
     pub async fn spot_order_book(
@@ -265,7 +299,10 @@ impl GateioRawHttpClient {
             ("with_id".to_string(), "true".to_string()),
         ];
         if let Some(limit) = limit {
-            params.push(("limit".to_string(), limit.min(1000).to_string()));
+            params.push((
+                "limit".to_string(),
+                bounded_limit(limit, PAGINATION_LIMIT, "spot order book")?.to_string(),
+            ));
         }
         self.send(Method::GET, SPOT_ORDER_BOOK, &params, None, false)
             .await
@@ -281,7 +318,10 @@ impl GateioRawHttpClient {
             ("with_id".to_string(), "true".to_string()),
         ];
         if let Some(limit) = limit {
-            params.push(("limit".to_string(), limit.min(1000).to_string()));
+            params.push((
+                "limit".to_string(),
+                bounded_limit(limit, PAGINATION_LIMIT, "futures order book")?.to_string(),
+            ));
         }
         self.send(Method::GET, FUTURES_ORDER_BOOK, &params, None, false)
             .await
@@ -291,11 +331,18 @@ impl GateioRawHttpClient {
         &self,
         symbol: &str,
         limit: Option<u32>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
     ) -> Result<Vec<GateioTrade>, GateioHttpError> {
         let mut params = vec![("currency_pair".to_string(), symbol.to_string())];
         if let Some(limit) = limit {
-            params.push(("limit".to_string(), limit.min(1000).to_string()));
+            params.push((
+                "limit".to_string(),
+                bounded_limit(limit, PAGINATION_LIMIT, "spot trades")?.to_string(),
+            ));
         }
+        validate_time_range(start, end, Some(MAX_SPOT_TRADE_RANGE_SECS), "spot trades")?;
+        append_time_range(&mut params, start, end)?;
         self.send(Method::GET, SPOT_TRADES, &params, None, false)
             .await
     }
@@ -304,11 +351,18 @@ impl GateioRawHttpClient {
         &self,
         contract: &str,
         limit: Option<u32>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
     ) -> Result<Vec<GateioTrade>, GateioHttpError> {
         let mut params = vec![("contract".to_string(), contract.to_string())];
         if let Some(limit) = limit {
-            params.push(("limit".to_string(), limit.min(1000).to_string()));
+            params.push((
+                "limit".to_string(),
+                bounded_limit(limit, PAGINATION_LIMIT, "futures trades")?.to_string(),
+            ));
         }
+        validate_time_range(start, end, None, "futures trades")?;
+        append_time_range(&mut params, start, end)?;
         self.send(Method::GET, FUTURES_TRADES, &params, None, false)
             .await
     }
@@ -320,7 +374,10 @@ impl GateioRawHttpClient {
     ) -> Result<Vec<GateioFundingRate>, GateioHttpError> {
         let mut params = vec![("contract".to_string(), contract.to_string())];
         if let Some(limit) = limit {
-            params.push(("limit".to_string(), limit.min(1000).to_string()));
+            params.push((
+                "limit".to_string(),
+                bounded_limit(limit, PAGINATION_LIMIT, "funding rates")?.to_string(),
+            ));
         }
         self.send(Method::GET, FUTURES_FUNDING_RATE, &params, None, false)
             .await
@@ -332,6 +389,8 @@ impl GateioRawHttpClient {
         symbol: &str,
         interval: &str,
         limit: Option<u32>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
     ) -> Result<Vec<GateioCandle>, GateioHttpError> {
         let endpoint = if product_type == GateioProductType::Spot {
             SPOT_CANDLESTICKS
@@ -347,8 +406,28 @@ impl GateioRawHttpClient {
             (symbol_key.to_string(), symbol.to_string()),
             ("interval".to_string(), interval.to_string()),
         ];
-        if let Some(limit) = limit {
-            params.push(("limit".to_string(), limit.min(1000).to_string()));
+        validate_time_range(start, end, None, "candlesticks")?;
+        match (limit, start, end) {
+            (Some(limit), None, None) => {
+                let maximum = if product_type == GateioProductType::Spot {
+                    SPOT_CANDLE_MAX_LIMIT
+                } else {
+                    FUTURES_CANDLE_MAX_LIMIT
+                };
+                params.push((
+                    "limit".to_string(),
+                    bounded_limit(limit, maximum, "candlesticks")?.to_string(),
+                ));
+            }
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                return Err(GateioHttpError::Validation(
+                    "Gate.io candlestick limit cannot be combined with from/to".to_string(),
+                ));
+            }
+            (None, Some(_), _) | (None, _, Some(_)) => {
+                append_time_range(&mut params, start, end)?;
+            }
+            (None, None, None) => {}
         }
         self.send(Method::GET, endpoint, &params, None, false).await
     }
@@ -389,19 +468,14 @@ impl GateioRawHttpClient {
         } else {
             format!("{FUTURES_ORDERS}/{order_id}")
         };
-        let key = if product_type == GateioProductType::Spot {
-            "currency_pair"
+        let params = if product_type == GateioProductType::Spot {
+            vec![("currency_pair".to_string(), symbol.to_string())]
         } else {
-            "contract"
+            // The futures single-order endpoint only accepts settle and order_id.
+            // The contract is present in the response and is not a query parameter.
+            Vec::new()
         };
-        self.send(
-            Method::GET,
-            &endpoint,
-            &[(key.to_string(), symbol.to_string())],
-            None,
-            true,
-        )
-        .await
+        self.send(Method::GET, &endpoint, &params, None, true).await
     }
 
     pub async fn open_orders(
@@ -410,12 +484,56 @@ impl GateioRawHttpClient {
         symbol: Option<&str>,
     ) -> Result<Vec<GateioOrder>, GateioHttpError> {
         if product_type == GateioProductType::Spot {
-            let params = symbol
-                .map(|value| vec![("currency_pair".to_string(), value.to_string())])
-                .unwrap_or_default();
-            return self
-                .send(Method::GET, SPOT_OPEN_ORDERS, &params, None, true)
-                .await;
+            let mut result = Vec::new();
+            let mut page_fingerprints = HashSet::new();
+            let mut order_fingerprints = HashSet::new();
+            for page in 1..=MAX_PAGINATION_PAGES {
+                let params = vec![
+                    ("page".to_string(), page.to_string()),
+                    ("limit".to_string(), SPOT_OPEN_ORDER_LIMIT.to_string()),
+                ];
+                let groups: Vec<GateioSpotOpenOrders> = self
+                    .send(Method::GET, SPOT_OPEN_ORDERS, &params, None, true)
+                    .await?;
+                if groups.is_empty() {
+                    break;
+                }
+
+                let page_fingerprint = serde_json::to_string(&groups)?;
+                if !page_fingerprints.insert(page_fingerprint) {
+                    return Err(GateioHttpError::Validation(
+                        "Gate.io spot open-orders pagination returned a repeated page".to_string(),
+                    ));
+                }
+                let mut page_is_complete = true;
+                let mut new_orders = 0;
+                for group in groups {
+                    if group.orders.len() as u32 >= SPOT_OPEN_ORDER_LIMIT {
+                        page_is_complete = false;
+                    }
+                    if symbol.is_some_and(|value| value != group.currency_pair.as_str()) {
+                        continue;
+                    }
+                    for mut order in group.orders {
+                        order.currency_pair = Some(group.currency_pair.clone());
+                        let fingerprint = serde_json::to_string(&order)?;
+                        if order_fingerprints.insert(fingerprint) {
+                            result.push(order);
+                            new_orders += 1;
+                        }
+                    }
+                }
+                if !page_is_complete && new_orders == 0 {
+                    return Err(GateioHttpError::Validation(
+                        "Gate.io spot open-orders pagination made no progress".to_string(),
+                    ));
+                }
+
+                if page_is_complete {
+                    break;
+                }
+            }
+            return Ok(result);
         }
         self.orders(product_type, "open", symbol).await
     }
@@ -436,11 +554,112 @@ impl GateioRawHttpClient {
         } else {
             "contract"
         };
-        let mut params = vec![("status".to_string(), status.to_string())];
-        if let Some(symbol) = symbol {
-            params.push((symbol_key.to_string(), symbol.to_string()));
+        let page_limit =
+            if product_type == GateioProductType::Spot && status.eq_ignore_ascii_case("open") {
+                SPOT_OPEN_ORDER_LIMIT
+            } else {
+                PAGINATION_LIMIT
+            };
+        if product_type == GateioProductType::Spot
+            && status.eq_ignore_ascii_case("open")
+            && symbol.is_none()
+        {
+            return Err(GateioHttpError::Validation(
+                "Gate.io spot open-order queries require currency_pair; use open_orders(None) for all pairs"
+                    .to_string(),
+            ));
         }
-        self.send(Method::GET, endpoint, &params, None, true).await
+        let mut result = Vec::new();
+        let mut tracker = PaginationTracker::default();
+        for page in 1..=MAX_PAGINATION_PAGES {
+            let mut params = vec![
+                ("status".to_string(), status.to_string()),
+                ("limit".to_string(), page_limit.to_string()),
+            ];
+            if product_type == GateioProductType::Spot {
+                params.push(("page".to_string(), page.to_string()));
+            } else {
+                params.push((
+                    "offset".to_string(),
+                    pagination_offset(page, page_limit)?.to_string(),
+                ));
+            }
+            if let Some(symbol) = symbol {
+                params.push((symbol_key.to_string(), symbol.to_string()));
+            }
+            let rows: Vec<GateioOrder> = self
+                .send(Method::GET, endpoint, &params, None, true)
+                .await?;
+            let page_is_complete = rows.len() < page_limit as usize;
+            let new_rows = tracker.append_unique(&rows, "orders", &mut result)?;
+            if !page_is_complete && new_rows == 0 {
+                return Err(GateioHttpError::Validation(
+                    "Gate.io order pagination made no progress".to_string(),
+                ));
+            }
+            if page_is_complete {
+                break;
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn orders_in_time_range(
+        &self,
+        product_type: GateioProductType,
+        symbol: Option<&str>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> Result<Vec<GateioOrder>, GateioHttpError> {
+        validate_time_range(start, end, None, "orders")?;
+        let mut result = Vec::new();
+        let mut tracker = PaginationTracker::default();
+        for page in 1..=MAX_PAGINATION_PAGES {
+            let (endpoint, mut params) = if product_type == GateioProductType::Spot {
+                (
+                    SPOT_ORDERS,
+                    vec![
+                        ("status".to_string(), "finished".to_string()),
+                        ("page".to_string(), page.to_string()),
+                        ("limit".to_string(), PAGINATION_LIMIT.to_string()),
+                    ],
+                )
+            } else {
+                (
+                    FUTURES_ORDERS_TIMERANGE,
+                    vec![
+                        (
+                            "offset".to_string(),
+                            pagination_offset(page, PAGINATION_LIMIT)?.to_string(),
+                        ),
+                        ("limit".to_string(), PAGINATION_LIMIT.to_string()),
+                    ],
+                )
+            };
+            let symbol_key = if product_type == GateioProductType::Spot {
+                "currency_pair"
+            } else {
+                "contract"
+            };
+            if let Some(symbol) = symbol {
+                params.push((symbol_key.to_string(), symbol.to_string()));
+            }
+            append_time_range(&mut params, start, end)?;
+            let rows: Vec<GateioOrder> = self
+                .send(Method::GET, endpoint, &params, None, true)
+                .await?;
+            let page_is_complete = rows.len() < PAGINATION_LIMIT as usize;
+            let new_rows = tracker.append_unique(&rows, "orders in time range", &mut result)?;
+            if !page_is_complete && new_rows == 0 {
+                return Err(GateioHttpError::Validation(
+                    "Gate.io historical-order pagination made no progress".to_string(),
+                ));
+            }
+            if page_is_complete {
+                break;
+            }
+        }
+        Ok(result)
     }
 
     pub async fn user_trades(
@@ -448,25 +667,115 @@ impl GateioRawHttpClient {
         product_type: GateioProductType,
         symbol: Option<&str>,
     ) -> Result<Vec<GateioUserTrade>, GateioHttpError> {
-        let endpoint = if product_type == GateioProductType::Spot {
-            SPOT_MY_TRADES
-        } else {
-            FUTURES_MY_TRADES
-        };
-        let params = symbol
-            .map(|value| {
-                vec![(
-                    if product_type == GateioProductType::Spot {
-                        "currency_pair"
-                    } else {
-                        "contract"
-                    }
-                    .to_string(),
-                    value.to_string(),
-                )]
-            })
-            .unwrap_or_default();
-        self.send(Method::GET, endpoint, &params, None, true).await
+        let mut result = Vec::new();
+        let mut tracker = PaginationTracker::default();
+        for page in 1..=MAX_PAGINATION_PAGES {
+            let (endpoint, mut params) = if product_type == GateioProductType::Spot {
+                (
+                    SPOT_MY_TRADES,
+                    vec![
+                        ("page".to_string(), page.to_string()),
+                        ("limit".to_string(), PAGINATION_LIMIT.to_string()),
+                    ],
+                )
+            } else {
+                (
+                    FUTURES_MY_TRADES,
+                    vec![
+                        (
+                            "offset".to_string(),
+                            pagination_offset(page, PAGINATION_LIMIT)?.to_string(),
+                        ),
+                        ("limit".to_string(), PAGINATION_LIMIT.to_string()),
+                    ],
+                )
+            };
+            let symbol_key = if product_type == GateioProductType::Spot {
+                "currency_pair"
+            } else {
+                "contract"
+            };
+            if let Some(symbol) = symbol {
+                params.push((symbol_key.to_string(), symbol.to_string()));
+            }
+            let rows: Vec<GateioUserTrade> = self
+                .send(Method::GET, endpoint, &params, None, true)
+                .await?;
+            let page_is_complete = rows.len() < PAGINATION_LIMIT as usize;
+            let new_rows = tracker.append_unique(&rows, "user trades", &mut result)?;
+            if !page_is_complete && new_rows == 0 {
+                return Err(GateioHttpError::Validation(
+                    "Gate.io user-trade pagination made no progress".to_string(),
+                ));
+            }
+            if page_is_complete {
+                break;
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn user_trades_in_time_range(
+        &self,
+        product_type: GateioProductType,
+        symbol: Option<&str>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> Result<Vec<GateioUserTrade>, GateioHttpError> {
+        validate_time_range(
+            start,
+            end,
+            (product_type == GateioProductType::Spot).then_some(MAX_SPOT_TRADE_RANGE_SECS),
+            "user trades",
+        )?;
+        let mut result = Vec::new();
+        let mut tracker = PaginationTracker::default();
+        for page in 1..=MAX_PAGINATION_PAGES {
+            let (endpoint, mut params) = if product_type == GateioProductType::Spot {
+                (
+                    SPOT_MY_TRADES,
+                    vec![
+                        ("page".to_string(), page.to_string()),
+                        ("limit".to_string(), PAGINATION_LIMIT.to_string()),
+                    ],
+                )
+            } else {
+                (
+                    FUTURES_MY_TRADES_TIMERANGE,
+                    vec![
+                        (
+                            "offset".to_string(),
+                            pagination_offset(page, PAGINATION_LIMIT)?.to_string(),
+                        ),
+                        ("limit".to_string(), PAGINATION_LIMIT.to_string()),
+                    ],
+                )
+            };
+            let symbol_key = if product_type == GateioProductType::Spot {
+                "currency_pair"
+            } else {
+                "contract"
+            };
+            if let Some(symbol) = symbol {
+                params.push((symbol_key.to_string(), symbol.to_string()));
+            }
+            append_time_range(&mut params, start, end)?;
+            let rows: Vec<GateioUserTrade> = self
+                .send(Method::GET, endpoint, &params, None, true)
+                .await?;
+            let page_is_complete = rows.len() < PAGINATION_LIMIT as usize;
+            let new_rows =
+                tracker.append_unique(&rows, "user trades in time range", &mut result)?;
+            if !page_is_complete && new_rows == 0 {
+                return Err(GateioHttpError::Validation(
+                    "Gate.io historical user-trade pagination made no progress".to_string(),
+                ));
+            }
+            if page_is_complete {
+                break;
+            }
+        }
+        Ok(result)
     }
 
     pub async fn submit_order(
@@ -569,6 +878,97 @@ impl GateioRawHttpClient {
     }
 }
 
+fn append_time_range(
+    params: &mut Vec<(String, String)>,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+) -> Result<(), GateioHttpError> {
+    if let Some(start) = start {
+        params.push(("from".to_string(), start.timestamp().to_string()));
+    }
+    if let Some(end) = end {
+        params.push(("to".to_string(), end.timestamp().to_string()));
+    }
+    Ok(())
+}
+
+fn bounded_limit(value: u32, maximum: u32, resource: &str) -> Result<u32, GateioHttpError> {
+    if value == 0 {
+        return Err(GateioHttpError::Validation(format!(
+            "Gate.io {resource} limit must be greater than zero"
+        )));
+    }
+    Ok(value.min(maximum))
+}
+
+fn pagination_offset(page: u32, page_limit: u32) -> Result<u32, GateioHttpError> {
+    page.checked_sub(1)
+        .and_then(|page_index| page_index.checked_mul(page_limit))
+        .ok_or_else(|| {
+            GateioHttpError::Validation("Gate.io pagination offset overflow".to_string())
+        })
+}
+
+fn validate_time_range(
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    max_range_secs: Option<i64>,
+    resource: &str,
+) -> Result<(), GateioHttpError> {
+    if let (Some(start), Some(end)) = (start, end) {
+        if start >= end {
+            return Err(GateioHttpError::Validation(format!(
+                "Gate.io {resource} requires start to be before end"
+            )));
+        }
+        if let Some(max_range_secs) = max_range_secs
+            && (end - start).num_seconds() > max_range_secs
+        {
+            return Err(GateioHttpError::Validation(format!(
+                "Gate.io {resource} time range cannot exceed {max_range_secs} seconds"
+            )));
+        }
+    } else if let (Some(start), Some(max_range_secs)) = (start, max_range_secs)
+        && (Utc::now() - start).num_seconds() > max_range_secs
+    {
+        return Err(GateioHttpError::Validation(format!(
+            "Gate.io {resource} time range starting at {start} cannot exceed {max_range_secs} seconds"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct PaginationTracker {
+    page_fingerprints: HashSet<String>,
+    record_fingerprints: HashSet<String>,
+}
+
+impl PaginationTracker {
+    fn append_unique<T: Serialize + Clone>(
+        &mut self,
+        rows: &[T],
+        resource: &str,
+        output: &mut Vec<T>,
+    ) -> Result<usize, GateioHttpError> {
+        let page_fingerprint = serde_json::to_string(rows)?;
+        if !self.page_fingerprints.insert(page_fingerprint) {
+            return Err(GateioHttpError::Validation(format!(
+                "Gate.io {resource} pagination returned a repeated page"
+            )));
+        }
+        let mut new_rows = 0;
+        for row in rows {
+            let fingerprint = serde_json::to_string(row)?;
+            if self.record_fingerprints.insert(fingerprint) {
+                output.push(row.clone());
+                new_rows += 1;
+            }
+        }
+        Ok(new_rows)
+    }
+}
+
 fn retry_manager(max_retries: u32) -> RetryManager<GateioHttpError> {
     RetryManager::new(RetryConfig {
         max_retries,
@@ -583,7 +983,10 @@ fn retry_manager(max_retries: u32) -> RetryManager<GateioHttpError> {
 }
 
 fn should_retry(method: &Method, error: &GateioHttpError) -> bool {
-    if !matches!(*method, Method::GET | Method::PATCH | Method::DELETE) {
+    if !matches!(
+        *method,
+        Method::GET | Method::PATCH | Method::PUT | Method::DELETE
+    ) {
         return false;
     }
     match error {
@@ -702,7 +1105,14 @@ impl GateioHttpClient {
                 .contracts()
                 .await?
                 .into_iter()
-                .filter(|item| item.name.ends_with("_USDT"))
+                .filter(|item| {
+                    item.name.ends_with("_USDT")
+                        && item
+                            .status
+                            .as_deref()
+                            .is_none_or(|status| status.eq_ignore_ascii_case("trading"))
+                        && !item.in_delisting.unwrap_or(false)
+                })
                 .filter_map(|item| match parse_perpetual_instrument(&item, ts, ts) {
                     Ok(value) => Some(value),
                     Err(error) => {
@@ -725,11 +1135,41 @@ impl GateioHttpClient {
         if let Some(value) = self.cached(id) {
             return Ok(value);
         }
-        self.instruments(product_type, ts)
-            .await?
-            .into_iter()
-            .find(|value| value.id() == id)
-            .ok_or_else(|| anyhow::anyhow!("Gate.io instrument not found: {id}"))
+        anyhow::ensure!(
+            GateioProductType::from_symbol(id.symbol.as_str()) == product_type,
+            "Gate.io client is configured for {product_type:?}, cannot load {id}"
+        );
+        let raw = raw_symbol(id);
+        let instrument = match product_type {
+            GateioProductType::Spot => {
+                let pair = self.raw.spot_pair(&raw).await?;
+                parse_spot_instrument(&pair, ts, ts)?
+            }
+            GateioProductType::UsdtPerpetual => {
+                let contract = self.raw.contract(&raw).await?;
+                parse_perpetual_instrument(&contract, ts, ts)?
+            }
+        };
+        self.cache_instruments(std::slice::from_ref(&instrument));
+        Ok(instrument)
+    }
+
+    pub async fn instruments_for(
+        &self,
+        product_type: GateioProductType,
+        instrument_ids: Option<&[InstrumentId]>,
+        ts: UnixNanos,
+    ) -> anyhow::Result<Vec<InstrumentAny>> {
+        let Some(instrument_ids) = instrument_ids.filter(|values| !values.is_empty()) else {
+            return self.instruments(product_type, ts).await;
+        };
+
+        let mut result = Vec::with_capacity(instrument_ids.len());
+        for instrument_id in instrument_ids {
+            result.push(self.instrument(*instrument_id, product_type, ts).await?);
+        }
+        self.cache_instruments(&result);
+        Ok(result)
     }
 
     pub async fn order_book(
@@ -758,7 +1198,11 @@ impl GateioHttpClient {
         } else {
             self.raw.futures_order_book(&symbol, limit).await?
         };
-        let sequence = crate::common::parse::book_sequence(&book);
+        let sequence = crate::common::parse::book_snapshot_sequence(&book);
+        anyhow::ensure!(
+            sequence > 0,
+            "Gate.io order-book snapshot missing update id"
+        );
         Ok((parse_book(&book, instrument, ts)?, sequence))
     }
 
@@ -767,15 +1211,15 @@ impl GateioHttpClient {
         instrument: &InstrumentAny,
         product_type: GateioProductType,
         limit: Option<u32>,
-        _start: Option<DateTime<Utc>>,
-        _end: Option<DateTime<Utc>>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         ts: UnixNanos,
     ) -> anyhow::Result<Vec<TradeTick>> {
         let symbol = raw_symbol(instrument.id());
         let rows = if product_type == GateioProductType::Spot {
-            self.raw.spot_trades(&symbol, limit).await?
+            self.raw.spot_trades(&symbol, limit, start, end).await?
         } else {
-            self.raw.futures_trades(&symbol, limit).await?
+            self.raw.futures_trades(&symbol, limit, start, end).await?
         };
         rows.iter()
             .map(|row| parse_trade(row, instrument, ts))
@@ -788,6 +1232,8 @@ impl GateioHttpClient {
         product_type: GateioProductType,
         bar_type: BarType,
         limit: Option<u32>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         ts: UnixNanos,
     ) -> anyhow::Result<Vec<Bar>> {
         let interval = match bar_type.spec().aggregation {
@@ -798,7 +1244,14 @@ impl GateioHttpClient {
         };
         let rows = self
             .raw
-            .candles(product_type, &raw_symbol(instrument.id()), &interval, limit)
+            .candles(
+                product_type,
+                &raw_symbol(instrument.id()),
+                &interval,
+                limit,
+                start,
+                end,
+            )
             .await?;
         rows.iter()
             .map(|row| parse_candle(row, instrument, bar_type, ts))
@@ -811,11 +1264,37 @@ impl GateioHttpClient {
         account_id: nautilus_model::identifiers::AccountId,
         ts: UnixNanos,
     ) -> anyhow::Result<AccountState> {
+        self.account_state_with_timestamps(product_type, account_id, ts, ts)
+            .await
+    }
+
+    pub async fn user_id(&self) -> anyhow::Result<String> {
+        let detail = self.raw.account_detail().await?;
+        anyhow::ensure!(
+            !detail.user_id.trim().is_empty(),
+            "Gate.io account detail did not return a user_id"
+        );
+        Ok(detail.user_id)
+    }
+
+    pub async fn account_state_with_timestamps(
+        &self,
+        product_type: GateioProductType,
+        account_id: nautilus_model::identifiers::AccountId,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<AccountState> {
         let rows = match product_type {
             GateioProductType::Spot => self.raw.spot_accounts().await?,
             GateioProductType::UsdtPerpetual => vec![self.raw.futures_accounts().await?],
         };
-        crate::common::parse::parse_account_state(&rows, product_type, account_id, ts, ts)
+        crate::common::parse::parse_account_state(
+            &rows,
+            product_type,
+            account_id,
+            ts_event,
+            ts_init,
+        )
     }
 
     pub async fn submit_order(
@@ -880,12 +1359,36 @@ impl GateioHttpClient {
         self.raw.orders(product_type, status, symbol).await
     }
 
+    pub async fn orders_in_time_range(
+        &self,
+        product_type: GateioProductType,
+        symbol: Option<&str>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> Result<Vec<GateioOrder>, GateioHttpError> {
+        self.raw
+            .orders_in_time_range(product_type, symbol, start, end)
+            .await
+    }
+
     pub async fn user_trades(
         &self,
         product_type: GateioProductType,
         symbol: Option<&str>,
     ) -> Result<Vec<GateioUserTrade>, GateioHttpError> {
         self.raw.user_trades(product_type, symbol).await
+    }
+
+    pub async fn user_trades_in_time_range(
+        &self,
+        product_type: GateioProductType,
+        symbol: Option<&str>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> Result<Vec<GateioUserTrade>, GateioHttpError> {
+        self.raw
+            .user_trades_in_time_range(product_type, symbol, start, end)
+            .await
     }
 
     pub async fn positions(

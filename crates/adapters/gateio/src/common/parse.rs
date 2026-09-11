@@ -71,6 +71,13 @@ pub fn timestamp_nanos(value: i64) -> anyhow::Result<UnixNanos> {
     ))
 }
 
+fn timestamp_or_init(value: Option<i64>, ts_init: UnixNanos) -> anyhow::Result<UnixNanos> {
+    match value.filter(|value| *value > 0) {
+        Some(value) => timestamp_nanos(value),
+        None => Ok(ts_init),
+    }
+}
+
 fn precision(value: &str) -> u8 {
     value
         .split('.')
@@ -96,6 +103,12 @@ fn optional_decimal(value: Option<&str>, field: &str) -> anyhow::Result<Option<D
         .map(|value| {
             Decimal::from_str(value).with_context(|| format!("invalid Gate.io {field}: {value:?}"))
         })
+        .transpose()
+}
+
+fn optional_spot_fee_rate(value: Option<&str>) -> anyhow::Result<Option<Decimal>> {
+    optional_decimal(value, "spot fee")?
+        .map(|value| Ok(value / Decimal::from(100_u32)))
         .transpose()
 }
 
@@ -171,8 +184,8 @@ pub fn parse_spot_instrument(
         None,
         None,
         None,
-        optional_decimal(definition.fee.as_deref(), "spot fee")?,
-        optional_decimal(definition.fee.as_deref(), "spot fee")?,
+        optional_spot_fee_rate(definition.fee.as_deref())?,
+        optional_spot_fee_rate(definition.fee.as_deref())?,
         None,
         None,
         ts_event,
@@ -281,8 +294,7 @@ pub fn parse_trade(
         Some("sell") => AggressorSide::Seller,
         _ => AggressorSide::NoAggressor,
     };
-    let timestamp_ms = trade.create_time_ms.or(trade.create_time).unwrap_or(0);
-    let ts_event = timestamp_nanos(timestamp_ms)?;
+    let ts_event = timestamp_or_init(trade.create_time_ms.or(trade.create_time), ts_init)?;
     let id = trade
         .id
         .clone()
@@ -361,16 +373,55 @@ pub fn parse_user_trade(
         .map(|value| decimal(value, "user_trade.fee"))
         .transpose()?
         .unwrap_or_default();
+    let rebated_fee = trade
+        .rebated_fee
+        .as_deref()
+        .map(|value| decimal(value, "user_trade.rebated_fee"))
+        .transpose()?
+        .unwrap_or_default();
     let fee_currency = trade
         .fee_currency
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .map(currency)
-        .unwrap_or_else(|| instrument.quote_currency());
-    // Gate reports a positive fee as a debit. Keep rebates positive by negating the
-    // venue value once, instead of losing the sign when constructing Money.
-    let commission =
-        Money::from_decimal(-fee, fee_currency).context("invalid Gate.io user trade commission")?;
+        .map(currency);
+    let rebate_currency = trade
+        .rebated_fee_currency
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(currency);
+    let default_currency = instrument.quote_currency();
+    let commission = match (
+        fee.is_zero(),
+        rebated_fee.is_zero(),
+        fee_currency,
+        rebate_currency,
+    ) {
+        (true, true, _, _) => Ok(Money::zero(default_currency)),
+        (false, true, Some(fee_currency), _) => Money::from_decimal(fee, fee_currency),
+        (true, false, _, Some(rebate_currency)) => {
+            Money::from_decimal(-rebated_fee, rebate_currency)
+        }
+        (false, false, Some(fee_currency), Some(rebate_currency))
+            if fee_currency == rebate_currency =>
+        {
+            Money::from_decimal(fee - rebated_fee, fee_currency)
+        }
+        (false, false, Some(fee_currency), Some(rebate_currency)) => {
+            // FillReport carries one commission currency. Do not net values from
+            // different currencies, because that would make the reported PnL
+            // depend on an arbitrary currency conversion that never happened.
+            log::warn!(
+                "Gate.io fill has fee in {fee_currency} and rebate in {rebate_currency}; \
+                 keeping the fee debit and leaving the rebate to account reconciliation"
+            );
+            Money::from_decimal(fee, fee_currency)
+        }
+        (false, true, None, _) => Money::from_decimal(fee, default_currency),
+        (true, false, _, None) => Money::from_decimal(-rebated_fee, default_currency),
+        (false, false, Some(fee_currency), None) => Money::from_decimal(fee, fee_currency),
+        (false, false, None, _) => Money::from_decimal(fee, default_currency),
+    }
+    .context("invalid Gate.io user trade commission")?;
     let liquidity_side = match trade
         .role
         .as_deref()
@@ -382,12 +433,7 @@ pub fn parse_user_trade(
         "taker" => LiquiditySide::Taker,
         _ => LiquiditySide::NoLiquiditySide,
     };
-    let ts_event = trade
-        .create_time_ms
-        .or(trade.create_time)
-        .map(timestamp_nanos)
-        .transpose()?
-        .unwrap_or(ts_init);
+    let ts_event = timestamp_or_init(trade.create_time_ms.or(trade.create_time), ts_init)?;
     let client_order_id = trade
         .text
         .as_deref()
@@ -435,12 +481,7 @@ pub fn parse_position_status_report(
         "" | "0" => None,
         value => Some(decimal(value, "position.entry_price")?),
     };
-    let ts_last = position
-        .update_time
-        .or(position.create_time)
-        .map(timestamp_nanos)
-        .transpose()?
-        .unwrap_or(ts_init);
+    let ts_last = timestamp_or_init(position.update_time.or(position.create_time), ts_init)?;
 
     Ok(PositionStatusReport::new(
         account_id,
@@ -545,12 +586,8 @@ pub fn parse_book(
     instrument: &InstrumentAny,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderBookDeltas> {
-    let sequence = book
-        .sequence
-        .or(book.id)
-        .or_else(|| book.update.and_then(|value| u64::try_from(value).ok()))
-        .unwrap_or(0);
-    let ts_event = timestamp_nanos(book.current.or(book.update).unwrap_or(0))?;
+    let sequence = book_snapshot_sequence(book);
+    let ts_event = timestamp_or_init(book.current.or(book.update), ts_init)?;
     let total_levels = book.bids.len() + book.asks.len();
     let mut deltas = vec![OrderBookDelta::clear(
         instrument.id(),
@@ -589,13 +626,24 @@ pub fn parse_book(
     OrderBookDeltas::new_checked(instrument.id(), deltas).context("failed to construct book deltas")
 }
 
-/// Returns the venue sequence used to order Gate.io book snapshots and updates.
+/// Returns the REST/base order-book sequence.
+///
+/// Gate.io snapshots use `id`/`lastUpdateId`. Timestamp fields such as `t` and
+/// `update` must never be used as a fallback sequence because that can make a
+/// stale local book look contiguous.
 #[must_use]
-pub fn book_sequence(book: &GateioOrderBook) -> u64 {
-    book.sequence
-        .or(book.id)
-        .or_else(|| book.update.and_then(|value| u64::try_from(value).ok()))
-        .unwrap_or(0)
+pub fn book_snapshot_sequence(book: &GateioOrderBook) -> u64 {
+    book.id.unwrap_or(0)
+}
+
+/// Returns the WebSocket order-book update sequence.
+///
+/// Gate.io update messages use `u` as the last update id. The matching first
+/// update id is `U` and is checked by the data client before an update is
+/// replayed or published.
+#[must_use]
+pub fn book_update_sequence(book: &GateioOrderBook) -> u64 {
+    book.sequence.unwrap_or(0)
 }
 
 /// Parses a Gate.io order-book update without clearing the existing book.
@@ -611,8 +659,12 @@ pub fn parse_book_update(
         return parse_book(book, instrument, ts_init);
     }
 
-    let sequence = book_sequence(book);
-    let ts_event = timestamp_nanos(book.current.or(book.update).unwrap_or(0))?;
+    let sequence = book_update_sequence(book);
+    anyhow::ensure!(
+        sequence > 0,
+        "Gate.io order-book update missing last update id"
+    );
+    let ts_event = timestamp_or_init(book.current.or(book.update), ts_init)?;
     let total_levels = book.bids.len() + book.asks.len();
     anyhow::ensure!(
         total_levels > 0,
@@ -694,11 +746,7 @@ pub fn parse_funding_rate(
 ) -> anyhow::Result<FundingRateUpdate> {
     let rate = Decimal::from_str(value.rate.trim())
         .with_context(|| format!("invalid Gate.io funding rate: {:?}", value.rate))?;
-    let ts_event = value
-        .timestamp_ms
-        .map(timestamp_nanos)
-        .transpose()?
-        .unwrap_or(ts_init);
+    let ts_event = timestamp_or_init(value.timestamp_ms, ts_init)?;
     Ok(FundingRateUpdate::new(
         instrument.id(),
         rate,
@@ -742,7 +790,7 @@ pub fn parse_candle(
         price(&candle.low, instrument.price_precision(), "candle.low")?,
         price(&candle.close, instrument.price_precision(), "candle.close")?,
         quantity(&candle.volume, instrument.size_precision(), "candle.volume")?,
-        timestamp_nanos(candle.timestamp_ms)?,
+        timestamp_or_init(Some(candle.timestamp_ms), ts_init)?,
         ts_init,
     )
     .context("failed to construct Gate.io Bar")
@@ -769,7 +817,7 @@ mod tests {
             "max_base_amount": "100",
             "min_quote_amount": "1",
             "max_quote_amount": "100000",
-            "fee": "0.001"
+            "fee": "0.2"
         }))
         .unwrap();
         parse_spot_instrument(
@@ -819,8 +867,8 @@ mod tests {
             instrument.min_notional.unwrap().as_decimal(),
             Decimal::from_str("1").unwrap()
         );
-        assert_eq!(instrument.maker_fee, Decimal::from_str("0.001").unwrap());
-        assert_eq!(instrument.taker_fee, Decimal::from_str("0.001").unwrap());
+        assert_eq!(instrument.maker_fee, Decimal::from_str("0.002").unwrap());
+        assert_eq!(instrument.taker_fee, Decimal::from_str("0.002").unwrap());
     }
 
     #[test]
@@ -957,6 +1005,8 @@ mod tests {
             size: String::new(),
             fee: Some("0.00025".to_string()),
             fee_currency: Some("USDT".to_string()),
+            rebated_fee: None,
+            rebated_fee_currency: None,
             create_time_ms: Some(1_700_000_000_000),
             create_time: None,
             side: Some("sell".to_string()),
@@ -974,7 +1024,7 @@ mod tests {
         assert_eq!(spot_report.last_qty, Quantity::from("0.250"));
         assert_eq!(
             spot_report.commission.as_decimal(),
-            Decimal::from_str("-0.00025").unwrap()
+            Decimal::from_str("0.00025").unwrap()
         );
         assert_eq!(spot_report.liquidity_side, LiquiditySide::Maker);
         assert_eq!(
@@ -993,6 +1043,8 @@ mod tests {
             size: "-3".to_string(),
             fee: Some("0.75".to_string()),
             fee_currency: Some("USDT".to_string()),
+            rebated_fee: None,
+            rebated_fee_currency: None,
             create_time_ms: None,
             create_time: Some(1_700_000_000),
             side: None,
@@ -1010,9 +1062,62 @@ mod tests {
         assert_eq!(futures_report.last_qty, Quantity::from("3"));
         assert_eq!(
             futures_report.commission.as_decimal(),
-            Decimal::from_str("-0.75").unwrap()
+            Decimal::from_str("0.75").unwrap()
         );
         assert_eq!(futures_report.liquidity_side, LiquiditySide::Taker);
+    }
+
+    #[test]
+    fn does_not_net_fee_and_rebate_from_different_currencies() {
+        let trade = GateioUserTrade {
+            id: "trade-multi-currency".to_string(),
+            order_id: "order-multi-currency".to_string(),
+            price: "50000".to_string(),
+            amount: "0.001".to_string(),
+            fee: Some("1".to_string()),
+            fee_currency: Some("USDT".to_string()),
+            rebated_fee: Some("0.1".to_string()),
+            rebated_fee_currency: Some("GT".to_string()),
+            side: Some("buy".to_string()),
+            ..Default::default()
+        };
+        let report = parse_user_trade(
+            &trade,
+            &spot_instrument(),
+            AccountId::from("GATEIO-001"),
+            UnixNanos::from(2),
+        )
+        .unwrap();
+
+        assert_eq!(report.commission.currency.code.as_str(), "USDT");
+        assert_eq!(report.commission.as_decimal(), Decimal::ONE);
+    }
+
+    #[test]
+    fn represents_rebate_only_as_negative_commission() {
+        let trade = GateioUserTrade {
+            id: "trade-rebate-only".to_string(),
+            order_id: "order-rebate-only".to_string(),
+            price: "50000".to_string(),
+            amount: "0.001".to_string(),
+            rebated_fee: Some("0.1".to_string()),
+            rebated_fee_currency: Some("USDT".to_string()),
+            side: Some("buy".to_string()),
+            ..Default::default()
+        };
+        let report = parse_user_trade(
+            &trade,
+            &spot_instrument(),
+            AccountId::from("GATEIO-001"),
+            UnixNanos::from(2),
+        )
+        .unwrap();
+
+        assert_eq!(report.commission.currency.code.as_str(), "USDT");
+        assert_eq!(
+            report.commission.as_decimal(),
+            -Decimal::from_str("0.1").unwrap()
+        );
     }
 
     #[test]
@@ -1029,6 +1134,7 @@ mod tests {
                 value: "0".to_string(),
                 entry_price: "50000".to_string(),
                 mark_price: "50000".to_string(),
+                update_id: None,
                 update_time: Some(1_700_000_000_000),
                 create_time: None,
             };
@@ -1098,5 +1204,64 @@ mod tests {
         assert_eq!(update_deltas.deltas[0].order.size, Quantity::from("4"));
         assert_eq!(update_deltas.deltas[1].action, BookAction::Delete);
         assert_eq!(update_deltas.deltas[1].order.size, Quantity::from("0"));
+    }
+
+    #[test]
+    fn order_book_sequences_ignore_timestamp_fields() {
+        let instrument = futures_instrument();
+        let snapshot = GateioOrderBook {
+            id: Some(10),
+            sequence: Some(999),
+            update: Some(1_700_000_000_000),
+            bids: vec![GateioLevel::Futures {
+                price: "50000".to_string(),
+                amount: "3".to_string(),
+            }],
+            asks: vec![GateioLevel::Futures {
+                price: "50001".to_string(),
+                amount: "-2".to_string(),
+            }],
+            ..Default::default()
+        };
+        let snapshot_deltas =
+            parse_book(&snapshot, &instrument, UnixNanos::from(2_000_000_000)).unwrap();
+        assert_eq!(book_snapshot_sequence(&snapshot), 10);
+        assert_eq!(snapshot_deltas.sequence, 10);
+
+        let update = GateioOrderBook {
+            first_sequence: Some(11),
+            sequence: Some(11),
+            update: Some(1_700_000_000_000),
+            bids: vec![GateioLevel::Futures {
+                price: "50000".to_string(),
+                amount: "4".to_string(),
+            }],
+            ..Default::default()
+        };
+        let update_deltas =
+            parse_book_update(&update, &instrument, UnixNanos::from(2_000_000_000)).unwrap();
+        assert_eq!(book_update_sequence(&update), 11);
+        assert_eq!(update_deltas.sequence, 11);
+
+        let missing_sequence = GateioOrderBook {
+            update: Some(1_700_000_000_000),
+            bids: vec![GateioLevel::Futures {
+                price: "50000".to_string(),
+                amount: "4".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(book_snapshot_sequence(&missing_sequence), 0);
+        assert_eq!(book_update_sequence(&missing_sequence), 0);
+        assert!(
+            parse_book_update(
+                &missing_sequence,
+                &instrument,
+                UnixNanos::from(2_000_000_000)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("missing last update id")
+        );
     }
 }

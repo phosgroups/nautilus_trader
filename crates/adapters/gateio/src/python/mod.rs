@@ -15,7 +15,11 @@ use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
 
 use crate::{
-    common::{consts::GATEIO, enums::GateioProductType, symbol::extract_raw_symbol},
+    common::{
+        consts::GATEIO,
+        enums::{GateioEnvironment, GateioProductType},
+        symbol::extract_raw_symbol,
+    },
     config::{GateioDataClientConfig, GateioExecClientConfig},
     factories::{GateioDataClientFactory, GateioExecutionClientFactory},
 };
@@ -97,6 +101,7 @@ fn extract_gateio_exec_config(
 pub fn gateio(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(GATEIO, GATEIO)?;
     m.add_class::<GateioProductType>()?;
+    m.add_class::<GateioEnvironment>()?;
     m.add_class::<GateioDataClientConfig>()?;
     m.add_class::<GateioExecClientConfig>()?;
     m.add_class::<GateioDataClientFactory>()?;
