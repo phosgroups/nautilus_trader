@@ -89,8 +89,9 @@ use crate::{
     client::ExecutionClientAdapter,
     reconciliation::{
         check_position_reconciliation, create_incremental_inferred_fill,
-        generate_external_order_status_events, generate_reconciliation_order_events,
-        reconcile_fill_report as reconcile_fill,
+        create_reconciliation_updated, generate_external_order_status_events,
+        generate_reconciliation_order_events, reconcile_fill_report as reconcile_fill,
+        should_reconciliation_update,
     },
 };
 
@@ -1156,8 +1157,8 @@ impl ExecutionEngine {
             report.time_in_force,
             report.post_only,
             report.reduce_only,
-            false, // quote_quantity
-            true,  // reconciliation
+            report.is_quote_quantity,
+            true, // reconciliation
             UUID4::new(),
             ts_now,
             ts_now,
@@ -1494,6 +1495,25 @@ impl ExecutionEngine {
                 order
             }
         };
+
+        // A venue can report fills in base units even when the local order was
+        // submitted as a quote-denominated order. Convert the local projection
+        // before applying real fill events so cumulative fills and leaves
+        // quantity use the same unit. This is also needed when the status report
+        // and its fill reports arrive in the same bundled execution report.
+        if should_reconciliation_update(&order, report) {
+            let ts_now = self.clock.borrow().timestamp_ns();
+            let updated = create_reconciliation_updated(&order, report, ts_now);
+            self.handle_event(&updated);
+            if let Some(refreshed) = self
+                .cache
+                .borrow()
+                .order(&order.client_order_id())
+                .map(|o| o.clone())
+            {
+                order = refreshed;
+            }
+        }
 
         let client_order_id = order.client_order_id();
 

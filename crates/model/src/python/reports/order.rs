@@ -74,6 +74,7 @@ impl OrderStatusReport {
         reduce_only=false,
         cancel_reason=None,
         ts_triggered=None,
+        is_quote_quantity=false,
     ))]
     fn py_new(
         account_id: AccountId,
@@ -108,6 +109,7 @@ impl OrderStatusReport {
         reduce_only: bool,
         cancel_reason: Option<String>,
         ts_triggered: Option<u64>,
+        is_quote_quantity: bool,
     ) -> Self {
         let mut report = Self::new(
             account_id,
@@ -196,6 +198,10 @@ impl OrderStatusReport {
 
         if let Some(ts_triggered) = ts_triggered {
             report = report.with_ts_triggered(ts_triggered.into());
+        }
+
+        if is_quote_quantity {
+            report = report.with_is_quote_quantity(true);
         }
 
         report
@@ -386,6 +392,12 @@ impl OrderStatusReport {
     }
 
     #[getter]
+    #[pyo3(name = "is_quote_quantity")]
+    const fn py_is_quote_quantity(&self) -> bool {
+        self.is_quote_quantity
+    }
+
+    #[getter]
     #[pyo3(name = "post_only")]
     const fn py_post_only(&self) -> bool {
         self.post_only
@@ -462,6 +474,7 @@ impl OrderStatusReport {
         )?;
         dict.set_item("post_only", self.post_only)?;
         dict.set_item("reduce_only", self.reduce_only)?;
+        dict.set_item("is_quote_quantity", self.is_quote_quantity)?;
 
         match &self.client_order_id {
             Some(id) => dict.set_item("client_order_id", id.to_string())?,

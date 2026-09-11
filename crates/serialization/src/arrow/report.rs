@@ -55,6 +55,7 @@ const ORDER_STATUS_REPORT_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8("trailing_offset_type", false),
     JsonFieldSpec::utf8("avg_px", true),
     JsonFieldSpec::utf8("display_qty", true),
+    JsonFieldSpec::boolean("is_quote_quantity", false),
     JsonFieldSpec::boolean("post_only", false),
     JsonFieldSpec::boolean("reduce_only", false),
     JsonFieldSpec::utf8("cancel_reason", true),

@@ -97,6 +97,13 @@ pub struct OrderStatusReport {
     pub avg_px: Option<Decimal>,
     /// The quantity of the `LIMIT` order to display on the public book (iceberg).
     pub display_qty: Option<Quantity>,
+    /// If the reported order quantity is denominated in the quote currency.
+    ///
+    /// The filled quantity is always expressed in instrument quantity (base
+    /// units for spot instruments). This flag lets reconciliation convert a
+    /// quote-denominated order before applying venue fills.
+    #[serde(default)]
+    pub is_quote_quantity: bool,
     /// If the order will only provide liquidity (make a market).
     pub post_only: bool,
     /// If the order carries the 'reduce-only' execution instruction.
@@ -156,6 +163,7 @@ impl OrderStatusReport {
             trailing_offset_type: TrailingOffsetType::default(),
             avg_px: None,
             display_qty: None,
+            is_quote_quantity: false,
             post_only: false,
             reduce_only: false,
             cancel_reason: None,
@@ -275,6 +283,13 @@ impl OrderStatusReport {
         self
     }
 
+    /// Sets whether the reported order quantity is denominated in quote currency.
+    #[must_use]
+    pub const fn with_is_quote_quantity(mut self, is_quote_quantity: bool) -> Self {
+        self.is_quote_quantity = is_quote_quantity;
+        self
+    }
+
     /// Sets the expire time.
     #[must_use]
     pub const fn with_expire_time(mut self, expire_time: UnixNanos) -> Self {
@@ -323,6 +338,7 @@ impl OrderStatusReport {
     /// - Price (if both the order and report have a price).
     /// - Trigger price (if both the order and report have a trigger price).
     /// - Quantity.
+    /// - Quantity denomination.
     #[must_use]
     pub fn is_order_updated(&self, order: &impl Order) -> bool {
         if order.has_price()
@@ -340,7 +356,7 @@ impl OrderStatusReport {
             return true;
         }
 
-        order.quantity() != self.quantity
+        order.quantity() != self.quantity || order.is_quote_quantity() != self.is_quote_quantity
     }
 }
 
@@ -377,6 +393,7 @@ impl Display for OrderStatusReport {
                 trailing_offset_type={}, \
                 avg_px={:?}, \
                 display_qty={:?}, \
+                is_quote_quantity={}, \
                 post_only={}, \
                 reduce_only={}, \
                 cancel_reason={:?}, \
@@ -410,6 +427,7 @@ impl Display for OrderStatusReport {
             self.trailing_offset_type,
             self.avg_px,
             self.display_qty,
+            self.is_quote_quantity,
             self.post_only,
             self.reduce_only,
             self.cancel_reason,
@@ -492,6 +510,7 @@ mod tests {
         assert_eq!(report.trailing_offset_type, TrailingOffsetType::default());
         assert_eq!(report.avg_px, None);
         assert_eq!(report.display_qty, None);
+        assert!(!report.is_quote_quantity);
         assert!(!report.post_only);
         assert!(!report.reduce_only);
         assert_eq!(report.cancel_reason, None);
@@ -540,6 +559,7 @@ mod tests {
             .with_trailing_offset(dec!(0.0002))
             .with_trailing_offset_type(TrailingOffsetType::BasisPoints)
             .with_display_qty(Quantity::from("50"))
+            .with_is_quote_quantity(true)
             .with_expire_time(UnixNanos::from(4_000_000_000))
             .with_post_only(true)
             .with_reduce_only(true)
@@ -565,6 +585,7 @@ mod tests {
         assert_eq!(report.trailing_offset, Some(dec!(0.0002)));
         assert_eq!(report.trailing_offset_type, TrailingOffsetType::BasisPoints);
         assert_eq!(report.display_qty, Some(Quantity::from("50")));
+        assert!(report.is_quote_quantity);
         assert_eq!(report.expire_time, Some(UnixNanos::from(4_000_000_000)));
         assert!(report.post_only);
         assert!(report.reduce_only);

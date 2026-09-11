@@ -293,6 +293,7 @@ pub fn parse_futures_ws_order_status_report(
         trailing_offset_type: TrailingOffsetType::NoTrailingOffset,
         display_qty: None,
         avg_px: None,
+        is_quote_quantity: false,
         post_only: false,
         reduce_only: order.reduce_only,
         cancel_reason: None,
