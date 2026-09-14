@@ -118,7 +118,15 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   build-macos:
-    runs-on: macos-latest
+    # Pin macOS 15: poetry-core/packaging derives the wheel platform tag from
+    # platform.mac_ver() (the runner OS), not MACOSX_DEPLOYMENT_TARGET.
+    # macos-latest is now macOS 26, which tags the wheel macosx_26_0_arm64
+    # (not installable on macOS 15). macos-15 yields macosx_15_0_arm64, which is
+    # forward-compatible with newer macOS (ISSUE-0046).
+    runs-on: macos-15
+    env:
+      # Ensure the compiled extension links against a 15.0 minimum OS.
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -175,6 +183,9 @@ jobs:
         run: |
           ls dist/*.whl | grep -q 'nautilus_trader-' \
             || { echo "::error::wheel name does not contain nautilus_trader-"; exit 1; }
+          EXPECTED_PLAT="macosx_${MACOSX_DEPLOYMENT_TARGET//./_}_arm64"
+          ls dist/*.whl | grep -q "${EXPECTED_PLAT}" \
+            || { echo "::error::expected wheel platform ${EXPECTED_PLAT}, got $(ls dist/*.whl)"; exit 1; }
           echo "wheel OK: $(ls dist/*.whl)"
 
       - name: Smoke test (wheel metadata version)
