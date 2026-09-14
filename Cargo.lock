@@ -6142,6 +6142,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "nautilus-gateio"
+version = "0.60.0"
+dependencies = [
+ "ahash 0.8.12",
+ "anyhow",
+ "async-trait",
+ "aws-lc-rs",
+ "axum",
+ "base64",
+ "bon",
+ "chrono",
+ "dashmap",
+ "futures-util",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-network",
+ "nautilus-system",
+ "nautilus-testkit",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "pyo3-stub-gen",
+ "rstest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "strum 0.28.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "ustr",
+ "zeroize",
+]
+
+[[package]]
 name = "nautilus-hyperliquid"
 version = "0.60.0"
 dependencies = [
@@ -6696,6 +6736,7 @@ dependencies = [
  "nautilus-derive",
  "nautilus-dydx",
  "nautilus-execution",
+ "nautilus-gateio",
  "nautilus-hyperliquid",
  "nautilus-indicators",
  "nautilus-infrastructure",

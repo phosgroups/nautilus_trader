@@ -14263,6 +14263,80 @@ fn test_reconcile_order_with_fills_applies_to_cached_order(mut execution_engine:
 }
 
 #[rstest]
+fn test_reconcile_order_with_fills_converts_quote_order_before_base_fill(
+    mut execution_engine: ExecutionEngine,
+) {
+    let instrument = audusd_sim();
+    let client_order_id = ClientOrderId::from("O-QUOTE-001");
+    let venue_order_id = VenueOrderId::from("V-QUOTE-001");
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(instrument.clone()))
+        .unwrap();
+
+    // The local order uses a quote-currency budget. Gate.io reports the
+    // executed base quantity in both the order status and fill report.
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("100"))
+        .quote_quantity(true)
+        .build();
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(ClientId::from("STUB")), true)
+        .unwrap();
+    let submitted = TestOrderEventStubs::submitted(&order, AccountId::test_default());
+    execution_engine.process(&submitted);
+    let accepted = TestOrderEventStubs::accepted(&order, AccountId::test_default(), venue_order_id);
+    execution_engine.process(&accepted);
+
+    let order_report = OrderStatusReport::new(
+        AccountId::test_default(),
+        instrument.id(),
+        Some(client_order_id),
+        venue_order_id,
+        OrderSide::Buy,
+        OrderType::Market,
+        TimeInForce::Ioc,
+        OrderStatus::Filled,
+        Quantity::from("0.002"),
+        Quantity::from("0.002"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )
+    .with_is_quote_quantity(false);
+    let fill = create_fill_report(
+        instrument.id(),
+        Some(client_order_id),
+        venue_order_id,
+        TradeId::from("T-QUOTE-001"),
+        Quantity::from("0.002"),
+        Price::from("1.00000"),
+    );
+
+    execution_engine.reconcile_order_with_fills(&order_report, &[fill]);
+
+    let cache = execution_engine.cache().borrow();
+    let order = cache
+        .order(&client_order_id)
+        .expect("quote-denominated order should remain in cache");
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(order.quantity(), Quantity::from("0.002"));
+    assert!(!order.is_quote_quantity());
+    assert_eq!(order.filled_qty(), Quantity::from("0.002"));
+    assert_eq!(order.trade_ids().len(), 1);
+    assert_eq!(*order.trade_ids()[0], TradeId::from("T-QUOTE-001"));
+}
+
+#[rstest]
 #[case(OrderStatus::Canceled)]
 #[case(OrderStatus::Expired)]
 fn test_reconcile_order_with_fills_emits_terminal_event_for_external(

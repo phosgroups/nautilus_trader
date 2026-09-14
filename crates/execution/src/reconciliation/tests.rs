@@ -4902,6 +4902,47 @@ fn test_reconciliation_updated_strips_trigger_price_for_limit(instrument: Instru
 }
 
 #[rstest]
+fn test_reconciliation_updated_converts_quote_quantity_to_base(instrument: InstrumentAny) {
+    let client_order_id = ClientOrderId::from("O-QUOTE-001");
+    let venue_order_id = VenueOrderId::from("V-QUOTE-001");
+    let account_id = AccountId::from("SIM-001");
+
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("100"))
+        .quote_quantity(true)
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+
+    let report = create_test_order_status_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Market,
+        OrderStatus::Filled,
+        Quantity::from("0.002"),
+        Quantity::from("0.002"),
+    )
+    .with_is_quote_quantity(false);
+
+    assert!(should_reconciliation_update(&order, &report));
+
+    let event = create_reconciliation_updated(&order, &report, UnixNanos::default());
+    let updated = match event.clone() {
+        OrderEventAny::Updated(updated) => updated,
+        other => panic!("expected OrderUpdated, was {other:?}"),
+    };
+    assert_eq!(updated.quantity, Quantity::from("0.002"));
+    assert!(!updated.is_quote_quantity);
+
+    order.apply(event).unwrap();
+    assert_eq!(order.quantity(), Quantity::from("0.002"));
+    assert!(!order.is_quote_quantity());
+}
+
+#[rstest]
 fn test_reconcile_closed_order_within_tolerance_is_noop(instrument: InstrumentAny) {
     // Venue can redeliver a filled order with sub-precision jitter on
     // filled_qty after it closed locally; the mismatch is within single-unit

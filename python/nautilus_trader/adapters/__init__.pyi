@@ -11,6 +11,7 @@ from . import databento
 from . import deribit
 from . import derive
 from . import dydx
+from . import gateio
 from . import hyperliquid
 from . import kraken
 from . import lighter
@@ -31,6 +32,7 @@ __all__ = [
     "deribit",
     "derive",
     "dydx",
+    "gateio",
     "hyperliquid",
     "kraken",
     "lighter",

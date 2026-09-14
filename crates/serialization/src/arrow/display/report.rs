@@ -62,6 +62,7 @@ pub fn order_status_report_schema() -> Schema {
         utf8_field("trailing_offset_type", false),
         float64_field("avg_px", true),
         float64_field("display_qty", true),
+        bool_field("is_quote_quantity", false),
         bool_field("post_only", false),
         bool_field("reduce_only", false),
         utf8_field("cancel_reason", true),
@@ -109,6 +110,7 @@ pub fn encode_order_status_reports(data: &[OrderStatusReport]) -> Result<RecordB
     let mut trailing_offset_type = StringBuilder::new();
     let mut avg_px = Float64Builder::with_capacity(data.len());
     let mut display_qty = Float64Builder::with_capacity(data.len());
+    let mut is_quote_quantity = BooleanBuilder::with_capacity(data.len());
     let mut post_only = BooleanBuilder::with_capacity(data.len());
     let mut reduce_only = BooleanBuilder::with_capacity(data.len());
     let mut cancel_reason = StringBuilder::new();
@@ -146,6 +148,7 @@ pub fn encode_order_status_reports(data: &[OrderStatusReport]) -> Result<RecordB
         trailing_offset_type.append_value(format!("{}", report.trailing_offset_type));
         avg_px.append_option(report.avg_px.and_then(|v| v.to_f64()));
         display_qty.append_option(report.display_qty.map(|v| quantity_to_f64(&v)));
+        is_quote_quantity.append_value(report.is_quote_quantity);
         post_only.append_value(report.post_only);
         reduce_only.append_value(report.reduce_only);
         cancel_reason.append_option(report.cancel_reason.clone());
@@ -183,6 +186,7 @@ pub fn encode_order_status_reports(data: &[OrderStatusReport]) -> Result<RecordB
             Arc::new(trailing_offset_type.finish()),
             Arc::new(avg_px.finish()),
             Arc::new(display_qty.finish()),
+            Arc::new(is_quote_quantity.finish()),
             Arc::new(post_only.finish()),
             Arc::new(reduce_only.finish()),
             Arc::new(cancel_reason.finish()),
@@ -239,6 +243,7 @@ mod tests {
             trailing_offset_type: TrailingOffsetType::NoTrailingOffset,
             avg_px: None,
             display_qty: None,
+            is_quote_quantity: false,
             post_only: true,
             reduce_only: false,
             cancel_reason: None,
@@ -251,7 +256,7 @@ mod tests {
         let batch = encode_order_status_reports(&[]).unwrap();
         let schema = batch.schema();
         let fields = schema.fields();
-        assert_eq!(fields.len(), 32);
+        assert_eq!(fields.len(), 33);
         assert_eq!(fields[0].name(), "account_id");
         assert_eq!(fields[0].data_type(), &DataType::Utf8);
         assert_eq!(fields[8].name(), "quantity");
@@ -261,8 +266,10 @@ mod tests {
             fields[11].data_type(),
             &DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
-        assert_eq!(fields[28].name(), "post_only");
+        assert_eq!(fields[28].name(), "is_quote_quantity");
         assert_eq!(fields[28].data_type(), &DataType::Boolean);
+        assert_eq!(fields[29].name(), "post_only");
+        assert_eq!(fields[29].data_type(), &DataType::Boolean);
     }
 
     #[rstest]
@@ -287,8 +294,13 @@ mod tests {
             .as_any()
             .downcast_ref::<Float64Array>()
             .unwrap();
-        let post_only_col = batch
+        let quote_quantity_col = batch
             .column(28)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let post_only_col = batch
+            .column(29)
             .as_any()
             .downcast_ref::<BooleanArray>()
             .unwrap();
@@ -301,6 +313,7 @@ mod tests {
         assert!((quantity_col.value(0) - 100.0).abs() < 1e-9);
         assert!((filled_qty_col.value(0) - 50.0).abs() < 1e-9);
         assert!((price_col.value(0) - 100.50).abs() < 1e-9);
+        assert!(!quote_quantity_col.value(0));
         assert!(post_only_col.value(0));
         assert_eq!(ts_accepted_col.value(0), 1_000_000);
     }
@@ -361,7 +374,7 @@ mod tests {
     fn test_encode_order_status_reports_empty() {
         let batch = encode_order_status_reports(&[]).unwrap();
         assert_eq!(batch.num_rows(), 0);
-        assert_eq!(batch.schema().fields().len(), 32);
+        assert_eq!(batch.schema().fields().len(), 33);
     }
 
     #[rstest]

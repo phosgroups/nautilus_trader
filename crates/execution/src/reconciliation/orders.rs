@@ -418,7 +418,10 @@ pub fn reconcile_fill_report(
 /// snapshot (for example, a Filled report that omits price but supplies
 /// `avg_px`) does not trigger a spurious `OrderUpdated`.
 pub fn should_reconciliation_update(order: &OrderAny, report: &OrderStatusReport) -> bool {
-    if report.quantity != order.quantity() && report.quantity >= order.filled_qty() {
+    if (report.quantity != order.quantity()
+        || report.is_quote_quantity != order.is_quote_quantity())
+        && report.quantity >= order.filled_qty()
+    {
         return true;
     }
 
@@ -566,7 +569,7 @@ pub(super) fn create_reconciliation_expired(
 
 /// Creates an `OrderUpdated` event for reconciliation.
 #[must_use]
-pub(super) fn create_reconciliation_updated(
+pub fn create_reconciliation_updated(
     order: &OrderAny,
     report: &OrderStatusReport,
     ts_now: UnixNanos,
@@ -602,7 +605,7 @@ pub(super) fn create_reconciliation_updated(
         report.price,
         trigger_price,
         None, // protection_price
-        order.is_quote_quantity(),
+        report.is_quote_quantity,
     ))
 }
 

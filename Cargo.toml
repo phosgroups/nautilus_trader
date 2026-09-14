@@ -14,6 +14,7 @@ members = [
   "crates/adapters/deribit",
   "crates/adapters/derive",
   "crates/adapters/dydx",
+  "crates/adapters/gateio",
   "crates/adapters/hyperliquid",
   "crates/adapters/interactive_brokers",
   "crates/adapters/kraken",
@@ -110,6 +111,7 @@ nautilus-databento = { path = "crates/adapters/databento", version = "0.60.0", d
 nautilus-deribit = { path = "crates/adapters/deribit", version = "0.60.0", default-features = false }
 nautilus-derive = { path = "crates/adapters/derive", version = "0.60.0", default-features = false }
 nautilus-dydx = { path = "crates/adapters/dydx", version = "0.60.0", default-features = false }
+nautilus-gateio = { path = "crates/adapters/gateio", version = "0.60.0", default-features = false }
 nautilus-hyperliquid = { path = "crates/adapters/hyperliquid", version = "0.60.0", default-features = false }
 nautilus-interactive-brokers = { path = "crates/adapters/interactive_brokers", version = "0.60.0" }
 nautilus-kraken = { path = "crates/adapters/kraken", version = "0.60.0", default-features = false }
