@@ -81,7 +81,7 @@ mod tests {
         );
         assert_eq!(
             ws_url(GateioProductType::UsdtPerpetual, GateioEnvironment::Testnet),
-            "wss://ws-testnet.gate.com/v4/ws/futures/usdt"
+            "wss://fx-ws-testnet.gateio.ws/v4/ws/usdt"
         );
     }
 
