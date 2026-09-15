@@ -39,6 +39,13 @@ const SUBSCRIPTION_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const GATEIO_INTERNAL_RECONNECTED_CHANNEL: &str = "__gateio.reconnected";
 
+fn restore_ack_deadline(restore_started: Option<tokio::time::Instant>) -> tokio::time::Instant {
+    restore_started.map_or_else(
+        || tokio::time::Instant::now() + SUBSCRIPTION_ACK_TIMEOUT,
+        |started| started + SUBSCRIPTION_ACK_TIMEOUT,
+    )
+}
+
 /// Errors reported by the Gate.io WebSocket protocol.
 #[derive(Debug, Error)]
 pub enum GateioWsError {
@@ -537,10 +544,7 @@ impl GateioWebSocketClient {
                             }
                         }
                     }
-                    _ = tokio::time::sleep_until(
-                        restore_started
-                            .unwrap_or_else(|| tokio::time::Instant::now() + SUBSCRIPTION_ACK_TIMEOUT),
-                    ), if !restore_pending.is_empty() => {
+                    _ = tokio::time::sleep_until(restore_ack_deadline(restore_started)), if !restore_pending.is_empty() => {
                         log::warn!(
                             "Gate.io WebSocket subscription restoration timed out with {} pending ACKs",
                             restore_pending.len()
@@ -885,6 +889,14 @@ mod tests {
             ping_channel(GateioProductType::UsdtPerpetual),
             GATEIO_FUTURES_PING_WS_CHANNEL
         );
+    }
+
+    #[test]
+    fn restore_ack_deadline_waits_ack_timeout_after_restore_start() {
+        let started = tokio::time::Instant::now();
+        let deadline = restore_ack_deadline(Some(started));
+
+        assert_eq!(deadline.duration_since(started), SUBSCRIPTION_ACK_TIMEOUT);
     }
 
     #[tokio::test]
