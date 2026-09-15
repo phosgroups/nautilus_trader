@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use nautilus_core::{AtomicMap, UnixNanos, consts::NAUTILUS_USER_AGENT};
 use nautilus_model::{
     data::{Bar, BarType, OrderBookDeltas, TradeTick},
-    enums::BarAggregation,
+    enums::{BarAggregation, OrderSide},
     events::AccountState,
     identifiers::InstrumentId,
     instruments::{Instrument, InstrumentAny},
@@ -854,25 +854,14 @@ impl GateioRawHttpClient {
         &self,
         product_type: GateioProductType,
         symbol: Option<&str>,
+        order_side: OrderSide,
     ) -> Result<Vec<GateioOrder>, GateioHttpError> {
         let endpoint = if product_type == GateioProductType::Spot {
             SPOT_ORDERS
         } else {
             FUTURES_ORDERS
         };
-        let params = symbol
-            .map(|value| {
-                vec![(
-                    if product_type == GateioProductType::Spot {
-                        "currency_pair"
-                    } else {
-                        "contract"
-                    }
-                    .to_string(),
-                    value.to_string(),
-                )]
-            })
-            .unwrap_or_default();
+        let params = cancel_all_params(product_type, symbol, order_side);
         self.send(Method::DELETE, endpoint, &params, None, true)
             .await
     }
@@ -890,6 +879,38 @@ fn append_time_range(
         params.push(("to".to_string(), end.timestamp().to_string()));
     }
     Ok(())
+}
+
+fn cancel_all_params(
+    product_type: GateioProductType,
+    symbol: Option<&str>,
+    order_side: OrderSide,
+) -> Vec<(String, String)> {
+    let mut params = symbol
+        .map(|value| {
+            vec![(
+                if product_type == GateioProductType::Spot {
+                    "currency_pair"
+                } else {
+                    "contract"
+                }
+                .to_string(),
+                value.to_string(),
+            )]
+        })
+        .unwrap_or_default();
+
+    let side = match (product_type, order_side) {
+        (GateioProductType::Spot, OrderSide::Buy) => Some("buy"),
+        (GateioProductType::Spot, OrderSide::Sell) => Some("sell"),
+        (GateioProductType::UsdtPerpetual, OrderSide::Buy) => Some("bid"),
+        (GateioProductType::UsdtPerpetual, OrderSide::Sell) => Some("ask"),
+        (_, OrderSide::NoOrderSide) => None,
+    };
+    if let Some(side) = side {
+        params.push(("side".to_string(), side.to_string()));
+    }
+    params
 }
 
 fn bounded_limit(value: u32, maximum: u32, resource: &str) -> Result<u32, GateioHttpError> {
@@ -993,6 +1014,63 @@ fn should_retry(method: &Method, error: &GateioHttpError) -> bool {
         GateioHttpError::Network(_) => true,
         GateioHttpError::UnexpectedStatus { status, .. } => *status == 429 || *status >= 500,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_all_params_map_spot_order_side() {
+        assert_eq!(
+            cancel_all_params(GateioProductType::Spot, Some("BTC_USDT"), OrderSide::Buy,),
+            vec![
+                ("currency_pair".to_string(), "BTC_USDT".to_string()),
+                ("side".to_string(), "buy".to_string()),
+            ]
+        );
+        assert_eq!(
+            cancel_all_params(GateioProductType::Spot, Some("BTC_USDT"), OrderSide::Sell,),
+            vec![
+                ("currency_pair".to_string(), "BTC_USDT".to_string()),
+                ("side".to_string(), "sell".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn cancel_all_params_map_futures_order_side() {
+        assert_eq!(
+            cancel_all_params(
+                GateioProductType::UsdtPerpetual,
+                Some("BTC_USDT"),
+                OrderSide::Buy,
+            ),
+            vec![
+                ("contract".to_string(), "BTC_USDT".to_string()),
+                ("side".to_string(), "bid".to_string()),
+            ]
+        );
+        assert_eq!(
+            cancel_all_params(
+                GateioProductType::UsdtPerpetual,
+                Some("BTC_USDT"),
+                OrderSide::Sell,
+            ),
+            vec![
+                ("contract".to_string(), "BTC_USDT".to_string()),
+                ("side".to_string(), "ask".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn cancel_all_params_omit_side_for_no_order_side() {
+        assert_eq!(
+            cancel_all_params(GateioProductType::Spot, None, OrderSide::NoOrderSide,),
+            Vec::<(String, String)>::new()
+        );
     }
 }
 
@@ -1329,8 +1407,9 @@ impl GateioHttpClient {
         &self,
         product_type: GateioProductType,
         symbol: Option<&str>,
+        order_side: OrderSide,
     ) -> Result<Vec<GateioOrder>, GateioHttpError> {
-        self.raw.cancel_all(product_type, symbol).await
+        self.raw.cancel_all(product_type, symbol, order_side).await
     }
 
     pub async fn order(

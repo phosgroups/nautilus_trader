@@ -15,7 +15,7 @@ pub const GATEIO_FUTURES_TESTNET_REST_URL: &str = "https://api-testnet.gateapi.i
 pub const GATEIO_SPOT_WS_URL: &str = "wss://api.gateio.ws/ws/v4/";
 pub const GATEIO_SPOT_TESTNET_WS_URL: &str = "wss://ws-testnet.gate.com/v4/ws/spot";
 pub const GATEIO_FUTURES_WS_URL: &str = "wss://fx-ws.gateio.ws/v4/ws/usdt";
-pub const GATEIO_FUTURES_TESTNET_WS_URL: &str = "wss://ws-testnet.gate.com/v4/ws/futures/usdt";
+pub const GATEIO_FUTURES_TESTNET_WS_URL: &str = "wss://fx-ws-testnet.gateio.ws/v4/ws/usdt";
 pub const GATEIO_SPOT_PING_WS_CHANNEL: &str = "spot.ping";
 pub const GATEIO_FUTURES_PING_WS_CHANNEL: &str = "futures.ping";
 

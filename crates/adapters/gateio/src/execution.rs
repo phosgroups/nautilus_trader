@@ -69,6 +69,7 @@ pub struct GateioExecutionClient {
     http_client: GateioHttpClient,
     ws_client: GateioWebSocketClient,
     ws_task: Option<JoinHandle<()>>,
+    pending_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     account_refresh_lock: Arc<tokio::sync::Mutex<()>>,
     latest_account_event: Arc<AtomicU64>,
     reconnect_reconciliation_lookback_mins: Option<u64>,
@@ -98,6 +99,7 @@ struct GateioExecutionWsDispatchContext {
     seen_trades: Arc<Mutex<DedupCache>>,
     seen_balances: Arc<Mutex<DedupCache>>,
     seen_positions: Arc<Mutex<DedupCache>>,
+    pending_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 const MAX_DEDUP_ENTRIES: usize = 100_000;
@@ -150,6 +152,7 @@ impl GateioExecutionClient {
             http_client,
             ws_client,
             ws_task: None,
+            pending_tasks: Arc::new(Mutex::new(Vec::new())),
             account_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             latest_account_event: Arc::new(AtomicU64::new(0)),
             reconnect_reconciliation_lookback_mins,
@@ -206,6 +209,7 @@ impl GateioExecutionClient {
             seen_trades: Arc::clone(&self.seen_trades),
             seen_balances: Arc::clone(&self.seen_balances),
             seen_positions: Arc::clone(&self.seen_positions),
+            pending_tasks: Arc::clone(&self.pending_tasks),
         };
         self.ws_task = Some(get_runtime().spawn(async move {
             loop {
@@ -411,11 +415,52 @@ impl GateioExecutionClient {
     where
         F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        get_runtime().spawn(async move {
+        self.reap_pending_tasks();
+        let task = get_runtime().spawn(async move {
             if let Err(error) = future.await {
                 log::error!("Gate.io {name} task failed: {error:?}");
             }
         });
+        self.track_task(task);
+    }
+
+    fn track_task(&self, task: JoinHandle<()>) {
+        if let Ok(mut tasks) = self.pending_tasks.lock() {
+            tasks.push(task);
+        } else {
+            log::error!("Gate.io pending task lock poisoned; aborting task");
+            task.abort();
+        }
+    }
+
+    fn reap_pending_tasks(&self) {
+        if let Ok(mut tasks) = self.pending_tasks.lock() {
+            tasks.retain(|task| !task.is_finished());
+        }
+    }
+
+    fn abort_pending_tasks(&self) {
+        if let Ok(mut tasks) = self.pending_tasks.lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        } else {
+            log::error!("Gate.io pending task lock poisoned while stopping");
+        }
+    }
+}
+
+fn spawn_tracked_execution_task<F>(tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>, future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let task = get_runtime().spawn(future);
+    if let Ok(mut pending) = tasks.lock() {
+        pending.retain(|task| !task.is_finished());
+        pending.push(task);
+    } else {
+        log::error!("Gate.io pending task lock poisoned; aborting task");
+        task.abort();
     }
 }
 
@@ -953,7 +998,8 @@ fn dispatch_private_message(message: GateioWsMessage, context: &GateioExecutionW
             return;
         }
         let context = context.clone();
-        get_runtime().spawn(async move {
+        let pending_tasks = Arc::clone(&context.pending_tasks);
+        spawn_tracked_execution_task(&pending_tasks, async move {
             reconcile_after_reconnect(context.clone()).await;
             context
                 .reconnect_reconciliation_in_flight
@@ -1085,7 +1131,7 @@ fn dispatch_private_message(message: GateioWsMessage, context: &GateioExecutionW
             if event_ns < previous {
                 return;
             }
-            get_runtime().spawn(async move {
+            spawn_tracked_execution_task(&context.pending_tasks, async move {
                 let _guard = account_refresh_lock.lock().await;
                 if latest_account_event.load(Ordering::Acquire) > event_ns {
                     return;
@@ -1144,7 +1190,7 @@ fn dispatch_private_message(message: GateioWsMessage, context: &GateioExecutionW
             let seen_positions = Arc::clone(&context.seen_positions);
             let account_id = context.account_id;
             let ts_init = context.clock.get_time_ns();
-            get_runtime().spawn(async move {
+            spawn_tracked_execution_task(&context.pending_tasks, async move {
                 match http.positions(GateioProductType::UsdtPerpetual, None).await {
                     Ok(rows) => {
                         for row in rows {
@@ -1553,6 +1599,8 @@ impl ExecutionClient for GateioExecutionClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        self.http_client.cancel_all_requests();
+        self.abort_pending_tasks();
         self.ws_client.stop();
         self.abort_ws_task();
         self.core.set_stopped();
@@ -1650,6 +1698,8 @@ impl ExecutionClient for GateioExecutionClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.http_client.cancel_all_requests();
+        self.abort_pending_tasks();
         self.ws_client.disconnect().await?;
         self.abort_ws_task();
         self.core.set_disconnected();
@@ -1825,10 +1875,12 @@ impl ExecutionClient for GateioExecutionClient {
         self.ensure_product(cmd.instrument_id)?;
         let http = self.http_client.clone();
         let symbol = raw_symbol(cmd.instrument_id);
+        let order_side = cmd.order_side;
         self.spawn_order_task("cancel_all_orders", async move {
             http.cancel_all(
                 GateioProductType::from_symbol(cmd.instrument_id.symbol.as_str()),
                 Some(&symbol),
+                order_side,
             )
             .await
             .map(|_| ())
@@ -2021,11 +2073,6 @@ impl ExecutionClient for GateioExecutionClient {
             {
                 continue;
             }
-            let dedup_key = order_dedup_key(raw, &order);
-            if dedup_contains(&self.seen_orders, &dedup_key) {
-                continue;
-            }
-            remember_once(&self.seen_orders, dedup_key);
             reports.push(report);
         }
         Ok(reports)
@@ -2101,10 +2148,6 @@ impl ExecutionClient for GateioExecutionClient {
             {
                 continue;
             }
-            if dedup_contains(&self.seen_trades, &dedup_key) {
-                continue;
-            }
-            remember_once(&self.seen_trades, dedup_key);
             reports.push(report);
         }
         Ok(reports)
