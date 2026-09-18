@@ -45,7 +45,7 @@ jobs:
           haskell: true
           large-packages: true
           docker-images: true
-          swap-storage: true
+          swap-storage: false
 
       - name: Free additional disk space (Linux)
         run: |
@@ -100,6 +100,9 @@ jobs:
           key: build-v2-linux
           cache-on-failure: true
           save-if: ${{ github.event_name == 'push' }}
+
+      - name: Limit Cargo build jobs on cold cache
+        run: bash scripts/ci/set-cargo-build-jobs.sh
 
       - name: Install Cap'n Proto
         uses: ./.github/actions/install-capnp
