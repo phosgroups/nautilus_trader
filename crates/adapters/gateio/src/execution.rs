@@ -114,6 +114,7 @@ struct DedupCache {
 struct ClientOrderIdMap {
     by_text: Mutex<HashMap<String, ClientOrderId>>,
     by_venue_order_id: Mutex<HashMap<String, ClientOrderId>>,
+    by_client_order_id: Mutex<HashMap<String, String>>,
 }
 
 /// Gate.io Spot execution client type alias.
@@ -527,6 +528,9 @@ impl ClientOrderIdMap {
         if let Ok(mut by_venue_order_id) = self.by_venue_order_id.lock() {
             by_venue_order_id.insert(venue_order_id.to_string(), client_order_id);
         }
+        if let Ok(mut by_client_order_id) = self.by_client_order_id.lock() {
+            by_client_order_id.insert(client_order_id.to_string(), venue_order_id.to_string());
+        }
     }
 
     fn resolve(&self, gate_text: &str, venue_order_id: &str) -> Option<ClientOrderId> {
@@ -540,6 +544,14 @@ impl ClientOrderIdMap {
                     .ok()
                     .and_then(|map| map.get(venue_order_id).copied())
             })
+    }
+
+    fn venue_order_id_for_client(&self, client_order_id: ClientOrderId) -> Option<VenueOrderId> {
+        self.by_client_order_id
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&client_order_id.to_string()).cloned())
+            .map(|venue_order_id| VenueOrderId::from(venue_order_id.as_str()))
     }
 }
 
@@ -1840,7 +1852,11 @@ impl ExecutionClient for GateioExecutionClient {
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
         self.ensure_product(cmd.instrument_id)?;
-        let Some(venue_order_id) = cmd.venue_order_id else {
+        let venue_order_id = cmd.venue_order_id.or_else(|| {
+            self.client_order_ids
+                .venue_order_id_for_client(cmd.client_order_id)
+        });
+        let Some(venue_order_id) = venue_order_id else {
             anyhow::bail!("Gate.io cancel requires a venue order ID");
         };
         let http = self.http_client.clone();
@@ -2673,6 +2689,19 @@ mod tests {
         let map = ClientOrderIdMap::default();
         let result = map.register(ClientOrderId::from("CLIENT-ORDER-12345678901234567890"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn remembers_venue_order_id_by_client_order_id() {
+        let map = ClientOrderIdMap::default();
+        let client_order_id = ClientOrderId::from("CLIENT-ORDER-1");
+
+        map.remember_venue_order("t-CLIENT-ORDER-1", "123456789", client_order_id);
+
+        assert_eq!(
+            map.venue_order_id_for_client(client_order_id),
+            Some(VenueOrderId::from("123456789"))
+        );
     }
 
     #[test]
