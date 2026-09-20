@@ -1,11 +1,11 @@
 name: phos-publish
 
-# phos publishes nautilus-trader to CodeArtifact (ADR-0015, TASK-0028)
-# Trigger: push main -> build Linux + macOS -> publish
+# phos publishes nautilus-trader v2 (python/, maturin) to CodeArtifact (ADR-0015 / ADR-0022, CR-0025).
+# Trigger: push main -> build Linux + macOS -> publish (release environment gate).
 # NOTE: This repo is a fork, so GitHub does not allow referencing private actions
 # (phosgroups/phos-actions). Build/publish logic is inlined here.
-# Version = pyproject version + VERSION_SUFFIX (repo variable, e.g. +phos) + .{short-sha}.{run_number}
-#   -> unique per run, e.g. 1.230.0+phos.a1b2c3d.42 (PEP 440 local version).
+# Version = python/pyproject.toml version + VERSION_SUFFIX (repo variable, e.g. +phos)
+#   + .{short-sha}.{run_number} -> unique per run, e.g. 2.0.0rc1+phos.a1b2c3d.42 (PEP 440 local).
 # Publish role: arn:aws:iam::${AWS_ACCOUNT_ID}:role/${AWS_ROLE_NAME} (release env secrets).
 # Region: AWS_REGION (release env secret).
 
@@ -23,15 +23,47 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.14"
+  PACKAGE_DIR: python
   VERSION_SUFFIX: ${{ vars.VERSION_SUFFIX }}
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
 
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/build-v2-linux
     steps:
       - uses: actions/checkout@v4
+
+      - name: Free disk space (Linux)
+        uses: jlumbroso/free-disk-space@v1.3.1
         with:
-          fetch-depth: 0
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Free additional disk space (Linux)
+        run: |
+          echo "=== Disk usage before extra cleanup ==="
+          df -h /
+          for path in \
+            /usr/share/swift \
+            /usr/local/lib/swift \
+            /usr/local/share/powershell \
+            /usr/local/share/boost \
+            /usr/local/share/chromium \
+            /opt/google/chrome \
+            /opt/microsoft \
+            /usr/local/julia*; do
+            sudo rm -rf $path || true
+          done
+          echo "=== Disk usage after extra cleanup ==="
+          df -h /
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -39,72 +71,88 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Get uv version
-        id: uv-version
-        run: echo "version=$(bash scripts/uv-version.sh)" >> "$GITHUB_OUTPUT"
+        run: echo "UV_VERSION=$(bash scripts/uv-version.sh)" >> "$GITHUB_ENV"
 
       - name: Install uv
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: auto
+          prune-cache: true
 
-      - name: Setup uv with pinned version
-        run: |
-          uv self update "${{ steps.uv-version.outputs.version }}" || true
-          uv --version
+      - name: Update Rust toolchain (rustup)
+        run: bash scripts/ci/install-rust.sh
 
-      - name: Update version suffix (pyproject.toml)
+      - name: Get Rust toolchain version
+        run: echo "RUST_TOOLCHAIN=$(bash scripts/rust-toolchain.sh)" >> "$GITHUB_ENV"
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          cache: false
+          override: true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target/build-v2-linux"
+          key: build-v2-linux
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' }}
+
+      - name: Limit Cargo build jobs on cold cache
+        run: bash scripts/ci/set-cargo-build-jobs.sh
+
+      - name: Install Cap'n Proto
+        uses: ./.github/actions/install-capnp
+
+      - name: Update version suffix (python/pyproject.toml)
         if: ${{ env.VERSION_SUFFIX != '' }}
         run: |
           set -euo pipefail
-          current=$(grep '^version = ' pyproject.toml | cut -d '"' -f2)
+          current=$(grep '^version = ' python/pyproject.toml | head -1 | cut -d '"' -f2)
           SHORT_SHA="${GITHUB_SHA::7}"
           RUN_NUMBER="${{ github.run_number }}"
           new="${current}${VERSION_SUFFIX}.${SHORT_SHA}.${RUN_NUMBER}"
-          sed -i.bak "s/^version = \".*\"/version = \"${new}\"/" pyproject.toml && rm -f pyproject.toml.bak
+          sed -i.bak "s/^version = \".*\"/version = \"${new}\"/" python/pyproject.toml && rm -f python/pyproject.toml.bak
           echo "Version: ${current} -> ${new}"
-        env:
-          VERSION_SUFFIX: ${{ env.VERSION_SUFFIX }}
 
-      - name: Setup Linux build deps
+      - name: Build wheel (Linux x86_64, v2)
+        working-directory: ${{ env.PACKAGE_DIR }}
         run: |
-          sudo apt-get update -o Acquire::Retries=5
-          sudo apt-get install -y curl clang lld git make pkg-config ripgrep python3-dev libpython3-dev -o Acquire::Retries=5
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
+          set -euo pipefail
+          MATURIN_VERSION="$(bash ../scripts/maturin-version.bash)"
+          uv run --no-project --no-build --with "maturin==${MATURIN_VERSION}" -- \
+            maturin build --release --out ../dist
+          ls -lh ../dist/
 
-      - name: Setup Rust toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Build wheel (Linux x86_64)
-        run: |
-          uv build --wheel
-          ls -lh dist/
-
-      - name: Verify wheel name
-        run: |
-          ls dist/*.whl | grep -q 'nautilus_trader-' \
-            || { echo "::error::wheel name does not contain nautilus_trader-"; exit 1; }
-          echo "wheel OK: $(ls dist/*.whl)"
-
-      - name: Smoke test (wheel metadata version)
+      - name: Verify wheel name (Linux)
         run: |
           set -euo pipefail
           WHL=$(ls dist/nautilus_trader-*.whl | head -1)
-          VER=$(basename "$WHL" | sed -E 's/^nautilus_trader-([^-]+)-.*/\1/')
-          echo "Wheel version: ${VER}"
+          NAME=$(basename "$WHL")
+          echo "wheel: ${NAME}"
+          case "$NAME" in
+            nautilus_trader-*) ;;
+            *) echo "::error::wheel name does not start with nautilus_trader-"; exit 1 ;;
+          esac
+          case "$NAME" in
+            *manylinux_*) echo "platform tag manylinux: OK" ;;
+            *linux_x86_64*) echo "::error::wheel tagged linux_x86_64 (not manylinux); enable maturin --zig fallback per ADR-0022"; exit 1 ;;
+            *) echo "::error::unexpected Linux platform tag: ${NAME}"; exit 1 ;;
+          esac
           if [ -n "${VERSION_SUFFIX}" ]; then
-            SHORT_SHA="${GITHUB_SHA::7}"
-            RUN_NUMBER="${{ github.run_number }}"
-            EXPECTED="${VERSION_SUFFIX//-/.}.${SHORT_SHA}.${RUN_NUMBER}"
-            case "$VER" in
+            EXPECTED="${VERSION_SUFFIX//-/.}.${GITHUB_SHA::7}.${{ github.run_number }}"
+            case "$NAME" in
               *"${EXPECTED}"*) echo "version suffix present: OK" ;;
-              *) echo "::error::expected version to contain ${EXPECTED}, got ${VER}"; exit 1 ;;
+              *) echo "::error::expected version to contain ${EXPECTED}, got ${NAME}"; exit 1 ;;
             esac
           fi
-        env:
-          VERSION_SUFFIX: ${{ env.VERSION_SUFFIX }}
+
+      - name: Smoke test (v2 API + phos adapters)
+        working-directory: ${{ env.PACKAGE_DIR }}
+        run: bash ../scripts/ci/smoke-test-v2-wheel.sh
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
@@ -114,19 +162,27 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    # Pin macOS 15: poetry-core/packaging derives the wheel platform tag from
-    # platform.mac_ver() (the runner OS), not MACOSX_DEPLOYMENT_TARGET.
-    # macos-latest is now macOS 26, which tags the wheel macosx_26_0_arm64
-    # (not installable on macOS 15). macos-15 yields macosx_15_0_arm64, which is
-    # forward-compatible with newer macOS (ISSUE-0046).
+    # Pin macOS 15: maturin derives the wheel platform tag from the build
+    # environment (MACOSX_DEPLOYMENT_TARGET), so macos-15 + target 15.0 yields
+    # macosx_15_0_arm64 (forward-compatible with newer macOS, ISSUE-0046).
     runs-on: macos-15
     env:
-      # Ensure the compiled extension links against a 15.0 minimum OS.
       MACOSX_DEPLOYMENT_TARGET: "15.0"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/build-v2-macos
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+
+      - name: Free disk space (macOS)
+        run: |
+          echo "=== Disk usage before cleanup ==="
+          df -h /
+          sudo rm -rf /Library/Developer/CoreSimulator || true
+          sudo rm -rf ~/Library/Android || true
+          sudo rm -rf /usr/local/share/dotnet || true
+          sudo rm -rf /usr/local/share/powershell || true
+          sudo rm -rf /usr/local/.ghcup || true
+          echo "=== Disk usage after cleanup ==="
+          df -h /
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -134,73 +190,85 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Get uv version
-        id: uv-version
-        run: echo "version=$(bash scripts/uv-version.sh)" >> "$GITHUB_OUTPUT"
+        run: echo "UV_VERSION=$(bash scripts/uv-version.sh)" >> "$GITHUB_ENV"
 
       - name: Install uv
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: auto
+          prune-cache: true
 
-      - name: Setup uv with pinned version
-        run: |
-          uv self update "${{ steps.uv-version.outputs.version }}" || true
-          uv --version
+      - name: Update Rust toolchain (rustup)
+        run: bash scripts/ci/install-rust.sh
 
-      - name: Update version suffix (pyproject.toml)
+      - name: Get Rust toolchain version
+        run: echo "RUST_TOOLCHAIN=$(bash scripts/rust-toolchain.sh)" >> "$GITHUB_ENV"
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          cache: false
+          override: true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target/build-v2-macos"
+          key: build-v2-macos
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' }}
+
+      - name: Install Cap'n Proto
+        uses: ./.github/actions/install-capnp
+
+      - name: Update version suffix (python/pyproject.toml)
         if: ${{ env.VERSION_SUFFIX != '' }}
         run: |
           set -euo pipefail
-          current=$(grep '^version = ' pyproject.toml | cut -d '"' -f2)
+          current=$(grep '^version = ' python/pyproject.toml | head -1 | cut -d '"' -f2)
           SHORT_SHA="${GITHUB_SHA::7}"
           RUN_NUMBER="${{ github.run_number }}"
           new="${current}${VERSION_SUFFIX}.${SHORT_SHA}.${RUN_NUMBER}"
-          sed -i.bak "s/^version = \".*\"/version = \"${new}\"/" pyproject.toml && rm -f pyproject.toml.bak
+          sed -i.bak "s/^version = \".*\"/version = \"${new}\"/" python/pyproject.toml && rm -f python/pyproject.toml.bak
           echo "Version: ${current} -> ${new}"
-        env:
-          VERSION_SUFFIX: ${{ env.VERSION_SUFFIX }}
 
-      - name: Setup Rust toolchain
+      - name: Build wheel (macOS arm64, v2)
+        working-directory: ${{ env.PACKAGE_DIR }}
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          MATURIN_VERSION="$(bash ../scripts/maturin-version.bash)"
+          uv run --no-project --no-build --with "maturin==${MATURIN_VERSION}" -- \
+            maturin build --release --out ../dist
+          ls -lh ../dist/
 
-      - name: Build wheel (macOS arm64)
-        run: |
-          export PYO3_PYTHON=python3.14
-          export RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup"
-          if [ "$(uname -m)" = "arm64" ]; then
-            export ARCHFLAGS="-arch arm64"
-          fi
-          uv build --wheel
-          ls -lh dist/
-
-      - name: Verify wheel name
-        run: |
-          ls dist/*.whl | grep -q 'nautilus_trader-' \
-            || { echo "::error::wheel name does not contain nautilus_trader-"; exit 1; }
-          EXPECTED_PLAT="macosx_${MACOSX_DEPLOYMENT_TARGET//./_}_arm64"
-          ls dist/*.whl | grep -q "${EXPECTED_PLAT}" \
-            || { echo "::error::expected wheel platform ${EXPECTED_PLAT}, got $(ls dist/*.whl)"; exit 1; }
-          echo "wheel OK: $(ls dist/*.whl)"
-
-      - name: Smoke test (wheel metadata version)
+      - name: Verify wheel name (macOS)
         run: |
           set -euo pipefail
           WHL=$(ls dist/nautilus_trader-*.whl | head -1)
-          VER=$(basename "$WHL" | sed -E 's/^nautilus_trader-([^-]+)-.*/\1/')
-          echo "Wheel version: ${VER}"
+          NAME=$(basename "$WHL")
+          echo "wheel: ${NAME}"
+          case "$NAME" in
+            nautilus_trader-*) ;;
+            *) echo "::error::wheel name does not start with nautilus_trader-"; exit 1 ;;
+          esac
+          EXPECTED_PLAT="macosx_${MACOSX_DEPLOYMENT_TARGET//./_}_arm64"
+          case "$NAME" in
+            *"${EXPECTED_PLAT}"*) echo "platform tag ${EXPECTED_PLAT}: OK" ;;
+            *) echo "::error::expected wheel platform ${EXPECTED_PLAT}, got ${NAME}"; exit 1 ;;
+          esac
           if [ -n "${VERSION_SUFFIX}" ]; then
-            SHORT_SHA="${GITHUB_SHA::7}"
-            RUN_NUMBER="${{ github.run_number }}"
-            EXPECTED="${VERSION_SUFFIX//-/.}.${SHORT_SHA}.${RUN_NUMBER}"
-            case "$VER" in
+            EXPECTED="${VERSION_SUFFIX//-/.}.${GITHUB_SHA::7}.${{ github.run_number }}"
+            case "$NAME" in
               *"${EXPECTED}"*) echo "version suffix present: OK" ;;
-              *) echo "::error::expected version to contain ${EXPECTED}, got ${VER}"; exit 1 ;;
+              *) echo "::error::expected version to contain ${EXPECTED}, got ${NAME}"; exit 1 ;;
             esac
           fi
-        env:
-          VERSION_SUFFIX: ${{ env.VERSION_SUFFIX }}
+
+      - name: Smoke test (v2 API + phos adapters)
+        working-directory: ${{ env.PACKAGE_DIR }}
+        run: bash ../scripts/ci/smoke-test-v2-wheel.sh
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
