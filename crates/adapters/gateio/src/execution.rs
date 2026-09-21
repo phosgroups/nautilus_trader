@@ -2705,6 +2705,20 @@ mod tests {
     }
 
     #[test]
+    fn updates_remembered_venue_order_id_for_client_order_id() {
+        let map = ClientOrderIdMap::default();
+        let client_order_id = ClientOrderId::from("CLIENT-ORDER-1");
+
+        map.remember_venue_order("t-CLIENT-ORDER-1", "123456789", client_order_id);
+        map.remember_venue_order("t-CLIENT-ORDER-1", "987654321", client_order_id);
+
+        assert_eq!(
+            map.venue_order_id_for_client(client_order_id),
+            Some(VenueOrderId::from("987654321"))
+        );
+    }
+
+    #[test]
     fn order_dedup_key_keeps_same_timestamp_price_amend() {
         let mut first = GateioOrder {
             id: "venue-order-1".to_string(),
