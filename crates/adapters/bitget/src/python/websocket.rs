@@ -61,6 +61,7 @@ use crate::{
     module = "nautilus_trader.core.nautilus_pyo3.bitget",
     skip_from_py_object
 )]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bitget")]
 #[derive(Clone)]
 pub struct PyBitgetWebSocketClient {
     inner: Arc<tokio::sync::Mutex<BitgetWebSocketClient>>,
@@ -328,6 +329,7 @@ fn dispatch_data_event_to_python(event: DataEvent, call_soon: &Py<PyAny>, callba
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyBitgetWebSocketClient {
     /// Bitget WebSocket client.
     #[new]
