@@ -24,6 +24,7 @@ submodules = [
     "backtest",
     "testkit",
     "adapters.binance",
+    "adapters.bitget",
     "adapters.gateio",
     "adapters.okx",
     "adapters.lighter",
@@ -35,16 +36,36 @@ submodules = [
 for name in submodules:
     importlib.import_module(f"nautilus_trader.{name}")
 
-from nautilus_trader._libnautilus.bitget import BitgetDataClientConfig
-from nautilus_trader._libnautilus.bitget import BitgetDataClientFactory
-from nautilus_trader._libnautilus.bitget import BitgetEnvironment
-from nautilus_trader._libnautilus.bitget import BitgetProductType
+from nautilus_trader.adapters.bitget import BitgetDataClientConfig
+from nautilus_trader.adapters.bitget import BitgetDataClientFactory
+from nautilus_trader.adapters.bitget import BitgetEnvironment
+from nautilus_trader.adapters.bitget import BitgetExecClientConfig
+from nautilus_trader.adapters.bitget import BitgetExecutionClientFactory
+from nautilus_trader.adapters.bitget import BitgetHttpClient
+from nautilus_trader.adapters.bitget import BitgetInstrumentProviderConfig
+from nautilus_trader.adapters.bitget import BitgetProductType
+from nautilus_trader.adapters.bitget import BitgetRawHttpClient
+from nautilus_trader.adapters.bitget import BitgetWebSocketClient
 from nautilus_trader.adapters.okx import OKXDataClientFactory
 from nautilus_trader.common import CacheConfig
 from nautilus_trader.common import DataActor
 from nautilus_trader.live import LiveNode
 
 assert hasattr(LiveNode, "builder"), "LiveNode.builder missing"
+
+for cls in (
+    BitgetDataClientConfig,
+    BitgetDataClientFactory,
+    BitgetEnvironment,
+    BitgetExecClientConfig,
+    BitgetExecutionClientFactory,
+    BitgetHttpClient,
+    BitgetInstrumentProviderConfig,
+    BitgetProductType,
+    BitgetRawHttpClient,
+    BitgetWebSocketClient,
+):
+    assert cls.__module__ == "nautilus_trader.adapters.bitget", cls
 
 print(f"nautilus_trader {nautilus_trader.__version__} imported OK (v2 API + phos adapters)")
 PY
