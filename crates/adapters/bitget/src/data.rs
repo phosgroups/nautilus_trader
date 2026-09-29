@@ -1128,7 +1128,8 @@ impl BitgetDataClient {
             Some(config.http_base_url()),
             config.http_timeout_secs,
             config.proxy_url.clone(),
-        )?;
+        )?
+        .with_account_mode(config.account_mode);
         let data_sender = try_get_data_event_sender().unwrap_or_else(|| {
             log::warn!(
                 "BitgetDataClient created before live runner initialized a data sender; events will be dropped"
@@ -1143,7 +1144,8 @@ impl BitgetDataClient {
             config.heartbeat_interval_secs,
             config.transport_backend,
             config.proxy_url.clone(),
-        );
+        )
+        .with_account_mode(config.account_mode);
 
         Ok(Self {
             client_id,

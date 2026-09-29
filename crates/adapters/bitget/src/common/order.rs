@@ -88,6 +88,8 @@ pub enum BitgetModifyOrderRequest {
 pub enum BitgetCancelOrderRequest {
     /// Spot regular order cancel.
     Spot(BitgetSpotCancelOrderRequest),
+    /// Spot Classic plan order cancel.
+    SpotPlan(BitgetSpotCancelOrderRequest),
     /// USDT futures regular order cancel.
     Mix(BitgetMixCancelOrderRequest),
     /// USDT futures plan order cancel.
@@ -247,6 +249,36 @@ pub fn map_submit_order(
         BitgetProductType::Spot => map_spot_submit_order(order, params),
         BitgetProductType::UsdtFutures => map_mix_submit_order(order, params),
     }
+}
+
+/// Maps submit quantities according to the explicitly selected account protocol.
+/// Classic Spot market buys consume quote currency; they cannot promise a base quantity.
+pub fn map_submit_order_for_account(
+    account_mode: crate::common::enums::BitgetAccountMode,
+    product_type: BitgetProductType,
+    order: &OrderInitialized,
+    params: Option<&Params>,
+) -> anyhow::Result<BitgetSubmitOrderRequest> {
+    if account_mode == crate::common::enums::BitgetAccountMode::Classic {
+        anyhow::ensure!(
+            crate::classic::replacement::original_client_id(order.client_order_id.as_str())
+                == order.client_order_id.as_str(),
+            "Classic client order ID uses the reserved replacement suffix"
+        );
+        if product_type == BitgetProductType::Spot
+            && order.order_type == OrderType::Market
+            && order.order_side == OrderSide::Buy
+        {
+            anyhow::ensure!(
+                order.quote_quantity,
+                "Classic Spot market buys require quote_quantity=True (quantity in quote currency)"
+            );
+            let mut wire_order = order.clone();
+            wire_order.quote_quantity = false;
+            return map_submit_order(product_type, &wire_order, params);
+        }
+    }
+    map_submit_order(product_type, order, params)
 }
 
 fn map_spot_submit_order(
@@ -457,6 +489,31 @@ pub fn map_cancel_order(
             }))
         }
     }
+}
+
+/// Maps cancellation with an explicit protocol; legacy mapping remains UTA-compatible.
+pub fn map_cancel_order_for_account(
+    account_mode: crate::common::enums::BitgetAccountMode,
+    product_type: BitgetProductType,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: Option<VenueOrderId>,
+    params: Option<&Params>,
+) -> anyhow::Result<BitgetCancelOrderRequest> {
+    let request = map_cancel_order(
+        product_type,
+        instrument_id,
+        client_order_id,
+        venue_order_id,
+        params,
+    )?;
+    if account_mode == crate::common::enums::BitgetAccountMode::Classic
+        && param_str(params, PARAM_PLAN_TYPE).is_some()
+        && let BitgetCancelOrderRequest::Spot(row) = request
+    {
+        return Ok(BitgetCancelOrderRequest::SpotPlan(row));
+    }
+    Ok(request)
 }
 
 /// Maps a Nautilus batch cancel command to a Bitget REST batch cancel request.
@@ -859,5 +916,50 @@ mod tests {
         assert_eq!(request.order_id.as_deref(), Some("123"));
         assert_eq!(request.new_size.as_deref(), Some("0.002"));
         assert_eq!(request.new_price.as_deref(), Some("101.0"));
+    }
+
+    #[test]
+    fn classic_spot_market_buy_uses_quote_currency_and_keeps_uta_validation() {
+        use crate::common::enums::BitgetAccountMode;
+        let mut order = order_init("BTCUSDT.BITGET", OrderType::Market, None, None);
+        assert!(
+            map_submit_order_for_account(
+                BitgetAccountMode::Classic,
+                BitgetProductType::Spot,
+                &order,
+                None
+            )
+            .is_err()
+        );
+        order.quote_quantity = true;
+        order.quantity = Quantity::from("100.00");
+        let BitgetSubmitOrderRequest::Spot(request) = map_submit_order_for_account(
+            BitgetAccountMode::Classic,
+            BitgetProductType::Spot,
+            &order,
+            None,
+        )
+        .unwrap() else {
+            panic!("expected spot order")
+        };
+        assert_eq!(request.size, "100.00");
+        assert!(
+            map_submit_order_for_account(
+                BitgetAccountMode::Uta,
+                BitgetProductType::Spot,
+                &order,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            map_submit_order_for_account(
+                BitgetAccountMode::Classic,
+                BitgetProductType::UsdtFutures,
+                &order,
+                None
+            )
+            .is_err()
+        );
     }
 }

@@ -17,7 +17,10 @@
 
 use pyo3::prelude::*;
 
-use crate::common::{enums::BitgetEnvironment, urls};
+use crate::common::{
+    enums::{BitgetAccountMode, BitgetEnvironment},
+    urls,
+};
 
 /// Returns the Bitget REST base URL for an environment.
 #[pyfunction]
@@ -31,17 +34,23 @@ pub fn py_get_bitget_http_base_url(environment: BitgetEnvironment) -> &'static s
 /// Returns the Bitget public WebSocket URL for an environment.
 #[pyfunction]
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.bitget")]
-#[pyo3(name = "get_bitget_ws_url_public")]
+#[pyo3(name = "get_bitget_ws_url_public", signature = (environment, account_mode = BitgetAccountMode::Uta))]
 #[must_use]
-pub fn py_get_bitget_ws_url_public(environment: BitgetEnvironment) -> &'static str {
-    urls::bitget_ws_public_url(environment)
+pub fn py_get_bitget_ws_url_public(
+    environment: BitgetEnvironment,
+    account_mode: BitgetAccountMode,
+) -> &'static str {
+    urls::bitget_ws_url_for_account(environment, account_mode, false)
 }
 
 /// Returns the Bitget private WebSocket URL for an environment.
 #[pyfunction]
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.bitget")]
-#[pyo3(name = "get_bitget_ws_url_private")]
+#[pyo3(name = "get_bitget_ws_url_private", signature = (environment, account_mode = BitgetAccountMode::Uta))]
 #[must_use]
-pub fn py_get_bitget_ws_url_private(environment: BitgetEnvironment) -> &'static str {
-    urls::bitget_ws_private_url(environment)
+pub fn py_get_bitget_ws_url_private(
+    environment: BitgetEnvironment,
+    account_mode: BitgetAccountMode,
+) -> &'static str {
+    urls::bitget_ws_url_for_account(environment, account_mode, true)
 }

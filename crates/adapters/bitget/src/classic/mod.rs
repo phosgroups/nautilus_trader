@@ -13,15 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Bitget Spot and USDT-FUTURES integration adapter.
+//! Classic (v2) protocol implementation, isolated from UTA wire models.
 
-mod classic;
-pub mod common;
-pub mod config;
-pub mod data;
-pub mod execution;
-pub mod factories;
-pub mod http;
-#[cfg(feature = "python")]
-pub mod python;
-pub mod websocket;
+pub(crate) mod http;
+pub(crate) mod models;
+pub(crate) mod replacement;
+pub(crate) mod websocket;

@@ -9081,6 +9081,10 @@ class OKXVipLevel(Enum):
 
 # Bitget
 
+class BitgetAccountMode(Enum):
+    CLASSIC = "classic"
+    UTA = "uta"
+
 class BitgetEnvironment(Enum):
     MAINNET = "MAINNET"
     DEMO = "DEMO"
@@ -9090,8 +9094,12 @@ class BitgetProductType(Enum):
     USDT_FUTURES = "USDT-FUTURES"
 
 def get_bitget_http_base_url(environment: BitgetEnvironment) -> str: ...
-def get_bitget_ws_url_public(environment: BitgetEnvironment) -> str: ...
-def get_bitget_ws_url_private(environment: BitgetEnvironment) -> str: ...
+def get_bitget_ws_url_public(
+    environment: BitgetEnvironment, account_mode: BitgetAccountMode = ...,
+) -> str: ...
+def get_bitget_ws_url_private(
+    environment: BitgetEnvironment, account_mode: BitgetAccountMode = ...,
+) -> str: ...
 def bitget_extract_raw_symbol(symbol: str) -> str: ...
 def bitget_product_type_from_symbol(symbol: str) -> BitgetProductType: ...
 def bitget_bar_spec_to_interval(aggregation: int, step: int) -> str: ...
@@ -9106,6 +9114,7 @@ class BitgetRawHttpClient:
         base_url: str | None = None,
         timeout_secs: int = 60,
         proxy_url: str | None = None,
+        account_mode: BitgetAccountMode = ...,
     ) -> None: ...
     def cancel_all_requests(self) -> None: ...
 
@@ -9119,6 +9128,7 @@ class BitgetHttpClient:
         base_url: str | None = None,
         timeout_secs: int = 60,
         proxy_url: str | None = None,
+        account_mode: BitgetAccountMode = ...,
     ) -> None: ...
     async def request_instruments(
         self,
@@ -9218,6 +9228,7 @@ class BitgetDataClientConfig:
         heartbeat_interval_secs: int | None = None,
         update_instruments_interval_mins: int | None = None,
         instrument_poll_interval_secs: int | None = None,
+        account_mode: BitgetAccountMode = ...,
     ) -> None: ...
 
 class BitgetExecClientConfig:
@@ -9239,6 +9250,7 @@ class BitgetExecClientConfig:
         account_id: AccountId | None = None,
         ignore_uncached_instrument_executions: bool | None = None,
         reconnect_reconciliation_lookback_mins: int | None = 60,
+        account_mode: BitgetAccountMode = ...,
     ) -> None: ...
 
 class BitgetDataClientFactory:
@@ -9261,6 +9273,9 @@ class BitgetWebSocketClient:
         private: bool = False,
         heartbeat_secs: int = 30,
         proxy_url: str | None = None,
+        http_url: str | None = None,
+        http_timeout_secs: int = 60,
+        account_mode: BitgetAccountMode = ...,
     ) -> None: ...
     @staticmethod
     def new_public(
@@ -9269,6 +9284,9 @@ class BitgetWebSocketClient:
         url: str | None = None,
         heartbeat_secs: int = 30,
         proxy_url: str | None = None,
+        http_url: str | None = None,
+        http_timeout_secs: int = 60,
+        account_mode: BitgetAccountMode = ...,
     ) -> BitgetWebSocketClient: ...
     @staticmethod
     def new_private(
@@ -9280,6 +9298,9 @@ class BitgetWebSocketClient:
         url: str | None = None,
         heartbeat_secs: int = 30,
         proxy_url: str | None = None,
+        http_url: str | None = None,
+        http_timeout_secs: int = 60,
+        account_mode: BitgetAccountMode = ...,
     ) -> BitgetWebSocketClient: ...
     @property
     def url(self) -> str: ...

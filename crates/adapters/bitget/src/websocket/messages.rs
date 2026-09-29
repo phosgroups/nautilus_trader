@@ -664,9 +664,14 @@ impl<'de> Deserialize<'de> for BitgetWsAccountData {
         let raw =
             BitgetWsAccountDataRaw::deserialize(deserializer).map_err(serde::de::Error::custom)?;
 
+        let mut coin = None;
         let assets = match raw.coin {
             Some(value @ Value::Array(_)) => {
                 serde_json::from_value(value).map_err(serde::de::Error::custom)?
+            }
+            Some(Value::String(value)) => {
+                coin = Some(value);
+                Vec::new()
             }
             Some(Value::Null) | None => Vec::new(),
             Some(other) => {
@@ -677,7 +682,7 @@ impl<'de> Deserialize<'de> for BitgetWsAccountData {
         };
 
         Ok(Self {
-            coin: None,
+            coin,
             margin_coin: raw.margin_coin,
             assets,
             available_balance: raw.available_balance,

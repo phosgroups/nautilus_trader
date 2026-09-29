@@ -26,6 +26,7 @@ from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core import nautilus_pyo3
+from nautilus_trader.core.nautilus_pyo3 import BitgetAccountMode
 from nautilus_trader.core.nautilus_pyo3 import BitgetEnvironment
 from nautilus_trader.core.nautilus_pyo3 import BitgetProductType
 from nautilus_trader.live.factories import LiveDataClientFactory
@@ -41,6 +42,7 @@ def get_cached_bitget_http_client(
     base_url: str | None = None,
     timeout_secs: int | None = None,
     proxy_url: str | None = None,
+    account_mode: BitgetAccountMode = BitgetAccountMode.UTA,
 ) -> nautilus_pyo3.BitgetHttpClient:
     """
     Cache and return a Bitget HTTP client.
@@ -53,6 +55,7 @@ def get_cached_bitget_http_client(
         api_secret=api_secret,
         api_passphrase=api_passphrase,
         environment=environment,
+        account_mode=account_mode,
         base_url=base_url,
         timeout_secs=timeout_secs or 60,
         proxy_url=proxy_url,
@@ -92,6 +95,7 @@ class BitgetLiveDataClientFactory(LiveDataClientFactory):
         environment = config.environment or BitgetEnvironment.MAINNET
         client = get_cached_bitget_http_client(
             environment=environment,
+            account_mode=config.account_mode,
             api_key=config.api_key,
             api_secret=config.api_secret,
             api_passphrase=config.api_passphrase,
@@ -132,6 +136,7 @@ class BitgetLiveExecClientFactory(LiveExecClientFactory):
         environment = config.environment or BitgetEnvironment.MAINNET
         client = get_cached_bitget_http_client(
             environment=environment,
+            account_mode=config.account_mode,
             api_key=config.api_key,
             api_secret=config.api_secret,
             api_passphrase=config.api_passphrase,

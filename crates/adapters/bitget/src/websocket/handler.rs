@@ -61,6 +61,7 @@ impl Debug for HandlerCommand {
 }
 
 pub(super) struct BitgetWsFeedHandler {
+    account_mode: crate::common::enums::BitgetAccountMode,
     signal: Arc<AtomicBool>,
     inner: Option<WebSocketClient>,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
@@ -79,12 +80,29 @@ impl BitgetWsFeedHandler {
         auth_tracker: AuthTracker,
     ) -> Self {
         Self {
+            account_mode: Default::default(),
             signal,
             inner: None,
             cmd_rx,
             raw_rx,
             out_tx,
             auth_tracker,
+        }
+    }
+
+    pub(super) fn with_account_mode(
+        mut self,
+        mode: crate::common::enums::BitgetAccountMode,
+    ) -> Self {
+        self.account_mode = mode;
+        self
+    }
+
+    fn parse_text(&self, text: &str) -> Result<BitgetWsMessage, BitgetWsError> {
+        if self.account_mode == crate::common::enums::BitgetAccountMode::Classic {
+            crate::classic::websocket::parse(text)
+        } else {
+            BitgetWsMessage::parse_text(text)
         }
     }
 
@@ -145,7 +163,7 @@ impl BitgetWsFeedHandler {
                     return None;
                 }
 
-                match BitgetWsMessage::parse_text(text) {
+                match self.parse_text(text) {
                     Ok(msg) => Some(msg),
                     Err(e) => {
                         log::warn!("Failed to parse Bitget WebSocket text frame: {e}");
@@ -154,7 +172,7 @@ impl BitgetWsFeedHandler {
                 }
             }
             Message::Binary(data) => match std::str::from_utf8(data.as_ref()) {
-                Ok(text) => match BitgetWsMessage::parse_text(text) {
+                Ok(text) => match self.parse_text(text) {
                     Ok(msg) => Some(msg),
                     Err(e) => {
                         log::warn!("Failed to parse Bitget WebSocket binary text frame: {e}");

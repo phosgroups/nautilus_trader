@@ -39,7 +39,7 @@ use nautilus_network::{
 use crate::{
     common::{
         credential::Credential,
-        enums::{BitgetEnvironment, BitgetProductType},
+        enums::{BitgetAccountMode, BitgetEnvironment, BitgetProductType},
         urls::{bitget_ws_private_url, bitget_ws_public_url},
     },
     websocket::{
@@ -59,6 +59,8 @@ const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bitget public/private WebSocket client.
 pub struct BitgetWebSocketClient {
     url: String,
+    account_mode: BitgetAccountMode,
+    default_environment: Option<BitgetEnvironment>,
     product_type: BitgetProductType,
     credential: Option<Credential>,
     requires_auth: bool,
@@ -92,6 +94,8 @@ impl Clone for BitgetWebSocketClient {
     fn clone(&self) -> Self {
         Self {
             url: self.url.clone(),
+            account_mode: self.account_mode,
+            default_environment: self.default_environment,
             product_type: self.product_type,
             credential: self.credential.clone(),
             requires_auth: self.requires_auth,
@@ -110,6 +114,21 @@ impl Clone for BitgetWebSocketClient {
 }
 
 impl BitgetWebSocketClient {
+    /// Selects the account protocol before connecting. Custom URLs are preserved.
+    #[must_use]
+    pub fn with_account_mode(mut self, account_mode: BitgetAccountMode) -> Self {
+        self.account_mode = account_mode;
+        if let Some(environment) = self.default_environment {
+            self.url = crate::common::urls::bitget_ws_url_for_account(
+                environment,
+                account_mode,
+                self.requires_auth,
+            )
+            .to_string();
+        }
+        self
+    }
+
     /// Creates a public WebSocket client for the selected product type.
     #[must_use]
     pub fn new_public(
@@ -120,7 +139,8 @@ impl BitgetWebSocketClient {
         transport_backend: TransportBackend,
         proxy_url: Option<String>,
     ) -> Self {
-        Self::new(
+        let default_environment = url.is_none().then_some(environment);
+        let mut client = Self::new(
             product_type,
             url.unwrap_or_else(|| bitget_ws_public_url(environment).to_string()),
             None,
@@ -128,7 +148,9 @@ impl BitgetWebSocketClient {
             heartbeat_secs,
             transport_backend,
             proxy_url,
-        )
+        );
+        client.default_environment = default_environment;
+        client
     }
 
     /// Creates a private WebSocket client for the selected product type.
@@ -149,7 +171,8 @@ impl BitgetWebSocketClient {
     ) -> Self {
         let credential = Credential::resolve(api_key, api_secret, api_passphrase);
 
-        Self::new(
+        let default_environment = url.is_none().then_some(environment);
+        let mut client = Self::new(
             product_type,
             url.unwrap_or_else(|| bitget_ws_private_url(environment).to_string()),
             credential,
@@ -157,7 +180,9 @@ impl BitgetWebSocketClient {
             heartbeat_secs,
             transport_backend,
             proxy_url,
-        )
+        );
+        client.default_environment = default_environment;
+        client
     }
 
     fn new(
@@ -173,6 +198,8 @@ impl BitgetWebSocketClient {
 
         Self {
             url,
+            account_mode: BitgetAccountMode::default(),
+            default_environment: None,
             product_type,
             credential,
             requires_auth,
@@ -286,6 +313,8 @@ impl BitgetWebSocketClient {
         let requires_auth = self.requires_auth;
         let cmd_tx_for_reconnect = cmd_tx.clone();
 
+        let account_mode = self.account_mode;
+        let product_type = self.product_type;
         let task = get_runtime().spawn(async move {
             let mut handler = BitgetWsFeedHandler::new(
                 Arc::clone(&signal),
@@ -293,7 +322,8 @@ impl BitgetWebSocketClient {
                 raw_rx,
                 out_tx,
                 auth_tracker.clone(),
-            );
+            )
+            .with_account_mode(account_mode);
 
             loop {
                 match handler.next().await {
@@ -304,7 +334,7 @@ impl BitgetWebSocketClient {
                         if requires_auth {
                             if let Some(credential) = &credential {
                                 let _rx = auth_tracker.begin();
-                                match login_payload(credential) {
+                                match login_payload(credential, account_mode) {
                                     Ok(payload) => {
                                         if let Err(e) = cmd_tx_for_reconnect
                                             .send(HandlerCommand::Login { payload })
@@ -327,8 +357,13 @@ impl BitgetWebSocketClient {
                                     "Cannot re-authenticate Bitget WebSocket: missing credentials"
                                 );
                             }
-                        } else if let Err(e) =
-                            replay_subscriptions(&subscriptions, &cmd_tx_for_reconnect).await
+                        } else if let Err(e) = replay_subscriptions(
+                            &subscriptions,
+                            &cmd_tx_for_reconnect,
+                            account_mode,
+                            product_type,
+                        )
+                        .await
                         {
                             log::error!("Failed to replay Bitget subscriptions: {e}");
                         }
@@ -344,8 +379,13 @@ impl BitgetWebSocketClient {
                     }
                     Some(msg @ BitgetWsMessage::Login(_)) => {
                         if msg.is_login_success()
-                            && let Err(e) =
-                                replay_subscriptions(&subscriptions, &cmd_tx_for_reconnect).await
+                            && let Err(e) = replay_subscriptions(
+                                &subscriptions,
+                                &cmd_tx_for_reconnect,
+                                account_mode,
+                                product_type,
+                            )
+                            .await
                         {
                             log::error!("Failed to replay Bitget subscriptions after login: {e}");
                         }
@@ -479,7 +519,7 @@ impl BitgetWebSocketClient {
             return Ok(());
         }
 
-        let payload = subscribe_payload(to_send)?;
+        let payload = protocol_payload("subscribe", to_send, self.account_mode, self.product_type)?;
         self.send_cmd(HandlerCommand::Subscribe { payload }).await
     }
 
@@ -504,8 +544,8 @@ impl BitgetWebSocketClient {
             return Ok(());
         }
 
-        let command = BitgetWsCommand::unsubscribe(to_send)?;
-        let payload = serde_json::to_string(&command)?;
+        let payload =
+            protocol_payload("unsubscribe", to_send, self.account_mode, self.product_type)?;
         self.send_cmd(HandlerCommand::Unsubscribe { payload }).await
     }
 
@@ -658,6 +698,11 @@ impl BitgetWebSocketClient {
     /// Returns an error if the subscribe command cannot be sent or the private session is not
     /// authenticated.
     pub async fn subscribe_positions(&self) -> BitgetWsResult<()> {
+        if self.account_mode == BitgetAccountMode::Classic
+            && self.product_type == BitgetProductType::Spot
+        {
+            return Ok(());
+        }
         self.subscribe_private_channel("position", None).await
     }
 
@@ -668,6 +713,13 @@ impl BitgetWebSocketClient {
     /// Returns an error if the subscribe command cannot be sent or the private session is not
     /// authenticated.
     pub async fn subscribe_strategy_orders(&self) -> BitgetWsResult<()> {
+        if self.account_mode == BitgetAccountMode::Classic
+            && self.product_type == BitgetProductType::Spot
+        {
+            return Err(BitgetWsError::Client(
+                "Classic Spot strategy orders use REST polling in the execution client".to_string(),
+            ));
+        }
         self.subscribe_private_channel("strategy-order", Some("default".to_string()))
             .await
     }
@@ -682,7 +734,7 @@ impl BitgetWebSocketClient {
             .as_ref()
             .ok_or(BitgetWsError::MissingCredentials)?;
         let receiver = self.auth_tracker.begin();
-        let payload = login_payload(credential)?;
+        let payload = login_payload(credential, self.account_mode)?;
 
         self.send_cmd(HandlerCommand::Login { payload }).await?;
         self.auth_tracker
@@ -718,8 +770,16 @@ impl BitgetWebSocketClient {
     }
 }
 
-fn login_payload(credential: &Credential) -> BitgetWsResult<String> {
-    let timestamp = Utc::now().timestamp_millis().to_string();
+fn login_payload(
+    credential: &Credential,
+    account_mode: BitgetAccountMode,
+) -> BitgetWsResult<String> {
+    let now = Utc::now();
+    let timestamp = match account_mode {
+        BitgetAccountMode::Classic => now.timestamp(),
+        BitgetAccountMode::Uta => now.timestamp_millis(),
+    }
+    .to_string();
     login_payload_for_timestamp(credential, timestamp)
 }
 
@@ -739,6 +799,21 @@ fn login_payload_for_timestamp(
     Ok(serde_json::to_string(&command)?)
 }
 
+fn protocol_payload(
+    op: &str,
+    args: Vec<BitgetWsArg>,
+    mode: BitgetAccountMode,
+    product: BitgetProductType,
+) -> BitgetWsResult<String> {
+    if mode == BitgetAccountMode::Classic {
+        return crate::classic::websocket::command(op, &args, product);
+    }
+    if op == "subscribe" {
+        return subscribe_payload(args);
+    }
+    Ok(serde_json::to_string(&BitgetWsCommand::unsubscribe(args)?)?)
+}
+
 fn subscribe_payload(args: Vec<BitgetWsArg>) -> BitgetWsResult<String> {
     let command = BitgetWsCommand::subscribe(args)?;
     Ok(serde_json::to_string(&command)?)
@@ -747,13 +822,15 @@ fn subscribe_payload(args: Vec<BitgetWsArg>) -> BitgetWsResult<String> {
 async fn replay_subscriptions(
     subscriptions: &Arc<tokio::sync::RwLock<BTreeMap<String, BitgetWsArg>>>,
     cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+    account_mode: BitgetAccountMode,
+    product_type: BitgetProductType,
 ) -> BitgetWsResult<()> {
     let args: Vec<BitgetWsArg> = subscriptions.read().await.values().cloned().collect();
     if args.is_empty() {
         return Ok(());
     }
 
-    let payload = subscribe_payload(args)?;
+    let payload = protocol_payload("subscribe", args, account_mode, product_type)?;
     cmd_tx
         .send(HandlerCommand::Subscribe { payload })
         .map_err(|e| BitgetWsError::Send(format!("Failed to queue subscription replay: {e:?}")))
