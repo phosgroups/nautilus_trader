@@ -111,6 +111,7 @@ class BitgetExecutionClient(LiveExecutionClient):
         self._ws_client = nautilus_pyo3.BitgetWebSocketClient.new_private(
             product_type=self._product_type,
             environment=self._environment,
+            account_mode=config.account_mode,
             api_key=config.api_key,
             api_secret=config.api_secret,
             api_passphrase=config.api_passphrase,

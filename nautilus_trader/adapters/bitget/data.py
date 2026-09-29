@@ -127,6 +127,7 @@ class BitgetDataClient(LiveMarketDataClient):
         self._ws_client = nautilus_pyo3.BitgetWebSocketClient.new_public(
             product_type=self._product_type,
             environment=self._environment,
+            account_mode=config.account_mode,
             url=config.base_url_ws_public,
             heartbeat_secs=30,
             proxy_url=config.proxy_url,

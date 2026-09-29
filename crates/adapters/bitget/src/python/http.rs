@@ -37,8 +37,8 @@ use pyo3::{
 
 use crate::{
     common::{
-        enums::{BitgetEnvironment, BitgetProductType},
-        order::{map_cancel_order, map_submit_order},
+        enums::{BitgetAccountMode, BitgetEnvironment, BitgetProductType},
+        order::{map_cancel_order_for_account, map_submit_order_for_account},
         parse::{parse_fill_report, parse_order_status_report, parse_position_status_report},
     },
     http::client::{BitgetHttpClient, BitgetRawHttpClient},
@@ -82,7 +82,12 @@ impl BitgetRawHttpClient {
         base_url = None,
         timeout_secs = 60,
         proxy_url = None,
+        account_mode = BitgetAccountMode::Uta,
     ))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "preserve positional constructor compatibility"
+    )]
     fn py_new(
         api_key: Option<String>,
         api_secret: Option<String>,
@@ -91,6 +96,7 @@ impl BitgetRawHttpClient {
         base_url: Option<String>,
         timeout_secs: u64,
         proxy_url: Option<String>,
+        account_mode: BitgetAccountMode,
     ) -> PyResult<Self> {
         Self::new_with_env_for_environment(
             environment,
@@ -101,6 +107,7 @@ impl BitgetRawHttpClient {
             timeout_secs,
             proxy_url,
         )
+        .map(|client| client.with_account_mode(account_mode))
         .map_err(to_pyvalue_err)
     }
 
@@ -124,7 +131,12 @@ impl BitgetHttpClient {
         base_url = None,
         timeout_secs = 60,
         proxy_url = None,
+        account_mode = BitgetAccountMode::Uta,
     ))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "preserve positional constructor compatibility"
+    )]
     fn py_new(
         api_key: Option<String>,
         api_secret: Option<String>,
@@ -133,6 +145,7 @@ impl BitgetHttpClient {
         base_url: Option<String>,
         timeout_secs: u64,
         proxy_url: Option<String>,
+        account_mode: BitgetAccountMode,
     ) -> PyResult<Self> {
         Self::new_with_env_for_environment(
             environment,
@@ -143,6 +156,7 @@ impl BitgetHttpClient {
             timeout_secs,
             proxy_url,
         )
+        .map(|client| client.with_account_mode(account_mode))
         .map_err(to_pyvalue_err)
     }
 
@@ -685,8 +699,13 @@ impl BitgetHttpClient {
             None,
             None,
         );
-        let request =
-            map_submit_order(product_type, &order_init, params.as_ref()).map_err(to_pyvalue_err)?;
+        let request = map_submit_order_for_account(
+            client.raw().account_mode(),
+            product_type,
+            &order_init,
+            params.as_ref(),
+        )
+        .map_err(to_pyvalue_err)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let ack = client
@@ -720,7 +739,8 @@ impl BitgetHttpClient {
             None => None,
         };
         let client = self.clone();
-        let request = map_cancel_order(
+        let request = map_cancel_order_for_account(
+            self.raw().account_mode(),
             product_type,
             instrument_id,
             client_order_id,

@@ -29,6 +29,7 @@ from nautilus_trader.adapters.bitget.factories import BitgetLiveExecClientFactor
 from nautilus_trader.adapters.bitget.factories import get_cached_bitget_http_client
 from nautilus_trader.adapters.bitget.factories import get_cached_bitget_instrument_provider
 from nautilus_trader.adapters.bitget.providers import BitgetInstrumentProvider
+from nautilus_trader.core.nautilus_pyo3 import BitgetAccountMode
 from nautilus_trader.core.nautilus_pyo3 import BitgetEnvironment
 from nautilus_trader.core.nautilus_pyo3 import BitgetProductType
 
@@ -37,6 +38,7 @@ __all__ = [
     "BITGET",
     "BITGET_CLIENT_ID",
     "BITGET_VENUE",
+    "BitgetAccountMode",
     "BitgetDataClient",
     "BitgetDataClientConfig",
     "BitgetEnvironment",

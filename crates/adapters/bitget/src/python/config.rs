@@ -19,7 +19,7 @@ use nautilus_model::identifiers::AccountId;
 use pyo3::pymethods;
 
 use crate::{
-    common::enums::{BitgetEnvironment, BitgetProductType},
+    common::enums::{BitgetAccountMode, BitgetEnvironment, BitgetProductType},
     config::{BitgetDataClientConfig, BitgetExecClientConfig, BitgetInstrumentProviderConfig},
 };
 
@@ -64,6 +64,7 @@ impl BitgetDataClientConfig {
         heartbeat_interval_secs = None,
         update_instruments_interval_mins = None,
         instrument_poll_interval_secs = None,
+        account_mode = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -83,9 +84,11 @@ impl BitgetDataClientConfig {
         heartbeat_interval_secs: Option<u64>,
         update_instruments_interval_mins: Option<u64>,
         instrument_poll_interval_secs: Option<u64>,
+        account_mode: Option<BitgetAccountMode>,
     ) -> Self {
         let defaults = Self::default();
         Self {
+            account_mode: account_mode.unwrap_or_default(),
             api_key,
             api_secret,
             api_passphrase,
@@ -137,6 +140,7 @@ impl BitgetExecClientConfig {
         account_id = None,
         ignore_uncached_instrument_executions = None,
         reconnect_reconciliation_lookback_mins = 60,
+        account_mode = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -156,9 +160,11 @@ impl BitgetExecClientConfig {
         account_id: Option<AccountId>,
         ignore_uncached_instrument_executions: Option<bool>,
         reconnect_reconciliation_lookback_mins: Option<u64>,
+        account_mode: Option<BitgetAccountMode>,
     ) -> Self {
         let defaults = Self::default();
         Self {
+            account_mode: account_mode.unwrap_or_default(),
             api_key,
             api_secret,
             api_passphrase,

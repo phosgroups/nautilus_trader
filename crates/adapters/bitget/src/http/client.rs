@@ -66,7 +66,7 @@ use crate::common::{
         BITGET_SPOT_PLACE_PLAN_ORDER_ENDPOINT, BITGET_SPOT_UNFILLED_ORDERS_ENDPOINT,
     },
     credential::Credential,
-    enums::{BitgetEnvironment, BitgetProductType},
+    enums::{BitgetAccountMode, BitgetEnvironment, BitgetProductType},
     order::{
         BitgetBatchCancelOrdersRequest, BitgetCancelAllOrdersRequest, BitgetCancelOrderRequest,
         BitgetModifyOrderRequest, BitgetSubmitOrderRequest,
@@ -110,15 +110,15 @@ fn mix_depth_limit(limit: Option<u32>) -> Option<String> {
 }
 
 #[derive(Debug, Default)]
-struct BitgetOrderStatusPage {
-    orders: Vec<super::models::BitgetOrderStatus>,
-    next_cursor: Option<String>,
+pub(crate) struct BitgetOrderStatusPage {
+    pub(crate) orders: Vec<super::models::BitgetOrderStatus>,
+    pub(crate) next_cursor: Option<String>,
 }
 
 #[derive(Debug, Default)]
-struct BitgetFillPage {
-    fills: Vec<super::models::BitgetFill>,
-    next_cursor: Option<String>,
+pub(crate) struct BitgetFillPage {
+    pub(crate) fills: Vec<super::models::BitgetFill>,
+    pub(crate) next_cursor: Option<String>,
 }
 
 /// Raw HTTP client for low-level Bitget API operations.
@@ -134,6 +134,10 @@ struct BitgetFillPage {
 pub struct BitgetRawHttpClient {
     base_url: String,
     environment: BitgetEnvironment,
+    pub(crate) account_mode: BitgetAccountMode,
+    pub(crate) classic_plans: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    pub(crate) classic_replacements:
+        Arc<std::sync::Mutex<crate::classic::replacement::Replacements>>,
     client: HttpClient,
     credential: Option<Credential>,
     cancellation_token: Arc<std::sync::Mutex<CancellationToken>>,
@@ -156,6 +160,18 @@ impl Debug for BitgetRawHttpClient {
 }
 
 impl BitgetRawHttpClient {
+    /// Returns the explicitly selected account protocol.
+    pub const fn account_mode(&self) -> BitgetAccountMode {
+        self.account_mode
+    }
+
+    /// Selects the account protocol before using this client. Never probes or falls back.
+    #[must_use]
+    pub fn with_account_mode(mut self, account_mode: BitgetAccountMode) -> Self {
+        self.account_mode = account_mode;
+        self
+    }
+
     /// Creates a new public [`BitgetRawHttpClient`].
     ///
     /// # Errors
@@ -188,6 +204,9 @@ impl BitgetRawHttpClient {
         Ok(Self {
             base_url: base_url.unwrap_or_else(|| bitget_http_base_url(environment).to_string()),
             environment,
+            account_mode: BitgetAccountMode::default(),
+            classic_replacements: Arc::default(),
+            classic_plans: Arc::default(),
             client: HttpClient::new(
                 Self::default_headers(),
                 vec![],
@@ -462,6 +481,10 @@ impl BitgetRawHttpClient {
     pub async fn request_spot_symbols(
         &self,
     ) -> Result<Vec<super::models::BitgetSpotSymbol>, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self.classic_spot_symbols().await;
+        }
+
         self.get_public::<Vec<super::models::BitgetSpotSymbol>>(
             BITGET_MARKET_INSTRUMENTS_ENDPOINT,
             Some("?category=SPOT"),
@@ -477,6 +500,10 @@ impl BitgetRawHttpClient {
     pub async fn request_usdt_futures_contracts(
         &self,
     ) -> Result<Vec<super::models::BitgetMixContract>, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self.classic_contracts().await;
+        }
+
         self.get_public::<Vec<super::models::BitgetMixContract>>(
             BITGET_MARKET_INSTRUMENTS_ENDPOINT,
             Some("?category=USDT-FUTURES"),
@@ -495,6 +522,12 @@ impl BitgetRawHttpClient {
         raw_symbol: &str,
         limit: Option<u32>,
     ) -> Result<super::models::BitgetOrderBookSnapshot, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self
+                .classic_orderbook(product_type, raw_symbol, limit)
+                .await;
+        }
+
         let mut params = vec![
             ("category", product_type.as_api_str().to_string()),
             ("symbol", raw_symbol.to_string()),
@@ -528,6 +561,12 @@ impl BitgetRawHttpClient {
         end: Option<DateTime<Utc>>,
         limit: Option<u32>,
     ) -> Result<Vec<super::models::BitgetMarketTrade>, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self
+                .classic_trades(product_type, raw_symbol, start, end, limit)
+                .await;
+        }
+
         let mut params = vec![
             ("category", product_type.as_api_str().to_string()),
             ("symbol", raw_symbol.to_string()),
@@ -566,6 +605,12 @@ impl BitgetRawHttpClient {
         end: Option<DateTime<Utc>>,
         limit: Option<u32>,
     ) -> Result<Vec<super::models::BitgetCandle>, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self
+                .classic_candles(product_type, raw_symbol, interval, start, end, limit)
+                .await;
+        }
+
         let mut params = vec![
             ("category", product_type.as_api_str().to_string()),
             ("symbol", raw_symbol.to_string()),
@@ -603,6 +648,10 @@ impl BitgetRawHttpClient {
         end: Option<DateTime<Utc>>,
         limit: Option<u32>,
     ) -> Result<Vec<super::models::BitgetFundingRate>, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self.classic_funding(raw_symbol, start, end, limit).await;
+        }
+
         let mut params = vec![
             (
                 "category",
@@ -641,6 +690,10 @@ impl BitgetRawHttpClient {
         &self,
         coin: Option<&str>,
     ) -> Result<Vec<super::models::BitgetSpotAsset>, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self.classic_spot_assets(coin).await;
+        }
+
         let account = self
             .send_private::<super::models::BitgetUtaAccount, serde_json::Value>(
                 Method::GET,
@@ -661,6 +714,12 @@ impl BitgetRawHttpClient {
     pub async fn request_uta_account(
         &self,
     ) -> Result<super::models::BitgetUtaAccount, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return Err(BitgetHttpError::ValidationError(
+                "request_uta_account requires UTA account mode".to_string(),
+            ));
+        }
+
         self.send_private::<super::models::BitgetUtaAccount, serde_json::Value>(
             Method::GET,
             BITGET_SPOT_ACCOUNT_ASSETS_ENDPOINT,
@@ -679,6 +738,10 @@ impl BitgetRawHttpClient {
         &self,
         product_type: BitgetProductType,
     ) -> Result<Vec<super::models::BitgetMixAccount>, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self.classic_mix_accounts().await;
+        }
+
         if product_type != BitgetProductType::UsdtFutures {
             return Ok(Vec::new());
         }
@@ -705,6 +768,10 @@ impl BitgetRawHttpClient {
         product_type: BitgetProductType,
         raw_symbol: Option<&str>,
     ) -> Result<Vec<super::models::BitgetMixPosition>, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self.classic_positions(raw_symbol).await;
+        }
+
         let mut params = vec![("category", product_type.as_api_str().to_string())];
         let endpoint = if let Some(raw_symbol) = raw_symbol {
             params.push(("symbol", raw_symbol.to_string()));
@@ -812,6 +879,10 @@ impl BitgetRawHttpClient {
         &self,
         request: &BitgetSubmitOrderRequest,
     ) -> Result<super::models::BitgetOrderAck, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self.classic_submit(request).await;
+        }
+
         match request {
             BitgetSubmitOrderRequest::Spot(request) => {
                 self.send_private(
@@ -861,6 +932,10 @@ impl BitgetRawHttpClient {
         &self,
         request: &BitgetModifyOrderRequest,
     ) -> Result<super::models::BitgetOrderAck, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self.classic_modify(request).await;
+        }
+
         match request {
             BitgetModifyOrderRequest::Mix(request) => {
                 self.send_private(
@@ -892,7 +967,14 @@ impl BitgetRawHttpClient {
         &self,
         request: &BitgetCancelOrderRequest,
     ) -> Result<super::models::BitgetOrderAck, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self.classic_cancel(request).await;
+        }
+
         match request {
+            BitgetCancelOrderRequest::SpotPlan(_) => Err(BitgetHttpError::ValidationError(
+                "Classic spot plan cancellation requires Classic account mode".to_string(),
+            )),
             BitgetCancelOrderRequest::Spot(request) => {
                 self.send_private(
                     Method::POST,
@@ -932,6 +1014,10 @@ impl BitgetRawHttpClient {
         &self,
         request: &BitgetBatchCancelOrdersRequest,
     ) -> Result<super::models::BitgetCancelBatchResponse, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self.classic_batch_cancel(request).await;
+        }
+
         match request {
             BitgetBatchCancelOrdersRequest::Spot(request) => {
                 self.send_uta_batch_cancel(&request.order_list).await
@@ -951,6 +1037,10 @@ impl BitgetRawHttpClient {
         &self,
         request: &BitgetCancelAllOrdersRequest,
     ) -> Result<super::models::BitgetCancelBatchResponse, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self.classic_cancel_all(request).await;
+        }
+
         match request {
             BitgetCancelAllOrdersRequest::Spot(request) => self.send_uta_cancel_all(request).await,
             BitgetCancelAllOrdersRequest::Mix(request) => self.send_uta_cancel_all(request).await,
@@ -969,6 +1059,12 @@ impl BitgetRawHttpClient {
         venue_order_id: Option<&str>,
         client_order_id: Option<&str>,
     ) -> Result<super::models::BitgetOrderStatus, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self
+                .classic_order_status(product_type, raw_symbol, venue_order_id, client_order_id)
+                .await;
+        }
+
         let mut params = vec![
             ("category", product_type.as_api_str().to_string()),
             ("symbol", raw_symbol.to_string()),
@@ -1012,6 +1108,20 @@ impl BitgetRawHttpClient {
         limit: u32,
         id_less_than: Option<&str>,
     ) -> Result<BitgetOrderStatusPage, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self
+                .classic_order_page(
+                    product_type,
+                    raw_symbol,
+                    start,
+                    end,
+                    open_only,
+                    limit,
+                    id_less_than,
+                )
+                .await;
+        }
+
         let mut params: Vec<(&str, String)> =
             vec![("category", product_type.as_api_str().to_string())];
         let endpoint = match (product_type, open_only) {
@@ -1095,6 +1205,12 @@ impl BitgetRawHttpClient {
             cursor = Some(next_cursor);
         }
 
+        if self.account_mode == BitgetAccountMode::Classic {
+            orders.extend(
+                self.classic_plan_orders(product_type, raw_symbol, start, end, open_only)
+                    .await?,
+            );
+        }
         Ok(orders)
     }
 
@@ -1113,6 +1229,12 @@ impl BitgetRawHttpClient {
         limit: u32,
         id_less_than: Option<&str>,
     ) -> Result<BitgetFillPage, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self
+                .classic_fill_page(product_type, raw_symbol, start, end, limit, id_less_than)
+                .await;
+        }
+
         let mut params: Vec<(&str, String)> =
             vec![("category", product_type.as_api_str().to_string())];
         let endpoint = match product_type {
@@ -1235,6 +1357,13 @@ impl Default for BitgetHttpClient {
 }
 
 impl BitgetHttpClient {
+    /// Selects the account protocol before using this client. Never probes or falls back.
+    #[must_use]
+    pub fn with_account_mode(mut self, account_mode: BitgetAccountMode) -> Self {
+        self.raw = self.raw.with_account_mode(account_mode);
+        self
+    }
+
     /// Creates a new public [`BitgetHttpClient`].
     ///
     /// # Errors

@@ -21,6 +21,7 @@ from nautilus_trader.adapters.bitget import BitgetInstrumentProviderConfig
 from nautilus_trader.adapters.bitget import BitgetLiveDataClientFactory
 from nautilus_trader.adapters.bitget import BitgetLiveExecClientFactory
 from nautilus_trader.core import nautilus_pyo3
+from nautilus_trader.core.nautilus_pyo3 import BitgetAccountMode
 from nautilus_trader.core.nautilus_pyo3 import BitgetEnvironment
 from nautilus_trader.core.nautilus_pyo3 import BitgetProductType
 
@@ -30,6 +31,8 @@ def test_bitget_python_facade_imports_and_config_defaults():
     data_config = BitgetDataClientConfig()
     exec_config = BitgetExecClientConfig()
 
+    assert data_config.account_mode == BitgetAccountMode.UTA
+    assert exec_config.account_mode == BitgetAccountMode.UTA
     assert BITGET == "BITGET"
     assert BITGET_VENUE.value == "BITGET"
     assert provider_config.product_type == BitgetProductType.USDT_FUTURES
@@ -87,3 +90,17 @@ def test_bitget_url_and_symbol_helpers():
         == BitgetProductType.USDT_FUTURES
     )
     assert nautilus_pyo3.bitget_product_type_from_symbol("BTCUSDT") == BitgetProductType.SPOT
+
+
+def test_bitget_classic_mode_is_part_of_http_client_cache_key():
+    from nautilus_trader.adapters.bitget.factories import get_cached_bitget_http_client
+
+    classic = get_cached_bitget_http_client(account_mode=BitgetAccountMode.CLASSIC)
+    assert classic is get_cached_bitget_http_client(account_mode=BitgetAccountMode.CLASSIC)
+    uta = get_cached_bitget_http_client(account_mode=BitgetAccountMode.UTA)
+    assert classic is not uta
+    config = BitgetExecClientConfig(account_mode=BitgetAccountMode.CLASSIC)
+    assert config.account_mode == BitgetAccountMode.CLASSIC
+    assert nautilus_pyo3.get_bitget_ws_url_private(
+        BitgetEnvironment.MAINNET, BitgetAccountMode.CLASSIC,
+    ) == "wss://ws.bitget.com/v2/ws/private"

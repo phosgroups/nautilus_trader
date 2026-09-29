@@ -20,6 +20,7 @@ from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.config import LiveExecClientConfig
 from nautilus_trader.config import PositiveInt
+from nautilus_trader.core.nautilus_pyo3 import BitgetAccountMode
 from nautilus_trader.core.nautilus_pyo3 import BitgetEnvironment
 from nautilus_trader.core.nautilus_pyo3 import BitgetProductType
 from nautilus_trader.model.identifiers import Venue
@@ -44,6 +45,7 @@ class BitgetDataClientConfig(LiveDataClientConfig, frozen=True):
     api_secret: str | None = None
     api_passphrase: str | None = None
     product_type: BitgetProductType = BitgetProductType.USDT_FUTURES
+    account_mode: BitgetAccountMode = BitgetAccountMode.UTA
     environment: BitgetEnvironment | None = None
     base_url_http: str | None = None
     base_url_ws_public: str | None = None
@@ -63,6 +65,7 @@ class BitgetExecClientConfig(LiveExecClientConfig, frozen=True):
     api_secret: str | None = None
     api_passphrase: str | None = None
     product_type: BitgetProductType = BitgetProductType.USDT_FUTURES
+    account_mode: BitgetAccountMode = BitgetAccountMode.UTA
     environment: BitgetEnvironment | None = None
     base_url_http: str | None = None
     base_url_ws_private: str | None = None

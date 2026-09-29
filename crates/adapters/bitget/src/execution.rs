@@ -56,8 +56,8 @@ use crate::{
         consts::BITGET_VENUE,
         enums::BitgetProductType,
         order::{
-            map_batch_cancel_orders, map_cancel_all_orders, map_cancel_order, map_modify_order,
-            map_submit_order,
+            map_batch_cancel_orders, map_cancel_all_orders, map_cancel_order_for_account,
+            map_modify_order, map_submit_order_for_account,
         },
         parse::{
             parse_fill_report, parse_mix_account_state, parse_order_status_report,
@@ -155,6 +155,7 @@ struct BitgetExecutionWsDispatchContext {
     http_client: BitgetHttpClient,
     reconnect_reconciliation_lookback_mins: Option<u64>,
     reconnect_reconciliation_in_flight: Arc<AtomicBool>,
+    classic_account_refresh: Arc<std::sync::atomic::AtomicU8>,
     instruments_by_id: HashMap<InstrumentId, InstrumentAny>,
     instrument_ids_by_raw_symbol: HashMap<String, InstrumentId>,
 }
@@ -190,6 +191,7 @@ impl BitgetExecutionWsDispatchContext {
             http_client,
             reconnect_reconciliation_lookback_mins,
             reconnect_reconciliation_in_flight: Arc::new(AtomicBool::new(false)),
+            classic_account_refresh: Arc::default(),
             instruments_by_id,
             instrument_ids_by_raw_symbol,
         }
@@ -224,6 +226,7 @@ pub struct BitgetExecutionClient {
     http_client: BitgetHttpClient,
     ws_client: BitgetWebSocketClient,
     ws_task: Option<tokio::task::JoinHandle<()>>,
+    spot_plan_task: Option<tokio::task::JoinHandle<()>>,
     is_connected: AtomicBool,
 }
 
@@ -250,7 +253,8 @@ impl BitgetExecutionClient {
             Some(config.http_base_url()),
             config.http_timeout_secs,
             config.proxy_url.clone(),
-        )?;
+        )?
+        .with_account_mode(config.account_mode);
         let ws_client = BitgetWebSocketClient::new_private(
             config.product_type,
             config.environment,
@@ -261,7 +265,8 @@ impl BitgetExecutionClient {
             config.heartbeat_interval_secs,
             config.transport_backend,
             config.proxy_url.clone(),
-        );
+        )
+        .with_account_mode(config.account_mode);
 
         Ok(Self {
             core,
@@ -271,6 +276,7 @@ impl BitgetExecutionClient {
             http_client,
             ws_client,
             ws_task: None,
+            spot_plan_task: None,
             is_connected: AtomicBool::new(false),
         })
     }
@@ -296,6 +302,9 @@ impl BitgetExecutionClient {
     }
 
     fn abort_ws_task(&mut self) {
+        if let Some(task) = self.spot_plan_task.take() {
+            task.abort();
+        }
         if let Some(handle) = self.ws_task.take() {
             handle.abort();
         }
@@ -397,6 +406,41 @@ impl BitgetExecutionClient {
             anyhow::anyhow!("Bitget private WebSocket receiver was already taken")
         })?;
         let venue = *BITGET_VENUE;
+        if self.config.account_mode == crate::common::enums::BitgetAccountMode::Classic {
+            self.http_client
+                .raw()
+                .classic_replacements
+                .lock()
+                .expect("replacement lock poisoned")
+                .restore(
+                    self.core
+                        .cache()
+                        .orders(Some(&venue), None, None, Some(&self.core.account_id), None)
+                        .into_iter()
+                        .map(|order| order.cloned())
+                        .collect(),
+                );
+        }
+        if self.config.account_mode == crate::common::enums::BitgetAccountMode::Classic {
+            for order in self.core.cache().orders(
+                Some(&venue),
+                None,
+                None,
+                Some(&self.core.account_id),
+                None,
+            ) {
+                if order.trigger_price().is_some()
+                    && let Some(id) = order.venue_order_id()
+                {
+                    self.http_client
+                        .raw()
+                        .classic_plans
+                        .lock()
+                        .expect("plan lock poisoned")
+                        .insert(id.to_string(), order.client_order_id().to_string());
+                }
+            }
+        }
         let instruments = self
             .core
             .cache()
@@ -413,6 +457,52 @@ impl BitgetExecutionClient {
             self.config.reconnect_reconciliation_lookback_mins,
             instruments,
         );
+
+        if self.config.account_mode == crate::common::enums::BitgetAccountMode::Classic
+            && self.config.product_type == BitgetProductType::Spot
+        {
+            let ctx = dispatch_ctx.clone();
+            self.spot_plan_task = Some(get_runtime().spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut previous = HashMap::<String, BitgetOrderStatus>::new();
+                let lookback = ctx
+                    .reconnect_reconciliation_lookback_mins
+                    .unwrap_or(60)
+                    .min(90 * 24 * 60);
+                let mut since = chrono::Utc::now() - chrono::Duration::minutes(lookback as i64);
+                loop {
+                    interval.tick().await;
+
+                    match ctx.http_client.raw().classic_spot_plan_orders(since).await {
+                        Ok(rows) => {
+                            let mut current = HashMap::new();
+                            for row in rows {
+                                if let Some(created) = row
+                                    .c_time
+                                    .as_deref()
+                                    .and_then(|s| s.parse::<i64>().ok())
+                                    .and_then(DateTime::from_timestamp_millis)
+                                {
+                                    since = since.min(created);
+                                }
+                                let Some(id) = row.order_id.clone() else {
+                                    continue;
+                                };
+                                if previous.get(&id) != Some(&row)
+                                    && let Err(e) = emit_order_status_report(row.clone(), &ctx)
+                                {
+                                    log::warn!("Failed to parse Classic spot plan order {id}: {e}");
+                                }
+                                current.insert(id, row);
+                            }
+                            previous = current;
+                        }
+                        Err(e) => log::warn!("Classic spot plan order polling failed: {e}"),
+                    }
+                }
+            }));
+        }
 
         self.ws_task = Some(get_runtime().spawn(async move {
             while let Some(message) = event_rx.recv().await {
@@ -703,10 +793,45 @@ fn emit_order_status_report(
     ctx: &BitgetExecutionWsDispatchContext,
 ) -> anyhow::Result<()> {
     let instrument = ctx.instrument_for_raw_symbol(status.symbol.as_deref())?;
-    let report =
-        parse_order_status_report(&status, instrument, ctx.account_id, ctx.clock.get_time_ns())?;
-    ctx.emitter.send_order_status_report(report);
+    if let Some(report) = parse_execution_order_report(
+        status,
+        instrument,
+        ctx.account_id,
+        ctx.clock.get_time_ns(),
+        &ctx.http_client,
+        &ctx.emitter,
+    )? {
+        ctx.emitter.send_order_status_report(report);
+    }
     Ok(())
+}
+
+fn parse_execution_order_report(
+    mut status: BitgetOrderStatus,
+    instrument: &InstrumentAny,
+    account_id: AccountId,
+    ts: nautilus_core::UnixNanos,
+    http: &BitgetHttpClient,
+    emitter: &ExecutionEventEmitter,
+) -> anyhow::Result<Option<nautilus_model::reports::OrderStatusReport>> {
+    if http.raw().account_mode() == crate::common::enums::BitgetAccountMode::Classic {
+        let mut replacements = http
+            .raw()
+            .classic_replacements
+            .lock()
+            .expect("replacement lock poisoned");
+        replacements.handle_rejection(&mut status, emitter, ts);
+        if !replacements.normalize(&mut status) {
+            return Ok(None);
+        }
+        let report = parse_order_status_report(&status, instrument, account_id, ts)?;
+        replacements.promote(&report, emitter, ts);
+        Ok(Some(report))
+    } else {
+        Ok(Some(parse_order_status_report(
+            &status, instrument, account_id, ts,
+        )?))
+    }
 }
 
 fn dispatch_ws_fill(
@@ -718,9 +843,17 @@ fn dispatch_ws_fill(
 }
 
 fn emit_fill_report(
-    fill: BitgetFill,
+    mut fill: BitgetFill,
     ctx: &BitgetExecutionWsDispatchContext,
 ) -> anyhow::Result<()> {
+    if ctx.http_client.raw().account_mode() == crate::common::enums::BitgetAccountMode::Classic {
+        ctx.http_client
+            .raw()
+            .classic_replacements
+            .lock()
+            .expect("replacement lock poisoned")
+            .normalize_fill(&mut fill, &ctx.emitter, ctx.clock.get_time_ns());
+    }
     let instrument = ctx.instrument_for_raw_symbol(fill.symbol.as_deref())?;
     let report = parse_fill_report(&fill, instrument, ctx.account_id, ctx.clock.get_time_ns())?;
     ctx.emitter.send_fill_report(report);
@@ -731,6 +864,40 @@ fn dispatch_ws_account(
     rows: Vec<BitgetWsAccountData>,
     ctx: &BitgetExecutionWsDispatchContext,
 ) -> anyhow::Result<()> {
+    // Classic futures pushes omit position margin amounts. Refresh the full REST
+    // snapshot rather than overwrite the account's margin state with zeros.
+    if ctx.product_type == BitgetProductType::UsdtFutures
+        && ctx.http_client.raw().account_mode() == crate::common::enums::BitgetAccountMode::Classic
+    {
+        if ctx.classic_account_refresh.swap(2, Ordering::AcqRel) == 0 {
+            let ctx = ctx.clone();
+            get_runtime().spawn(async move {
+                loop {
+                    ctx.classic_account_refresh.store(1, Ordering::Release);
+                    match ctx
+                        .http_client
+                        .request_account_state(
+                            ctx.product_type,
+                            ctx.account_id,
+                            ctx.clock.get_time_ns(),
+                        )
+                        .await
+                    {
+                        Ok(state) => ctx.emitter.send_account_state(state),
+                        Err(e) => log::warn!("Classic futures account refresh failed: {e}"),
+                    }
+                    if ctx
+                        .classic_account_refresh
+                        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+        return Ok(());
+    }
     let ts_init = ctx.clock.get_time_ns();
     let account_state = match ctx.product_type {
         BitgetProductType::Spot => {
@@ -1223,12 +1390,18 @@ impl ExecutionClient for BitgetExecutionClient {
             .subscribe_orders()
             .await
             .context("subscribe Bitget orders WebSocket channel")?;
-        self.ws_client
-            .subscribe_strategy_orders()
-            .await
-            .context("subscribe Bitget strategy orders WebSocket channel")?;
+        if self.config.account_mode != crate::common::enums::BitgetAccountMode::Classic
+            || self.config.product_type != BitgetProductType::Spot
+        {
+            self.ws_client
+                .subscribe_strategy_orders()
+                .await
+                .context("subscribe Bitget strategy orders WebSocket channel")?;
+        }
 
-        if self.config.product_type == BitgetProductType::UsdtFutures {
+        if self.config.product_type == BitgetProductType::UsdtFutures
+            || self.config.account_mode == crate::common::enums::BitgetAccountMode::Classic
+        {
             self.ws_client
                 .subscribe_fills()
                 .await
@@ -1266,7 +1439,12 @@ impl ExecutionClient for BitgetExecutionClient {
                 None
             }
         };
-        let request = match map_submit_order(product_type, &cmd.order_init, cmd.params.as_ref()) {
+        let request = match map_submit_order_for_account(
+            self.config.account_mode,
+            product_type,
+            &cmd.order_init,
+            cmd.params.as_ref(),
+        ) {
             Ok(request) => request,
             Err(e) => {
                 let reason = e.to_string();
@@ -1298,6 +1476,10 @@ impl ExecutionClient for BitgetExecutionClient {
                     );
                     if let (Some(order), Some(order_id)) = (order.as_ref(), ack.order_id.as_deref())
                     {
+                        if http.raw().account_mode() == crate::common::enums::BitgetAccountMode::Classic && order.trigger_price().is_some() {
+                            http.raw().classic_replacements.lock().expect("replacement lock poisoned")
+                                .register_plan(order.clone(), order_id);
+                        }
                         emitter.emit_order_accepted(
                             order,
                             VenueOrderId::from(order_id),
@@ -1328,7 +1510,7 @@ impl ExecutionClient for BitgetExecutionClient {
         let strategy_id = cmd.strategy_id;
         let instrument_id = cmd.instrument_id;
         let venue_order_id = cmd.venue_order_id;
-        let request = match map_modify_order(
+        let mut request = match map_modify_order(
             product_type,
             instrument_id,
             client_order_id,
@@ -1352,6 +1534,80 @@ impl ExecutionClient for BitgetExecutionClient {
                 return Ok(());
             }
         };
+        let replacement =
+            if self.config.account_mode == crate::common::enums::BitgetAccountMode::Classic {
+                if let crate::common::order::BitgetModifyOrderRequest::Mix(ref mut row) = request {
+                    let prepared = (|| -> anyhow::Result<String> {
+                        let order = self.core.get_order(&client_order_id)?;
+                        anyhow::ensure!(
+                            order.order_type() == nautilus_model::enums::OrderType::Limit
+                                && order.filled_qty().is_zero(),
+                            "Classic futures can only modify an unfilled limit order"
+                        );
+                        anyhow::ensure!(
+                            cmd.trigger_price.is_none(),
+                            "Classic regular order modify cannot set trigger_price"
+                        );
+                        anyhow::ensure!(
+                            cmd.quantity.is_some() || cmd.price.is_some(),
+                            "Classic modify requires quantity or price"
+                        );
+                        row.new_size = Some(cmd.quantity.unwrap_or(order.quantity()).to_string());
+                        row.new_price = Some(
+                            cmd.price
+                                .or(order.price())
+                                .context("Classic limit order missing price")?
+                                .to_string(),
+                        );
+                        row.order_id = order.venue_order_id().map(|id| id.to_string());
+                        let id = self
+                            .http_client
+                            .raw()
+                            .classic_replacements
+                            .lock()
+                            .expect("replacement lock poisoned")
+                            .begin(
+                                order,
+                                self.clock.get_time_ns().as_u64(),
+                                cmd.quantity,
+                                cmd.price,
+                            )?;
+                        row.new_client_oid = Some(id.clone());
+                        Ok(id)
+                    })();
+                    match prepared {
+                        Ok(id) => Some(id),
+                        Err(e) => {
+                            self.emitter.emit_order_modify_rejected_event(
+                                strategy_id,
+                                instrument_id,
+                                client_order_id,
+                                venue_order_id,
+                                &e.to_string(),
+                                self.clock.get_time_ns(),
+                            );
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        let replacement_context = if replacement.is_some() {
+            Some(BitgetExecutionWsDispatchContext::new(
+                product_type,
+                self.core.account_id,
+                self.clock,
+                self.emitter.clone(),
+                self.http_client.clone(),
+                self.config.reconnect_reconciliation_lookback_mins,
+                vec![self.cached_instrument(instrument_id)?],
+            ))
+        } else {
+            None
+        };
         let http = self.http_client.clone();
         let emitter = self.emitter.clone();
         let clock = self.clock;
@@ -1370,6 +1626,10 @@ impl ExecutionClient for BitgetExecutionClient {
                     match classify_bitget_http_failure(&e) {
                         BitgetCommandFailureKind::StructuredVenueRejection
                         | BitgetCommandFailureKind::LocalValidation => {
+                            if replacement.is_some() {
+                                http.raw().classic_replacements.lock().expect("replacement lock poisoned")
+                                    .abort(client_order_id.as_str());
+                            }
                             emitter.emit_order_modify_rejected_event(
                                 strategy_id,
                                 instrument_id,
@@ -1378,6 +1638,7 @@ impl ExecutionClient for BitgetExecutionClient {
                                 &format!("Bitget modify order failed: {e}"),
                                 clock.get_time_ns(),
                             );
+                            return;
                         }
                         BitgetCommandFailureKind::Ambiguous => {
                             log::warn!(
@@ -1386,6 +1647,23 @@ impl ExecutionClient for BitgetExecutionClient {
                         }
                     }
                 }
+            }
+            if let (Some(new_client_oid), Some(ctx)) = (replacement, replacement_context) {
+                // The replacement ID is asynchronous. Query by the unique client ID and never
+                // resend the mutation after a timeout; WS/reconnect may confirm it first.
+                for _ in 0..60 {
+                    match http.request_order_status(product_type, instrument_id, None, Some(&new_client_oid)).await {
+                        Ok(row) => {
+                            if let Err(e) = emit_order_status_report(row, &ctx) {
+                                log::error!("Classic replacement report failed for {client_order_id}: {e}");
+                            }
+                            return;
+                        }
+                        Err(e) => log::debug!("Classic replacement {new_client_oid} not yet confirmed: {e}"),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                log::error!("Classic replacement outcome remains unknown for {client_order_id}; reconciliation is required");
             }
         });
 
@@ -1398,7 +1676,8 @@ impl ExecutionClient for BitgetExecutionClient {
         let strategy_id = cmd.strategy_id;
         let instrument_id = cmd.instrument_id;
         let venue_order_id = cmd.venue_order_id;
-        let request = match map_cancel_order(
+        let request = match map_cancel_order_for_account(
+            self.config.account_mode,
             product_type,
             instrument_id,
             client_order_id,
@@ -1678,13 +1957,16 @@ impl ExecutionClient for BitgetExecutionClient {
             {
                 Ok(status) => {
                     log::debug!("Bitget order status for {client_order_id}: {status:?}");
-                    match parse_order_status_report(
-                        &status,
+                    match parse_execution_order_report(
+                        status,
                         &instrument,
                         account_id,
                         clock.get_time_ns(),
+                        &http,
+                        &emitter,
                     ) {
-                        Ok(report) => emitter.send_order_status_report(report),
+                        Ok(Some(report)) => emitter.send_order_status_report(report),
+                        Ok(None) => {}
                         Err(e) => log::error!(
                             "Bitget order status report parse failed for {client_order_id}: {e:?}"
                         ),
@@ -1732,14 +2014,14 @@ impl ExecutionClient for BitgetExecutionClient {
                 client_order_id.as_deref(),
             )
             .await?;
-        let report = parse_order_status_report(
-            &status,
+        parse_execution_order_report(
+            status,
             &instrument,
             self.core.account_id,
             self.clock.get_time_ns(),
-        )?;
-
-        Ok(Some(report))
+            &self.http_client,
+            &self.emitter,
+        )
     }
 
     async fn generate_order_status_reports(
@@ -1769,12 +2051,16 @@ impl ExecutionClient for BitgetExecutionClient {
         for order in orders {
             let instrument_id = self.instrument_id_for_order_status(&order, cmd.instrument_id)?;
             let instrument = self.cached_instrument(instrument_id)?;
-            reports.push(parse_order_status_report(
-                &order,
+            if let Some(report) = parse_execution_order_report(
+                order,
                 &instrument,
                 self.core.account_id,
                 ts_init,
-            )?);
+                &self.http_client,
+                &self.emitter,
+            )? {
+                reports.push(report);
+            }
         }
 
         Ok(reports)
@@ -1803,7 +2089,15 @@ impl ExecutionClient for BitgetExecutionClient {
         let ts_init = self.clock.get_time_ns();
         let mut reports = Vec::with_capacity(fills.len());
 
-        for fill in fills {
+        for mut fill in fills {
+            if self.config.account_mode == crate::common::enums::BitgetAccountMode::Classic {
+                self.http_client
+                    .raw()
+                    .classic_replacements
+                    .lock()
+                    .expect("replacement lock poisoned")
+                    .normalize_fill(&mut fill, &self.emitter, ts_init);
+            }
             if let Some(venue_order_id) = cmd.venue_order_id
                 && fill.order_id.as_deref() != Some(venue_order_id.as_str())
             {
@@ -2796,5 +3090,320 @@ mod tests {
 
         ws_client.disconnect().await.unwrap();
         dispatch_handle.abort();
+    }
+
+    fn classic_test_order() -> nautilus_model::orders::OrderAny {
+        use nautilus_model::{
+            enums::TimeInForce,
+            events::{OrderAccepted, OrderEventAny},
+            orders::{LimitOrder, OrderAny},
+            types::{Price, Quantity},
+        };
+        let mut order = OrderAny::Limit(LimitOrder::new(
+            "TESTER-001".into(),
+            "S-001".into(),
+            "BTCUSDT-PERP.BITGET".into(),
+            "O-001".into(),
+            OrderSide::Buy,
+            Quantity::from("1.000"),
+            Price::from("100.0"),
+            TimeInForce::Gtc,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            nautilus_core::UUID4::new(),
+            TEST_TS,
+        ));
+        order
+            .apply(OrderEventAny::Accepted(OrderAccepted::new(
+                order.trader_id(),
+                order.strategy_id(),
+                order.instrument_id(),
+                order.client_order_id(),
+                "old".into(),
+                "BITGET-001".into(),
+                nautilus_core::UUID4::new(),
+                TEST_TS,
+                TEST_TS,
+                false,
+            )))
+            .unwrap();
+        order
+    }
+
+    fn classic_test_context() -> (
+        BitgetExecutionWsDispatchContext,
+        tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    ) {
+        let (emitter, rx) = test_emitter();
+        let http = BitgetHttpClient::new(None, 60, None)
+            .unwrap()
+            .with_account_mode(crate::common::enums::BitgetAccountMode::Classic);
+        (
+            BitgetExecutionWsDispatchContext::new(
+                BitgetProductType::UsdtFutures,
+                "BITGET-001".into(),
+                get_atomic_clock_realtime(),
+                emitter,
+                http,
+                Some(60),
+                vec![usdt_perp_instrument()],
+            ),
+            rx,
+        )
+    }
+
+    fn classic_test_status(id: &str, client: &str, status: &str) -> BitgetOrderStatus {
+        BitgetOrderStatus {
+            symbol: Some("BTCUSDT".into()),
+            order_id: Some(id.into()),
+            client_oid: Some(client.into()),
+            status: Some(status.into()),
+            side: Some("buy".into()),
+            order_type: Some("limit".into()),
+            size: Some("2.000".into()),
+            price: Some("101.0".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn classic_amend_promotes_identity_before_reports_and_suppresses_only_the_old_cancel() {
+        use nautilus_model::events::OrderEventAny;
+        let (ctx, mut rx) = classic_test_context();
+        let new_client = ctx
+            .http_client
+            .raw()
+            .classic_replacements
+            .lock()
+            .unwrap()
+            .begin(classic_test_order(), 123, None, None)
+            .unwrap();
+        emit_order_status_report(classic_test_status("old", "O-001", "canceled"), &ctx).unwrap();
+        assert!(rx.try_recv().is_err());
+        emit_order_status_report(classic_test_status("new", &new_client, "live"), &ctx).unwrap();
+        let events = drain_execution_events(&mut rx);
+        assert_eq!(events.len(), 2);
+        let ExecutionEvent::Order(OrderEventAny::Updated(update)) = &events[0] else {
+            panic!("expected promotion first")
+        };
+        assert_eq!(update.client_order_id.as_str(), "O-001");
+        assert_eq!(update.venue_order_id.unwrap().as_str(), "new");
+        assert_eq!(update.quantity.to_string(), "2.000");
+        emit_order_status_report(classic_test_status("old", "O-001", "canceled"), &ctx).unwrap();
+        assert!(rx.try_recv().is_err());
+        emit_order_status_report(classic_test_status("new", &new_client, "canceled"), &ctx)
+            .unwrap();
+        assert_eq!(drain_execution_events(&mut rx).len(), 1);
+        let resolved = ctx
+            .http_client
+            .raw()
+            .classic_replacements
+            .lock()
+            .unwrap()
+            .resolve(Some("O-001"), Some("old"))
+            .unwrap();
+        assert_eq!(resolved.0.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn classic_failed_modify_does_not_hide_a_real_cancellation() {
+        let (ctx, mut rx) = classic_test_context();
+        let mut state = ctx.http_client.raw().classic_replacements.lock().unwrap();
+        state.begin(classic_test_order(), 123, None, None).unwrap();
+        assert!(state.resolve(Some("O-001"), Some("old")).is_err());
+        assert!(state.begin(classic_test_order(), 124, None, None).is_err());
+        state.abort("O-001");
+        drop(state);
+        emit_order_status_report(classic_test_status("old", "O-001", "canceled"), &ctx).unwrap();
+        assert_eq!(drain_execution_events(&mut rx).len(), 1);
+    }
+
+    #[test]
+    fn classic_reconciliation_recovers_replacement_identity_from_cached_order() {
+        let (ctx, mut rx) = classic_test_context();
+        ctx.http_client
+            .raw()
+            .classic_replacements
+            .lock()
+            .unwrap()
+            .restore(vec![classic_test_order()]);
+        emit_order_status_report(
+            classic_test_status("new", "O-001-NTR-0000000000000123", "live"),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(drain_execution_events(&mut rx).len(), 2);
+    }
+
+    #[test]
+    fn classic_fill_before_order_update_promotes_once() {
+        use nautilus_model::events::OrderEventAny;
+        let (ctx, mut rx) = classic_test_context();
+        let new_client = ctx
+            .http_client
+            .raw()
+            .classic_replacements
+            .lock()
+            .unwrap()
+            .begin(classic_test_order(), 123, None, None)
+            .unwrap();
+        let mut fill = BitgetFill {
+            order_id: Some("new".into()),
+            client_oid: Some(new_client.clone()),
+            ..Default::default()
+        };
+        ctx.http_client
+            .raw()
+            .classic_replacements
+            .lock()
+            .unwrap()
+            .normalize_fill(&mut fill, &ctx.emitter, TEST_TS);
+        assert_eq!(fill.client_oid.as_deref(), Some("O-001"));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ExecutionEvent::Order(OrderEventAny::Updated(_))
+        ));
+        emit_order_status_report(classic_test_status("new", &new_client, "live"), &ctx).unwrap();
+        assert_eq!(drain_execution_events(&mut rx).len(), 1);
+        // A subsequent failed amendment must keep the previously confirmed venue identity.
+        let mut order = classic_test_order();
+        let update = nautilus_model::events::OrderUpdated::new(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            order.quantity(),
+            nautilus_core::UUID4::new(),
+            TEST_TS,
+            TEST_TS,
+            false,
+            Some("new".into()),
+            Some("BITGET-001".into()),
+            order.price(),
+            None,
+            None,
+            false,
+        );
+        order.apply(OrderEventAny::Updated(update)).unwrap();
+        let mut state = ctx.http_client.raw().classic_replacements.lock().unwrap();
+        state.begin(order, 124, None, None).unwrap();
+        state.abort("O-001");
+        assert_eq!(
+            state.resolve(Some("O-001"), None).unwrap().0.as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn classic_plan_cancel_and_child_identity_do_not_regress_on_stale_plan_events() {
+        let (ctx, mut rx) = classic_test_context();
+        ctx.http_client
+            .raw()
+            .classic_replacements
+            .lock()
+            .unwrap()
+            .register_plan(classic_test_order(), "old");
+        emit_order_status_report(classic_test_status("old", "O-001", "canceled"), &ctx).unwrap();
+        assert_eq!(drain_execution_events(&mut rx).len(), 1);
+        emit_order_status_report(classic_test_status("child", "O-001", "live"), &ctx).unwrap();
+        assert_eq!(drain_execution_events(&mut rx).len(), 2);
+        emit_order_status_report(classic_test_status("old", "O-001", "live"), &ctx).unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn classic_async_replacement_rejection_closes_the_canceled_old_leg() {
+        use nautilus_model::events::OrderEventAny;
+        let (ctx, mut rx) = classic_test_context();
+        let new_client = ctx
+            .http_client
+            .raw()
+            .classic_replacements
+            .lock()
+            .unwrap()
+            .begin(classic_test_order(), 123, None, None)
+            .unwrap();
+        emit_order_status_report(classic_test_status("new", &new_client, "rejected"), &ctx)
+            .unwrap();
+        let events = drain_execution_events(&mut rx);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            ExecutionEvent::Order(OrderEventAny::ModifyRejected(_))
+        ));
+        assert!(matches!(&events[1], ExecutionEvent::Report(_)));
+    }
+
+    #[tokio::test]
+    async fn classic_account_push_refreshes_full_margin_snapshot() {
+        let app = Router::new().route(
+            "/api/v2/mix/account/accounts",
+            get(|| async {
+                Json(bitget_success(
+                    json!([{"marginCoin":"USDT","available":"83","locked":"2",
+                "accountEquity":"100","crossedMargin":"10","isolatedMargin":"5","unionMm":"4"}]),
+                ))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut ctx, mut rx) = classic_test_context();
+        ctx.http_client = BitgetHttpClient::with_credentials(
+            "key".into(),
+            "secret".into(),
+            "pass".into(),
+            Some(format!("http://{address}")),
+            5,
+            None,
+        )
+        .unwrap()
+        .with_account_mode(crate::common::enums::BitgetAccountMode::Classic);
+        for _ in 0..3 {
+            dispatch_ws_account(
+                vec![BitgetWsAccountData {
+                    margin_coin: Some("USDT".into()),
+                    available_balance: Some("999".into()),
+                    ..Default::default()
+                }],
+                &ctx,
+            )
+            .unwrap();
+        }
+        let event = tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ExecutionEvent::Account(state) = event else {
+            panic!("expected account state")
+        };
+        assert_eq!(
+            state.balances[0].total.as_decimal(),
+            rust_decimal::Decimal::from(100)
+        );
+        assert_eq!(
+            state.margins[0].initial.as_decimal(),
+            rust_decimal::Decimal::from(17)
+        );
+        assert_eq!(
+            state.margins[0].maintenance.as_decimal(),
+            rust_decimal::Decimal::from(4)
+        );
+        server.abort();
     }
 }

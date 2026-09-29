@@ -220,8 +220,7 @@ async fn bitget_python_report_methods_parse_null_list_payloads_as_empty_lists() 
 }
 
 fn register_bitget_python_module(py: Python<'_>) {
-    let module = PyModule::new(py, "bitget").expect("Bitget module should be created");
-    python::bitget(py, &module).expect("Bitget Python module should register");
+    registered_bitget_module(py);
 }
 
 async fn start_null_payload_fixture_server() -> SocketAddr {
@@ -450,4 +449,71 @@ fn assert_exec_factory_extracts_from_python_object(py: Python<'_>) {
     assert_eq!(client.client_id(), ClientId::from("BITGET-EXEC-EXTRACTED"));
     assert_eq!(client.account_id(), account_id);
     assert_eq!(client.oms_type(), OmsType::Netting);
+}
+
+#[test]
+fn bitget_python_account_mode_is_explicit_and_defaults_to_uta() {
+    use nautilus_bitget::common::enums::BitgetAccountMode;
+    use pyo3::types::PyDict;
+    Python::initialize();
+    Python::attach(|py| {
+        let module = registered_bitget_module(py);
+        let mode = module
+            .getattr("BitgetAccountMode")
+            .unwrap()
+            .getattr("CLASSIC")
+            .unwrap();
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("account_mode", &mode).unwrap();
+        let default = module
+            .getattr("BitgetExecClientConfig")
+            .unwrap()
+            .call0()
+            .unwrap()
+            .extract::<BitgetExecClientConfig>()
+            .unwrap();
+        assert_eq!(default.account_mode, BitgetAccountMode::Uta);
+        let classic = module
+            .getattr("BitgetExecClientConfig")
+            .unwrap()
+            .call((), Some(&kwargs))
+            .unwrap()
+            .extract::<BitgetExecClientConfig>()
+            .unwrap();
+        assert_eq!(classic.account_mode, BitgetAccountMode::Classic);
+        assert_eq!(
+            classic.ws_private_url(),
+            "wss://ws.bitget.com/v2/ws/private"
+        );
+        for name in ["BitgetHttpClient", "BitgetRawHttpClient"] {
+            module
+                .getattr(name)
+                .unwrap()
+                .call((), Some(&kwargs))
+                .unwrap();
+        }
+        let ws = module
+            .getattr("BitgetWebSocketClient")
+            .unwrap()
+            .getattr("new_private")
+            .unwrap()
+            .call((), Some(&kwargs))
+            .unwrap();
+        assert_eq!(
+            ws.getattr("url").unwrap().extract::<String>().unwrap(),
+            "wss://ws.bitget.com/v2/ws/private"
+        );
+    });
+}
+
+fn registered_bitget_module(py: Python<'_>) -> pyo3::Bound<'_, PyModule> {
+    static MODULE: pyo3::sync::PyOnceLock<Py<PyModule>> = pyo3::sync::PyOnceLock::new();
+    MODULE
+        .get_or_init(py, || {
+            let module = PyModule::new(py, "bitget").unwrap();
+            python::bitget(py, &module).unwrap();
+            module.unbind()
+        })
+        .bind(py)
+        .clone()
 }

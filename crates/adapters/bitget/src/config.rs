@@ -20,8 +20,8 @@ use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 
 use crate::common::{
-    enums::{BitgetEnvironment, BitgetProductType},
-    urls::{bitget_http_base_url, bitget_ws_private_url, bitget_ws_public_url},
+    enums::{BitgetAccountMode, BitgetEnvironment, BitgetProductType},
+    urls::bitget_http_base_url,
 };
 
 /// Configuration for the Bitget instrument provider.
@@ -62,6 +62,9 @@ impl Default for BitgetInstrumentProviderConfig {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bitget")
 )]
 pub struct BitgetDataClientConfig {
+    /// Account protocol. Defaults to UTA; no automatic fallback.
+    #[builder(default)]
+    pub account_mode: BitgetAccountMode,
     /// Optional API key for authenticated REST/WebSocket requests.
     pub api_key: Option<String>,
     /// Optional API secret for authenticated REST/WebSocket requests.
@@ -140,17 +143,27 @@ impl BitgetDataClientConfig {
     /// Returns the public WebSocket URL, considering overrides and environment.
     #[must_use]
     pub fn ws_public_url(&self) -> String {
-        self.base_url_ws_public
-            .clone()
-            .unwrap_or_else(|| bitget_ws_public_url(self.environment).to_string())
+        self.base_url_ws_public.clone().unwrap_or_else(|| {
+            crate::common::urls::bitget_ws_url_for_account(
+                self.environment,
+                self.account_mode,
+                false,
+            )
+            .to_string()
+        })
     }
 
     /// Returns the private WebSocket URL, considering overrides and environment.
     #[must_use]
     pub fn ws_private_url(&self) -> String {
-        self.base_url_ws_private
-            .clone()
-            .unwrap_or_else(|| bitget_ws_private_url(self.environment).to_string())
+        self.base_url_ws_private.clone().unwrap_or_else(|| {
+            crate::common::urls::bitget_ws_url_for_account(
+                self.environment,
+                self.account_mode,
+                true,
+            )
+            .to_string()
+        })
     }
 }
 
@@ -166,6 +179,9 @@ impl BitgetDataClientConfig {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bitget")
 )]
 pub struct BitgetExecClientConfig {
+    /// Account protocol. Defaults to UTA; no automatic fallback.
+    #[builder(default)]
+    pub account_mode: BitgetAccountMode,
     /// Optional API key for authenticated requests.
     pub api_key: Option<String>,
     /// Optional API secret for authenticated requests.
@@ -248,9 +264,14 @@ impl BitgetExecClientConfig {
     /// Returns the private WebSocket URL, considering overrides and environment.
     #[must_use]
     pub fn ws_private_url(&self) -> String {
-        self.base_url_ws_private
-            .clone()
-            .unwrap_or_else(|| bitget_ws_private_url(self.environment).to_string())
+        self.base_url_ws_private.clone().unwrap_or_else(|| {
+            crate::common::urls::bitget_ws_url_for_account(
+                self.environment,
+                self.account_mode,
+                true,
+            )
+            .to_string()
+        })
     }
 }
 

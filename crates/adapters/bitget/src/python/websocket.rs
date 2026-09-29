@@ -39,7 +39,7 @@ use serde_json::{Value, json};
 
 use crate::{
     common::{
-        enums::{BitgetEnvironment, BitgetProductType},
+        enums::{BitgetAccountMode, BitgetEnvironment, BitgetProductType},
         parse::bar_spec_to_bitget_interval_for_product,
     },
     data::{
@@ -345,6 +345,7 @@ impl PyBitgetWebSocketClient {
         proxy_url = None,
         http_url = None,
         http_timeout_secs = 60,
+        account_mode = BitgetAccountMode::Uta,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -359,6 +360,7 @@ impl PyBitgetWebSocketClient {
         proxy_url: Option<String>,
         http_url: Option<String>,
         http_timeout_secs: u64,
+        account_mode: BitgetAccountMode,
     ) -> PyResult<Self> {
         if private {
             Self::new_private(
@@ -372,6 +374,7 @@ impl PyBitgetWebSocketClient {
                 proxy_url,
                 http_url,
                 http_timeout_secs,
+                account_mode,
             )
         } else {
             Self::new_public(
@@ -382,6 +385,7 @@ impl PyBitgetWebSocketClient {
                 proxy_url,
                 http_url,
                 http_timeout_secs,
+                account_mode,
             )
         }
     }
@@ -397,7 +401,12 @@ impl PyBitgetWebSocketClient {
         proxy_url = None,
         http_url = None,
         http_timeout_secs = 60,
+        account_mode = BitgetAccountMode::Uta,
     ))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "preserve positional constructor compatibility"
+    )]
     fn new_public(
         product_type: BitgetProductType,
         environment: BitgetEnvironment,
@@ -406,6 +415,7 @@ impl PyBitgetWebSocketClient {
         proxy_url: Option<String>,
         http_url: Option<String>,
         http_timeout_secs: u64,
+        account_mode: BitgetAccountMode,
     ) -> PyResult<Self> {
         let http = BitgetHttpClient::new_with_env_for_environment(
             environment,
@@ -416,7 +426,8 @@ impl PyBitgetWebSocketClient {
             http_timeout_secs,
             proxy_url.clone(),
         )
-        .map_err(to_pyvalue_err)?;
+        .map_err(to_pyvalue_err)?
+        .with_account_mode(account_mode);
 
         Ok(Self::wrap(
             BitgetWebSocketClient::new_public(
@@ -426,7 +437,8 @@ impl PyBitgetWebSocketClient {
                 heartbeat_secs,
                 TransportBackend::default(),
                 proxy_url,
-            ),
+            )
+            .with_account_mode(account_mode),
             http,
             product_type,
         ))
@@ -446,6 +458,7 @@ impl PyBitgetWebSocketClient {
         proxy_url = None,
         http_url = None,
         http_timeout_secs = 60,
+        account_mode = BitgetAccountMode::Uta,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new_private(
@@ -459,6 +472,7 @@ impl PyBitgetWebSocketClient {
         proxy_url: Option<String>,
         http_url: Option<String>,
         http_timeout_secs: u64,
+        account_mode: BitgetAccountMode,
     ) -> PyResult<Self> {
         let http = BitgetHttpClient::new_with_env_for_environment(
             environment,
@@ -469,7 +483,8 @@ impl PyBitgetWebSocketClient {
             http_timeout_secs,
             proxy_url.clone(),
         )
-        .map_err(to_pyvalue_err)?;
+        .map_err(to_pyvalue_err)?
+        .with_account_mode(account_mode);
 
         Ok(Self::wrap(
             BitgetWebSocketClient::new_private(
@@ -482,7 +497,8 @@ impl PyBitgetWebSocketClient {
                 heartbeat_secs,
                 TransportBackend::default(),
                 proxy_url,
-            ),
+            )
+            .with_account_mode(account_mode),
             http,
             product_type,
         ))

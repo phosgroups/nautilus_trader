@@ -127,6 +127,7 @@ fn extract_bitget_exec_config(
 /// Returns an error if any bindings fail to register with the Python module.
 #[pymodule]
 pub fn bitget(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<crate::common::enums::BitgetAccountMode>()?;
     m.add_class::<crate::common::enums::BitgetEnvironment>()?;
     m.add_class::<crate::common::enums::BitgetProductType>()?;
     m.add_class::<crate::http::client::BitgetRawHttpClient>()?;

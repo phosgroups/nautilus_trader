@@ -20,7 +20,7 @@ use crate::common::{
         BITGET_HTTP_URL, BITGET_WS_DEMO_PRIVATE_URL, BITGET_WS_DEMO_PUBLIC_URL,
         BITGET_WS_PRIVATE_URL, BITGET_WS_PUBLIC_URL,
     },
-    enums::BitgetEnvironment,
+    enums::{BitgetAccountMode, BitgetEnvironment},
 };
 
 /// Returns the REST base URL for the selected Bitget environment.
@@ -47,5 +47,30 @@ pub const fn bitget_ws_private_url(environment: BitgetEnvironment) -> &'static s
     match environment {
         BitgetEnvironment::Mainnet => BITGET_WS_PRIVATE_URL,
         BitgetEnvironment::Demo => BITGET_WS_DEMO_PRIVATE_URL,
+    }
+}
+
+/// Resolves the WebSocket endpoint for an explicit account protocol.
+#[must_use]
+pub const fn bitget_ws_url_for_account(
+    environment: BitgetEnvironment,
+    mode: BitgetAccountMode,
+    private: bool,
+) -> &'static str {
+    match (environment, mode, private) {
+        (BitgetEnvironment::Mainnet, BitgetAccountMode::Classic, false) => {
+            "wss://ws.bitget.com/v2/ws/public"
+        }
+        (BitgetEnvironment::Mainnet, BitgetAccountMode::Classic, true) => {
+            "wss://ws.bitget.com/v2/ws/private"
+        }
+        (BitgetEnvironment::Demo, BitgetAccountMode::Classic, false) => {
+            "wss://wspap.bitget.com/v2/ws/public"
+        }
+        (BitgetEnvironment::Demo, BitgetAccountMode::Classic, true) => {
+            "wss://wspap.bitget.com/v2/ws/private"
+        }
+        (_, BitgetAccountMode::Uta, true) => bitget_ws_private_url(environment),
+        (_, BitgetAccountMode::Uta, false) => bitget_ws_public_url(environment),
     }
 }
