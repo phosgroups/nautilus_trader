@@ -46,6 +46,19 @@ Protocol-specific trading behavior:
 - Classic Spot market buys require `quote_quantity=True`; the amount is in quote currency.
   Base-denominated market buys are rejected locally instead of sending that number as a quote budget.
   Spot sells and limit orders use base currency. UTA's existing quantity validation is unchanged.
+- Classic Spot fill pushes use `priceAvg`, `size`, and `amount`; futures use `price`,
+  `baseVolume`, and `quoteVolume`. Normalization preserves valid execution fields and
+  falls back through nonempty aliases without replacing the execution timestamp with a push timestamp.
+- Classic order pushes bundle the latest execution with the cumulative order status, preserving
+  its trade ID, `fillPrice`, `baseVolume`, `fillFee`, and `fillTime`. Cumulative `priceAvg`,
+  `accBaseVolume`, and `feeDetail` are not used as individual execution values.
+  Spot order quantity prefers `newSize`. Unfilled market buys retain their quote budget;
+  once executions exist, reports convert to base units for reconciliation. Filled market buys
+  use the actual cumulative base fill as their final quantity.
+- Classic books normalize `asks`/`bids` into the shared book model and accept numeric or string
+  sequence values. Position pushes accept numeric leverage. Spot account pushes retain both
+  `frozen` and `locked` amounts when computing balances.
+  The execution client subscribes to positions only for futures.
 - Classic futures account pushes trigger a coalesced REST refresh to retain margin amounts
   omitted from the WebSocket payload.
 - The Rust execution client polls Classic Spot plan-order pending/history endpoints every five
@@ -71,6 +84,12 @@ These tests do not establish production account permissions or replace exchange-
 of your production account configuration.
 
 Protocol references: [Classic REST](https://www.bitget.com/docs/classic/rest-api),
+[Spot fills](https://www.bitget.com/docs/classic/websocket/spot/private/Fill-Channel),
+[Spot orders](https://www.bitget.com/docs/classic/websocket/spot/private/Order-Channel),
+[Classic futures orders](https://www.bitget.com/docs/classic/websocket/contract/private/Order-Channel),
+[Spot accounts](https://www.bitget.com/docs/classic/websocket/spot/private/Account-Channel),
+[Classic books](https://www.bitget.com/docs/classic/websocket/contract/public/Order-Book-Channel),
+[Classic positions](https://www.bitget.com/docs/classic/websocket/contract/private/Positions-Channel),
 [Classic futures amendments](https://www.bitget.com/api-doc/classic/contract/trade/Modify-Order),
 [Spot plans](https://www.bitget.com/api-doc/spot/plan/Get-History-Plan-Order),
 [futures plans](https://www.bitget.com/api-doc/classic/contract/plan/orders-plan-history).

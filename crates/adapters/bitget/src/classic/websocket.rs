@@ -20,9 +20,10 @@ use serde_json::{Value, json};
 
 use crate::{
     common::enums::BitgetProductType,
+    http::models::BitgetFill,
     websocket::{
         error::BitgetWsResult,
-        messages::{BitgetWsArg, BitgetWsMessage},
+        messages::{BitgetWsArg, BitgetWsMessage, BitgetWsOrderData},
     },
 };
 
@@ -35,6 +36,67 @@ struct ClassicArg {
     inst_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     coin: Option<String>,
+}
+
+/// Classic sends its latest execution alongside the order's cumulative state.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BitgetClassicOrderData {
+    #[serde(flatten)]
+    pub order: BitgetWsOrderData,
+    #[serde(default)]
+    trade_id: Option<String>,
+    #[serde(default)]
+    fill_price: Option<String>,
+    #[serde(default)]
+    base_volume: Option<String>,
+    #[serde(default)]
+    fill_time: Option<String>,
+    #[serde(default)]
+    fill_fee: Option<String>,
+    #[serde(default)]
+    fill_fee_coin: Option<String>,
+    #[serde(default)]
+    trade_scope: Option<String>,
+}
+
+impl BitgetClassicOrderData {
+    pub(crate) fn latest_fill(&self) -> Option<BitgetFill> {
+        use rust_decimal::Decimal;
+
+        let trade_id = self.trade_id.as_deref()?.trim();
+        if trade_id.is_empty() || trade_id == "0" {
+            return None;
+        }
+        // New/cancel pushes can have empty or zero execution placeholders.
+        if self.base_volume.as_deref().is_none_or(|quantity| {
+            quantity.trim().is_empty()
+                || quantity
+                    .trim()
+                    .parse::<Decimal>()
+                    .is_ok_and(|q| q.is_zero())
+        }) {
+            return None;
+        }
+        Some(BitgetFill {
+            symbol: self.order.symbol.clone(),
+            product_type: self.order.product_type.clone(),
+            order_id: self.order.order_id.clone(),
+            client_oid: self.order.client_oid.clone(),
+            trade_id: Some(trade_id.to_string()),
+            side: self.order.side.clone(),
+            trade_side: self.order.trade_side.clone(),
+            margin_coin: self.order.margin_coin.clone(),
+            price: self.fill_price.clone(),
+            size: self.base_volume.clone(),
+            fee: self.fill_fee.clone(),
+            fee_coin: self.fill_fee_coin.clone(),
+            trade_scope: self.trade_scope.clone(),
+            c_time: self.fill_time.clone(),
+            // feeDetail is cumulative for the order; use the latest fillFee above.
+            ..Default::default()
+        })
+    }
 }
 
 pub(crate) fn command(
@@ -78,11 +140,60 @@ fn rename(value: &mut Value, from: &str, to: &str) {
     }
 }
 
+fn rename_first(value: &mut Value, to: &str, aliases: &[&str]) {
+    fn present(value: &Value) -> bool {
+        !value.is_null() && value.as_str().is_none_or(|s| !s.trim().is_empty())
+    }
+
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    if map.get(to).is_some_and(present) {
+        return;
+    }
+    for alias in aliases {
+        if map.get(*alias).is_some_and(present) {
+            let field = map.remove(*alias).expect("alias checked above");
+            map.insert(to.to_string(), field);
+            return;
+        }
+    }
+}
+
+fn normalize_fill(row: &mut Value) {
+    for (to, aliases) in [
+        ("symbol", &["instId"][..]),
+        ("clientOid", &["clientOId"][..]),
+        ("execId", &["tradeId", "fillId"][..]),
+        ("execPrice", &["fillPrice", "price", "priceAvg"][..]),
+        ("execQty", &["baseVolume", "size"][..]),
+        ("execValue", &["quoteVolume", "amount"][..]),
+        ("execTime", &["fillTime", "cTime", "ts"][..]),
+        ("fee", &["fillFee"][..]),
+        ("feeCoin", &["fillFeeCoin"][..]),
+    ] {
+        rename_first(row, to, aliases);
+    }
+    // The Classic Spot fill example uses "marker" for the documented maker role.
+    if row.get("tradeScope").and_then(Value::as_str) == Some("marker") {
+        row["tradeScope"] = json!("maker");
+    }
+}
+
 fn string_field(value: &mut Value, name: &str) {
     if let Some(field) = value.get_mut(name)
         && field.is_number()
     {
         *field = Value::String(field.to_string());
+    }
+}
+
+fn integer_field(value: &mut Value, name: &str) {
+    if let Some(field) = value.get_mut(name)
+        && let Some(raw) = field.as_str()
+        && let Ok(number) = raw.parse::<i64>()
+    {
+        *field = json!(number);
     }
 }
 
@@ -132,12 +243,24 @@ pub(crate) fn parse(text: &str) -> BitgetWsResult<BitgetWsMessage> {
                 super::models::normalize_fee_detail(detail)?;
             }
             match topic {
+                "books" | "books1" | "books5" | "books50" => {
+                    rename_first(row, "a", &["asks"]);
+                    rename_first(row, "b", &["bids"]);
+                    string_field(row, "ts");
+                    for key in ["seq", "pseq"] {
+                        integer_field(row, key);
+                    }
+                }
                 "order" | "strategy-order" => {
+                    // Spot's newSize uses base units for limit orders, whereas size
+                    // on a buy-side push can be denominated in the quote currency.
+                    rename_first(row, "qty", &["newSize", "size"]);
+                    rename_first(row, "orderType", &["ordType"]);
+                    rename_first(row, "clientOid", &["clientOId"]);
                     for (from, to) in [
                         ("instId", "symbol"),
                         ("status", "orderStatus"),
                         ("planStatus", "orderStatus"),
-                        ("size", "qty"),
                         ("accBaseVolume", "cumExecQty"),
                         ("priceAvg", "avgPrice"),
                         ("force", "timeInForce"),
@@ -159,7 +282,9 @@ pub(crate) fn parse(text: &str) -> BitgetWsResult<BitgetWsMessage> {
                             row["timeInForce"] = json!("gtc");
                         }
                         match row.get("orderStatus").and_then(Value::as_str) {
-                            Some("executed") => row["orderStatus"] = json!("triggered"),
+                            Some("executing" | "executed") => {
+                                row["orderStatus"] = json!("triggered");
+                            }
                             Some("fail_execute") => row["orderStatus"] = json!("canceled"),
                             _ => {}
                         }
@@ -169,40 +294,14 @@ pub(crate) fn parse(text: &str) -> BitgetWsResult<BitgetWsMessage> {
                     }
                 }
                 "fill" => {
-                    for (from, to) in [
-                        ("instId", "symbol"),
-                        ("tradeId", "execId"),
-                        ("price", "execPrice"),
-                        ("baseVolume", "execQty"),
-                        ("quoteVolume", "execValue"),
-                        ("cTime", "execTime"),
-                        ("ts", "execTime"),
-                    ] {
-                        rename(row, from, to);
-                    }
-                    if row.get("execTime").is_none() {
-                        rename(row, "fillTime", "execTime");
-                    }
-                    if row.get("execPrice").is_none() {
-                        rename(row, "fillPrice", "execPrice");
-                    }
-                    if row.get("fee").is_none() {
-                        rename(row, "fillFee", "fee");
-                    }
-                    if row.get("feeCoin").is_none() {
-                        rename(row, "fillFeeCoin", "feeCoin");
-                    }
-                    if row.get("execQty").is_none() {
-                        rename(row, "size", "execQty");
-                    }
-                    if row.get("execId").is_none() {
-                        rename(row, "fillId", "execId");
-                    }
+                    normalize_fill(row);
                     if let Some(product) = product {
                         row["category"] = json!(product.as_api_str());
                     }
                 }
                 "position" => {
+                    // Classic documents leverage as a number in position pushes.
+                    string_field(row, "leverage");
                     for (from, to) in [
                         ("instId", "symbol"),
                         ("holdSide", "posSide"),
@@ -222,7 +321,6 @@ pub(crate) fn parse(text: &str) -> BitgetWsResult<BitgetWsMessage> {
                 }
                 "account" => {
                     for (from, to) in [
-                        ("frozen", "locked"),
                         ("equity", "totalEquity"),
                         ("unrealizedPL", "unrealisedPnL"),
                         ("cTime", "createdTime"),
@@ -268,10 +366,12 @@ pub(crate) fn parse(text: &str) -> BitgetWsResult<BitgetWsMessage> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::websocket::messages::{
-        BitgetPublicTradeData, BitgetTickerData, BitgetWsAccountData, BitgetWsFillData,
-        BitgetWsOrderData, BitgetWsPositionData,
+        BitgetBookData, BitgetPublicTradeData, BitgetTickerData, BitgetWsAccountData,
+        BitgetWsFillData, BitgetWsOrderData, BitgetWsPositionData,
     };
 
     fn row(channel: &str, product: &str, data: Value) -> Value {
@@ -334,8 +434,121 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(account.coin.as_deref(), Some("USDT"));
-        assert_eq!(account.locked.as_deref(), Some("2"));
+        assert_eq!(account.frozen.as_deref(), Some("2"));
         assert_eq!(account.available_balance.as_deref(), Some("10"));
+    }
+
+    #[rstest]
+    #[case(json!({"priceAvg":"100", "size":"0.2", "amount":"20", "cTime":"1700000000000"}))]
+    #[case(json!({"fillPrice":"100", "baseVolume":"0.2", "quoteVolume":"20", "fillTime":"1700000000000"}))]
+    #[case(json!({"price":null, "fillPrice":"100", "baseVolume":"0.2", "cTime":"1700000000001", "fillTime":"1700000000000", "amount":"20"}))]
+    #[case(json!({"execPrice":" ", "priceAvg":"100", "execQty":null, "size":"0.2", "execValue":"", "amount":"20", "execTime":null, "cTime":"1700000000000"}))]
+    fn classic_spot_fills_normalize_price_quantity_notional_and_time(#[case] data: Value) {
+        let fill: BitgetWsFillData = serde_json::from_value(row("fill", "SPOT", data)).unwrap();
+
+        assert_eq!(fill.price.as_deref(), Some("100"));
+        assert_eq!(fill.size.as_deref(), Some("0.2"));
+        assert_eq!(fill.quote_size.as_deref(), Some("20"));
+        assert_eq!(fill.c_time.as_deref(), Some("1700000000000"));
+    }
+
+    #[test]
+    fn classic_fill_aliases_preserve_canonical_fields_and_prefer_execution_details() {
+        let fill: BitgetWsFillData = serde_json::from_value(row(
+            "fill",
+            "SPOT",
+            json!({
+                "execPrice":"101", "fillPrice":"100", "price":"99", "priceAvg":"98",
+                "execQty":"0.2", "baseVolume":"0.3", "size":"1",
+                "execValue":"20.2", "quoteVolume":"30", "amount":"99",
+                "execTime":"1700000000000", "fillTime":"1700000000001",
+                "cTime":"1700000000002", "ts":"1700000000003"
+            }),
+        ))
+        .unwrap();
+        assert_eq!(fill.price.as_deref(), Some("101"));
+        assert_eq!(fill.size.as_deref(), Some("0.2"));
+        assert_eq!(fill.quote_size.as_deref(), Some("20.2"));
+        assert_eq!(fill.c_time.as_deref(), Some("1700000000000"));
+
+        let fill: BitgetWsFillData = serde_json::from_value(row(
+            "fill",
+            "SPOT",
+            json!({"fillPrice":"101", "price":"100", "priceAvg":"99", "cTime":"1700000000000", "ts":"1700000000001"}),
+        ))
+        .unwrap();
+        assert_eq!(fill.price.as_deref(), Some("101"));
+        assert_eq!(fill.c_time.as_deref(), Some("1700000000000"));
+    }
+
+    #[test]
+    fn classic_orders_preserve_documented_quantity_type_and_client_id() {
+        let order: BitgetWsOrderData = serde_json::from_value(row(
+            "orders",
+            "SPOT",
+            json!({"newSize":"0.2", "size":"20", "ordType":"limit", "clientOId":"C-1"}),
+        ))
+        .unwrap();
+        assert_eq!(order.size.as_deref(), Some("0.2"));
+        assert_eq!(order.order_type.as_deref(), Some("limit"));
+        assert_eq!(order.client_oid.as_deref(), Some("C-1"));
+    }
+
+    #[test]
+    fn classic_position_push_accepts_documented_numeric_leverage() {
+        let position: BitgetWsPositionData = serde_json::from_value(row(
+            "positions",
+            "USDT-FUTURES",
+            json!({"instId":"BTCUSDT", "holdSide":"short", "total":"0.1", "openPriceAvg":"1900", "leverage":20}),
+        ))
+        .unwrap();
+        assert_eq!(position.leverage.as_deref(), Some("20"));
+        assert_eq!(position.total.as_deref(), Some("0.1"));
+        assert_eq!(position.average_open_price.as_deref(), Some("1900"));
+    }
+
+    #[rstest]
+    #[case("books")]
+    #[case("books1")]
+    #[case("books5")]
+    #[case("books15")]
+    fn classic_orderbook_push_preserves_levels_and_sequence(#[case] channel: &str) {
+        let book: BitgetBookData = serde_json::from_value(row(
+            channel,
+            "SPOT",
+            json!({
+                "asks":[["100.20", "0.4"]], "bids":[["100.10", "0.5"]],
+                "seq":123, "pseq":"122", "ts":1700000000000_i64
+            }),
+        ))
+        .unwrap();
+        assert_eq!(book.asks.len(), 1);
+        assert_eq!(book.bids.len(), 1);
+        assert_eq!(book.asks[0].0, "100.20");
+        assert_eq!(book.bids[0].1, "0.5");
+        assert_eq!(book.seq, Some(123));
+        assert_eq!(book.pseq, Some(122));
+        assert_eq!(book.ts.as_deref(), Some("1700000000000"));
+    }
+
+    #[rstest]
+    #[case("executing")]
+    #[case("executed")]
+    fn classic_trigger_order_status_accepts_execution_states(#[case] status: &str) {
+        let order: BitgetWsOrderData = serde_json::from_value(row(
+            "orders-algo",
+            "USDT-FUTURES",
+            json!({"instId":"BTCUSDT", "status":status, "size":"0.02", "triggerPrice":"27000"}),
+        ))
+        .unwrap();
+        assert_eq!(order.status.as_deref(), Some("triggered"));
+
+        let rest: super::super::models::BitgetOrderStatus = serde_json::from_value(json!({
+            "symbol":"BTCUSDT", "planStatus":status, "size":"0.02", "triggerPrice":"27000"
+        }))
+        .unwrap();
+        let shared: crate::http::models::BitgetOrderStatus = rest.into();
+        assert_eq!(shared.status.as_deref(), Some("triggered"));
     }
 
     #[test]

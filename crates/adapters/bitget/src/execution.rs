@@ -727,7 +727,8 @@ fn ws_account_to_spot_asset(row: BitgetWsAccountData) -> BitgetSpotAsset {
     BitgetSpotAsset {
         coin: row.coin.or(row.margin_coin),
         available: row.available_balance,
-        frozen: row.locked,
+        frozen: row.frozen,
+        locked: row.locked,
         u_time: row.u_time.or(row.c_time),
         ..Default::default()
     }
@@ -788,6 +789,56 @@ fn dispatch_ws_order(
     emit_order_status_report(status, ctx)
 }
 
+fn dispatch_classic_order(
+    row: crate::classic::websocket::BitgetClassicOrderData,
+    ctx: &BitgetExecutionWsDispatchContext,
+) -> anyhow::Result<bool> {
+    let fill = row.latest_fill();
+    let mut status = ws_order_to_status(row.order);
+    status.is_quote_quantity = ctx.product_type == BitgetProductType::Spot
+        && status
+            .order_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("market"))
+        && status
+            .side
+            .as_deref()
+            .is_some_and(|side| side.eq_ignore_ascii_case("buy"));
+    let instrument = ctx.instrument_for_raw_symbol(status.symbol.as_deref())?;
+    let report = parse_execution_order_report(
+        status,
+        instrument,
+        ctx.account_id,
+        ctx.clock.get_time_ns(),
+        &ctx.http_client,
+        &ctx.emitter,
+    )?;
+    if let Some(fill) = fill {
+        match parse_execution_fill_report(fill, ctx) {
+            Ok(fill_report) => {
+                // Bundle the real execution with its status so reconciliation does
+                // not first infer a fill and lose the trade ID and commission.
+                if let Some(report) = report {
+                    ctx.emitter.send_order_with_fills(report, vec![fill_report]);
+                } else {
+                    ctx.emitter.send_fill_report(fill_report);
+                }
+                return Ok(true);
+            }
+            Err(error) => {
+                if let Some(report) = report {
+                    ctx.emitter.send_order_status_report(report);
+                }
+                return Err(error);
+            }
+        }
+    }
+    if let Some(report) = report {
+        ctx.emitter.send_order_status_report(report);
+    }
+    Ok(false)
+}
+
 fn emit_order_status_report(
     status: BitgetOrderStatus,
     ctx: &BitgetExecutionWsDispatchContext,
@@ -843,9 +894,18 @@ fn dispatch_ws_fill(
 }
 
 fn emit_fill_report(
-    mut fill: BitgetFill,
+    fill: BitgetFill,
     ctx: &BitgetExecutionWsDispatchContext,
 ) -> anyhow::Result<()> {
+    ctx.emitter
+        .send_fill_report(parse_execution_fill_report(fill, ctx)?);
+    Ok(())
+}
+
+fn parse_execution_fill_report(
+    mut fill: BitgetFill,
+    ctx: &BitgetExecutionWsDispatchContext,
+) -> anyhow::Result<FillReport> {
     if ctx.http_client.raw().account_mode() == crate::common::enums::BitgetAccountMode::Classic {
         ctx.http_client
             .raw()
@@ -855,9 +915,7 @@ fn emit_fill_report(
             .normalize_fill(&mut fill, &ctx.emitter, ctx.clock.get_time_ns());
     }
     let instrument = ctx.instrument_for_raw_symbol(fill.symbol.as_deref())?;
-    let report = parse_fill_report(&fill, instrument, ctx.account_id, ctx.clock.get_time_ns())?;
-    ctx.emitter.send_fill_report(report);
-    Ok(())
+    parse_fill_report(&fill, instrument, ctx.account_id, ctx.clock.get_time_ns())
 }
 
 fn dispatch_ws_account(
@@ -1190,6 +1248,30 @@ fn handle_bitget_execution_ws_message_with_context(
                 .unwrap_or("<unknown>");
 
             match topic {
+                "order" | "orders"
+                    if ctx.is_some_and(|ctx| {
+                        ctx.http_client.raw().account_mode()
+                            == crate::common::enums::BitgetAccountMode::Classic
+                    }) =>
+                {
+                    let ctx = ctx.expect("Classic context checked above");
+                    let (rows, errors) = decode_private_rows::<
+                        crate::classic::websocket::BitgetClassicOrderData,
+                    >(topic, event.data);
+                    summary.orders = rows.len();
+                    summary.errors += errors;
+                    for row in rows {
+                        match dispatch_classic_order(row, ctx) {
+                            Ok(has_fill) => summary.fills += usize::from(has_fill),
+                            Err(error) => {
+                                summary.errors += 1;
+                                log::error!(
+                                    "Failed to dispatch Bitget Classic order row: {error:?}"
+                                );
+                            }
+                        }
+                    }
+                }
                 "order" | "orders" | "strategy-order" => {
                     let (rows, errors) =
                         decode_private_rows::<BitgetWsOrderData>(topic, event.data);
@@ -1406,6 +1488,8 @@ impl ExecutionClient for BitgetExecutionClient {
                 .subscribe_fills()
                 .await
                 .context("subscribe Bitget fill WebSocket channel")?;
+        }
+        if self.config.product_type == BitgetProductType::UsdtFutures {
             self.ws_client
                 .subscribe_positions()
                 .await
@@ -2183,21 +2267,22 @@ mod tests {
         routing::get,
     };
     use futures_util::{SinkExt, StreamExt};
-    use nautilus_common::messages::{ExecutionEvent, ExecutionReport};
-    use nautilus_common::testing::wait_until_async;
+    use nautilus_common::{
+        messages::{ExecutionEvent, ExecutionReport},
+        testing::wait_until_async,
+    };
     use nautilus_core::UnixNanos;
     use nautilus_model::{enums::AccountType, events::OrderEventAny, identifiers::TraderId};
     use nautilus_network::websocket::{TEXT_PING, TEXT_PONG, TransportBackend};
     use rstest::rstest;
     use serde_json::{Value, json};
 
+    use super::*;
     use crate::{
         common::{enums::BitgetEnvironment, parse::parse_usdt_perp_instrument},
         http::models::BitgetMixContract,
         websocket::messages::{BitgetWsArg, BitgetWsEvent},
     };
-
-    use super::*;
 
     const TEST_TS: UnixNanos = UnixNanos::new(1_700_000_000_000_000_000);
 
@@ -3163,6 +3248,491 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    fn classic_spot_test_context() -> (
+        BitgetExecutionWsDispatchContext,
+        tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    ) {
+        use crate::{common::parse::parse_spot_instrument, http::models::BitgetSpotSymbol};
+
+        let definition = BitgetSpotSymbol {
+            symbol: "BTCUSDT".into(),
+            base_coin: "BTC".into(),
+            quote_coin: "USDT".into(),
+            min_trade_amount: Some("0.000001".into()),
+            max_trade_amount: Some("100".into()),
+            min_trade_usdt: Some("5".into()),
+            maker_fee_rate: Some("0.001".into()),
+            taker_fee_rate: Some("0.001".into()),
+            price_precision: Some("2".into()),
+            quantity_precision: Some("6".into()),
+            quote_precision: Some("2".into()),
+            status: Some("online".into()),
+        };
+        let instrument = parse_spot_instrument(&definition, TEST_TS, TEST_TS).unwrap();
+        let (emitter, rx) = test_emitter();
+        let http = BitgetHttpClient::new(None, 60, None)
+            .unwrap()
+            .with_account_mode(crate::common::enums::BitgetAccountMode::Classic);
+        (
+            BitgetExecutionWsDispatchContext::new(
+                BitgetProductType::Spot,
+                "BITGET-001".into(),
+                get_atomic_clock_realtime(),
+                emitter,
+                http,
+                Some(60),
+                vec![instrument],
+            ),
+            rx,
+        )
+    }
+
+    #[rstest]
+    #[case("priceAvg")]
+    #[case("fillPrice")]
+    #[case("price")]
+    fn classic_spot_fill_wire_message_emits_real_fill_report(#[case] price_field: &str) {
+        let (ctx, mut rx) = classic_spot_test_context();
+        let mut row = json!({
+            "symbol":"BTCUSDT", "orderId":"123", "clientOid":"C-1", "tradeId":"T-1",
+            "side":"buy", "size":"0.2", "amount":"20", "tradeScope":"taker",
+            "feeDetail":{"feeCoin":"BTC", "totalFee":"-0.0001"},
+            "cTime":"1700000000000"
+        });
+        row[price_field] = json!("100");
+        let raw = json!({
+            "arg":{"instType":"SPOT", "channel":"fill", "instId":"default"},
+            "action":"snapshot", "data":[row], "ts":1700000000001_i64
+        });
+        let message = crate::classic::websocket::parse(&raw.to_string()).unwrap();
+        let summary = handle_bitget_execution_ws_message_with_context(message, Some(&ctx));
+        assert_eq!(summary.fills, 1);
+        assert_eq!(summary.errors, 0);
+        let events = drain_execution_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        let ExecutionEvent::Report(ExecutionReport::Fill(report)) = &events[0] else {
+            panic!("expected fill report, got {:?}", events[0]);
+        };
+        assert_eq!(report.instrument_id.to_string(), "BTCUSDT.BITGET");
+        assert_eq!(report.trade_id.to_string(), "T-1");
+        assert_eq!(report.client_order_id.unwrap().to_string(), "C-1");
+        assert_eq!(report.last_px.to_string(), "100.00");
+        assert_eq!(report.last_qty.to_string(), "0.200000");
+        assert_eq!(
+            report.commission.as_decimal(),
+            rust_decimal::Decimal::new(1, 4)
+        );
+        assert_eq!(report.commission.currency.code.as_str(), "BTC");
+        assert_eq!(
+            report.liquidity_side,
+            nautilus_model::enums::LiquiditySide::Taker
+        );
+        assert_eq!(report.ts_event, TEST_TS);
+    }
+
+    #[test]
+    fn classic_spot_fill_without_execution_price_is_rejected() {
+        let (ctx, mut rx) = classic_spot_test_context();
+        let raw = json!({
+            "arg":{"instType":"SPOT", "channel":"fill", "instId":"default"},
+            "action":"snapshot", "data":[{
+                "symbol":"BTCUSDT", "orderId":"123", "tradeId":"T-1",
+                "side":"buy", "size":"0.2", "price":null, "priceAvg":" "
+            }]
+        });
+        let message = crate::classic::websocket::parse(&raw.to_string()).unwrap();
+        let summary = handle_bitget_execution_ws_message_with_context(message, Some(&ctx));
+        assert_eq!(summary.errors, 1);
+        assert!(drain_execution_events(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn classic_spot_documented_fill_batch_preserves_individual_executions() {
+        let (ctx, mut rx) = classic_spot_test_context();
+        // https://www.bitget.com/docs/classic/websocket/spot/private/Fill-Channel
+        let raw = json!({
+            "action":"snapshot",
+            "arg":{"instType":"SPOT", "channel":"fill", "instId":"default"},
+            "data":[
+                {
+                    "orderId":"111", "tradeId":"111", "symbol":"BTCUSDT",
+                    "orderType":"limit", "side":"buy", "priceAvg":"42740.41",
+                    "size":"0.0006", "amount":"25.644246", "tradeScope":"marker",
+                    "feeDetail":[{"feeCoin":"USDT", "deduction":"no", "totalDeductionFee":"0", "totalFee":"0.01538655"}],
+                    "cTime":"1703580202094", "uTime":"1703580202094"
+                },
+                {
+                    "orderId":"111", "tradeId":"222", "symbol":"BTCUSDT",
+                    "orderType":"limit", "side":"buy", "priceAvg":"42741.46",
+                    "size":"0.0006", "amount":"25.644876", "tradeScope":"marker",
+                    "feeDetail":[{"feeCoin":"USDT", "deduction":"no", "totalDeductionFee":"0", "totalFee":"0.01538693"}],
+                    "cTime":"1703580202094", "uTime":"1703580202094"
+                }
+            ],
+            "ts":1703580202416_i64
+        });
+        let message = crate::classic::websocket::parse(&raw.to_string()).unwrap();
+        let summary = handle_bitget_execution_ws_message_with_context(message, Some(&ctx));
+        assert_eq!(summary.fills, 2);
+        assert_eq!(summary.errors, 0);
+        let events = drain_execution_events(&mut rx);
+        assert_eq!(events.len(), 2);
+        for (event, (trade_id, price, fee)) in events.iter().zip([
+            ("111", "42740.41", rust_decimal::Decimal::new(1538655, 8)),
+            ("222", "42741.46", rust_decimal::Decimal::new(1538693, 8)),
+        ]) {
+            let ExecutionEvent::Report(ExecutionReport::Fill(report)) = event else {
+                panic!("expected fill report");
+            };
+            assert_eq!(report.trade_id.as_str(), trade_id);
+            assert_eq!(report.last_px.to_string(), price);
+            assert_eq!(report.last_qty.to_string(), "0.000600");
+            assert_eq!(report.commission.as_decimal(), fee);
+            assert_eq!(report.commission.currency.code.as_str(), "USDT");
+            assert_eq!(
+                report.liquidity_side,
+                nautilus_model::enums::LiquiditySide::Maker
+            );
+            assert_eq!(report.ts_event.as_u64(), 1703580202094 * 1_000_000);
+        }
+    }
+
+    #[rstest]
+    #[case("2", "3", 5)]
+    #[case("2", "0", 2)]
+    #[case("0", "3", 3)]
+    fn classic_spot_account_preserves_frozen_and_locked_balances(
+        #[case] frozen: &str,
+        #[case] locked: &str,
+        #[case] total_locked: i64,
+    ) {
+        let (ctx, mut rx) = classic_spot_test_context();
+        let raw = json!({
+            "arg":{"instType":"SPOT", "channel":"account", "coin":"default"},
+            "action":"snapshot", "data":[{
+                "coin":"USDT", "available":"10", "frozen":frozen, "locked":locked,
+                "limitAvailable":"0", "uTime":"1700000000000"
+            }], "ts":1700000000001_i64
+        });
+        let message = crate::classic::websocket::parse(&raw.to_string()).unwrap();
+        let summary = handle_bitget_execution_ws_message_with_context(message, Some(&ctx));
+        assert_eq!(summary.accounts, 1);
+        assert_eq!(summary.errors, 0);
+        let events = drain_execution_events(&mut rx);
+        let ExecutionEvent::Account(state) = &events[0] else {
+            panic!("expected account state");
+        };
+        assert_eq!(state.balances.len(), 1);
+        let balance = &state.balances[0];
+        assert_eq!(balance.free.as_decimal(), rust_decimal::Decimal::new(10, 0));
+        assert_eq!(
+            balance.locked.as_decimal(),
+            rust_decimal::Decimal::new(total_locked, 0)
+        );
+        assert_eq!(
+            balance.total.as_decimal(),
+            rust_decimal::Decimal::new(10 + total_locked, 0)
+        );
+    }
+
+    fn classic_spot_order_message(row: &serde_json::Value) -> BitgetWsMessage {
+        let raw = json!({
+            "arg":{"instType":"SPOT", "channel":"orders", "instId":"default"},
+            "action":"snapshot", "data":[row], "ts":1700000000002_i64
+        });
+        crate::classic::websocket::parse(&raw.to_string()).unwrap()
+    }
+
+    #[test]
+    fn classic_spot_order_bundles_latest_fill_with_cumulative_status() {
+        let (ctx, mut rx) = classic_spot_test_context();
+        let message = classic_spot_order_message(&json!({
+            "instId":"BTCUSDT", "orderId":"123", "clientOid":"C-1",
+            "side":"buy", "orderType":"limit", "force":"gtc",
+            "status":"partially_filled", "price":"100", "size":"100", "newSize":"1",
+            "accBaseVolume":"0.5", "priceAvg":"99.5",
+            "tradeId":"T-2", "fillPrice":"101", "baseVolume":"0.2",
+            "fillFee":"-0.0002", "fillFeeCoin":"BTC", "tradeScope":"M",
+            "feeDetail":[{"feeCoin":"BTC", "fee":"-0.0005"}],
+            "fillTime":"1700000000001", "cTime":"1700000000000", "uTime":"1700000000002"
+        }));
+        let summary = handle_bitget_execution_ws_message_with_context(message, Some(&ctx));
+        assert_eq!(summary.orders, 1);
+        assert_eq!(summary.fills, 1);
+        assert_eq!(summary.errors, 0);
+        let events = drain_execution_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        let ExecutionEvent::Report(ExecutionReport::OrderWithFills(order, fills)) = &events[0]
+        else {
+            panic!("expected bundled order and fill, got {:?}", events[0]);
+        };
+        assert_eq!(
+            order.order_status,
+            nautilus_model::enums::OrderStatus::PartiallyFilled
+        );
+        assert_eq!(order.quantity.to_string(), "1.000000");
+        assert_eq!(order.filled_qty.to_string(), "0.500000");
+        assert_eq!(order.avg_px.unwrap().to_string(), "99.5");
+        assert!(!order.is_quote_quantity);
+        assert_eq!(fills.len(), 1);
+        let fill = &fills[0];
+        assert_eq!(fill.trade_id.to_string(), "T-2");
+        assert_eq!(fill.client_order_id, order.client_order_id);
+        assert_eq!(fill.venue_order_id, order.venue_order_id);
+        assert_eq!(fill.last_px.to_string(), "101.00");
+        assert_eq!(fill.last_qty.to_string(), "0.200000");
+        assert_eq!(
+            fill.commission.as_decimal(),
+            rust_decimal::Decimal::new(2, 4)
+        );
+        assert_eq!(fill.commission.currency.code.as_str(), "BTC");
+        assert_eq!(
+            fill.liquidity_side,
+            nautilus_model::enums::LiquiditySide::Maker
+        );
+        assert_eq!(fill.ts_event.as_u64(), 1700000000001 * 1_000_000);
+    }
+
+    #[test]
+    fn classic_futures_order_bundles_latest_execution_in_base_units() {
+        let (ctx, mut rx) = classic_test_context();
+        let raw = json!({
+            "arg":{"instType":"USDT-FUTURES", "channel":"orders", "instId":"default"},
+            "action":"snapshot", "data":[{
+                "instId":"BTCUSDT", "orderId":"123", "clientOid":"C-1",
+                "side":"buy", "tradeSide":"open", "orderType":"market",
+                "status":"partially_filled", "size":"1", "accBaseVolume":"0.2",
+                "priceAvg":"100", "tradeId":"T-1", "fillPrice":"100",
+                "baseVolume":"0.2", "fillFee":"-0.01", "fillFeeCoin":"USDT", "tradeScope":"T",
+                "fillTime":"1700000000001", "cTime":"1700000000000", "uTime":"1700000000001"
+            }], "ts":1700000000002_i64
+        });
+        let message = crate::classic::websocket::parse(&raw.to_string()).unwrap();
+        let summary = handle_bitget_execution_ws_message_with_context(message, Some(&ctx));
+        assert_eq!(summary.orders, 1);
+        assert_eq!(summary.fills, 1);
+        assert_eq!(summary.errors, 0);
+        let events = drain_execution_events(&mut rx);
+        let ExecutionEvent::Report(ExecutionReport::OrderWithFills(order, fills)) = &events[0]
+        else {
+            panic!("expected bundled order and fill");
+        };
+        assert!(!order.is_quote_quantity);
+        assert_eq!(order.quantity.to_string(), "1.000");
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].instrument_id.to_string(), "BTCUSDT-PERP.BITGET");
+        assert_eq!(fills[0].last_qty.to_string(), "0.200");
+        assert_eq!(fills[0].last_px.to_string(), "100.0");
+        assert_eq!(
+            fills[0].commission.as_decimal(),
+            rust_decimal::Decimal::new(1, 2)
+        );
+    }
+
+    #[rstest]
+    #[case(json!({}))]
+    #[case(json!({"tradeId":"0", "fillPrice":"0", "baseVolume":"0"}))]
+    #[case(json!({"tradeId":"", "fillPrice":"", "baseVolume":""}))]
+    #[case(json!({"tradeId":"T-1", "baseVolume":"0.000000"}))]
+    fn classic_spot_order_without_new_execution_emits_status_only(
+        #[case] execution: serde_json::Value,
+    ) {
+        let (ctx, mut rx) = classic_spot_test_context();
+        let mut row = json!({
+            "instId":"BTCUSDT", "orderId":"123", "side":"buy", "orderType":"limit",
+            "status":"live", "price":"100", "size":"1", "accBaseVolume":"0"
+        });
+        row.as_object_mut()
+            .unwrap()
+            .extend(execution.as_object().unwrap().clone());
+        let summary = handle_bitget_execution_ws_message_with_context(
+            classic_spot_order_message(&row),
+            Some(&ctx),
+        );
+        assert_eq!(summary.orders, 1);
+        assert_eq!(summary.fills, 0);
+        assert_eq!(summary.errors, 0);
+        let events = drain_execution_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ExecutionEvent::Report(ExecutionReport::Order(_))
+        ));
+    }
+
+    #[test]
+    fn classic_spot_order_missing_fill_price_preserves_status_without_inventing_fill() {
+        let (ctx, mut rx) = classic_spot_test_context();
+        let message = classic_spot_order_message(&json!({
+            "instId":"BTCUSDT", "orderId":"123", "side":"buy", "orderType":"limit",
+            "status":"partially_filled", "price":"100", "size":"1", "accBaseVolume":"0.2",
+            "priceAvg":"99", "tradeId":"T-1", "baseVolume":"0.2", "fillPrice":null
+        }));
+        let summary = handle_bitget_execution_ws_message_with_context(message, Some(&ctx));
+        assert_eq!(summary.orders, 1);
+        assert_eq!(summary.fills, 0);
+        assert_eq!(summary.errors, 1);
+        let events = drain_execution_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ExecutionEvent::Report(ExecutionReport::Order(_))
+        ));
+    }
+
+    #[rstest]
+    #[case("market", "buy", true)]
+    #[case("market", "sell", false)]
+    #[case("limit", "buy", false)]
+    fn classic_spot_order_reports_preserve_quantity_units(
+        #[case] order_type: &str,
+        #[case] side: &str,
+        #[case] is_quote_quantity: bool,
+    ) {
+        let (ctx, mut rx) = classic_spot_test_context();
+        let message = classic_spot_order_message(&json!({
+            "instId":"BTCUSDT", "orderId":"123", "side":side, "orderType":order_type,
+            "status":"live", "size":"100", "newSize":"100", "accBaseVolume":"0"
+        }));
+        let summary = handle_bitget_execution_ws_message_with_context(message, Some(&ctx));
+        assert_eq!(summary.errors, 0);
+        let events = drain_execution_events(&mut rx);
+        let ExecutionEvent::Report(ExecutionReport::Order(report)) = &events[0] else {
+            panic!("expected order status report");
+        };
+        assert_eq!(report.is_quote_quantity, is_quote_quantity);
+        assert_eq!(report.quantity.to_string(), "100.000000");
+        assert_eq!(report.filled_qty.to_string(), "0.000000");
+
+        let rest_order: crate::classic::models::BitgetOrderStatus = serde_json::from_value(json!({
+            "symbol":"BTCUSDT", "orderId":"123", "side":side, "orderType":order_type,
+            "status":"live", "size":"100", "baseVolume":"0"
+        }))
+        .unwrap();
+        let rest_report = parse_order_status_report(
+            &rest_order.into(),
+            ctx.instrument_for_raw_symbol(Some("BTCUSDT")).unwrap(),
+            ctx.account_id,
+            TEST_TS,
+        )
+        .unwrap();
+        assert_eq!(rest_report.is_quote_quantity, is_quote_quantity);
+        assert_eq!(rest_report.filled_qty, report.filled_qty);
+    }
+
+    #[rstest]
+    #[case("partially_filled", "0.2", Some("100"), "1.000000")]
+    #[case("filled", "0.9", Some("110"), "0.900000")]
+    #[case("filled", "200", Some("0.5"), "200.000000")]
+    #[case("cancelled", "0.2", Some("100"), "1.000000")]
+    #[case("partially_filled", "0.2", None, "0.200000")]
+    fn classic_spot_market_buy_reports_convert_quote_budget_to_base_quantity(
+        #[case] status: &str,
+        #[case] filled: &str,
+        #[case] avg_price: Option<&str>,
+        #[case] expected_quantity: &str,
+    ) {
+        let (ctx, mut rx) = classic_spot_test_context();
+        let message = classic_spot_order_message(&json!({
+            "instId":"BTCUSDT", "orderId":"123", "side":"buy", "orderType":"market",
+            "status":status, "size":"100", "newSize":"100",
+            "accBaseVolume":filled, "priceAvg":avg_price
+        }));
+        let summary = handle_bitget_execution_ws_message_with_context(message, Some(&ctx));
+        assert_eq!(summary.errors, 0);
+        let events = drain_execution_events(&mut rx);
+        let ExecutionEvent::Report(ExecutionReport::Order(report)) = &events[0] else {
+            panic!("expected order status report");
+        };
+        assert!(!report.is_quote_quantity);
+        assert_eq!(report.quantity.to_string(), expected_quantity);
+
+        let rest_order: crate::classic::models::BitgetOrderStatus = serde_json::from_value(json!({
+            "symbol":"BTCUSDT", "orderId":"123", "side":"buy", "orderType":"market",
+            "status":status, "size":"100", "baseVolume":filled, "priceAvg":avg_price
+        }))
+        .unwrap();
+        let rest_report = parse_order_status_report(
+            &rest_order.into(),
+            ctx.instrument_for_raw_symbol(Some("BTCUSDT")).unwrap(),
+            ctx.account_id,
+            TEST_TS,
+        )
+        .unwrap();
+        assert!(!rest_report.is_quote_quantity);
+        assert_eq!(rest_report.quantity, report.quantity);
+        assert_eq!(rest_report.filled_qty, report.filled_qty);
+    }
+
+    #[test]
+    fn classic_spot_filled_market_buy_requires_actual_base_quantity() {
+        let (ctx, mut rx) = classic_spot_test_context();
+        let message = classic_spot_order_message(&json!({
+            "instId":"BTCUSDT", "orderId":"123", "side":"buy", "orderType":"market",
+            "status":"filled", "size":"100", "accBaseVolume":"0", "priceAvg":"100"
+        }));
+        let summary = handle_bitget_execution_ws_message_with_context(message, Some(&ctx));
+        assert_eq!(summary.errors, 1);
+        assert!(drain_execution_events(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn classic_spot_filled_market_buy_bundles_matching_base_quantities() {
+        let (ctx, mut rx) = classic_spot_test_context();
+        let message = classic_spot_order_message(&json!({
+            "instId":"BTCUSDT", "orderId":"123", "clientOid":"C-1", "side":"buy",
+            "orderType":"market", "status":"filled", "size":"100", "newSize":"100",
+            "accBaseVolume":"0.5", "priceAvg":"200", "fillPrice":"200",
+            "tradeId":"T-1", "baseVolume":"0.5", "fillFee":"-0.0001",
+            "fillFeeCoin":"BTC", "tradeScope":"T", "fillTime":"1700000000001"
+        }));
+        let summary = handle_bitget_execution_ws_message_with_context(message, Some(&ctx));
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.fills, 1);
+        let events = drain_execution_events(&mut rx);
+        let ExecutionEvent::Report(ExecutionReport::OrderWithFills(order, fills)) = &events[0]
+        else {
+            panic!("expected bundled order and fill");
+        };
+        assert_eq!(
+            order.order_status,
+            nautilus_model::enums::OrderStatus::Filled
+        );
+        assert_eq!(order.quantity.to_string(), "0.500000");
+        assert!(!order.is_quote_quantity);
+        assert_eq!(order.quantity, order.filled_qty);
+        assert_eq!(fills[0].last_qty, order.quantity);
+        assert_eq!(fills[0].last_px.to_string(), "200.00");
+    }
+
+    #[test]
+    fn uta_order_reports_keep_existing_quantity_interpretation() {
+        let (mut ctx, mut rx) = classic_spot_test_context();
+        ctx.http_client = BitgetHttpClient::new(None, 60, None).unwrap();
+        let message = BitgetWsMessage::parse_text(
+            &json!({
+                "arg":{"instType":"UTA", "topic":"order"},
+                "action":"snapshot", "data":[{
+                    "category":"spot", "symbol":"BTCUSDT", "orderId":"123",
+                    "side":"buy", "orderType":"market", "orderStatus":"filled",
+                    "qty":"0.5", "cumExecQty":"0.5", "avgPrice":"200"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let summary = handle_bitget_execution_ws_message_with_context(message, Some(&ctx));
+        assert_eq!(summary.orders, 1);
+        assert_eq!(summary.errors, 0);
+        let events = drain_execution_events(&mut rx);
+        let ExecutionEvent::Report(ExecutionReport::Order(report)) = &events[0] else {
+            panic!("expected order status report");
+        };
+        assert!(!report.is_quote_quantity);
+        assert_eq!(report.quantity.to_string(), "0.500000");
+        assert_eq!(report.quantity, report.filled_qty);
     }
 
     fn classic_test_status(id: &str, client: &str, status: &str) -> BitgetOrderStatus {
