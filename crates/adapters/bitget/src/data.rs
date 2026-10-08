@@ -2787,8 +2787,11 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
     #[tokio::test]
-    async fn books_ws_dispatch_emits_depth10_when_requested() {
+    async fn books_ws_dispatch_emits_depth10_when_requested(#[case] classic: bool) {
         let http = BitgetHttpClient::new_with_env(
             None,
             None,
@@ -2813,25 +2816,40 @@ mod tests {
         instruments.insert(instrument_id, instrument);
         book_subs.insert(instrument_id, [BOOK_SUB_DEPTH10].into_iter().collect());
 
-        let message = BitgetWsMessage::Data(crate::websocket::messages::BitgetWsEvent {
-            event: None,
-            action: Some("snapshot".to_string()),
-            arg: Some(BitgetWsArg::new(
-                BitgetProductType::Spot,
-                "books",
-                Some("BTCUSDT".to_string()),
-            )),
-            data: vec![json!({
-                "b": [["100.00", "1.000000"], ["99.00", "3.000000"]],
-                "a": [["101.00", "2.000000"]],
-                "seq": 42,
-                "pseq": 0,
-                "ts": "1700000000000"
-            })],
-            ts: None,
-            code: None,
-            msg: None,
-        });
+        let message = if classic {
+            crate::classic::websocket::parse(
+                &json!({
+                    "arg":{"instType":"SPOT", "channel":"books", "instId":"BTCUSDT"},
+                    "action":"snapshot", "data":[{
+                        "bids":[["100.00", "1.000000"], ["99.00", "3.000000"]],
+                        "asks":[["101.00", "2.000000"]],
+                        "seq":42, "pseq":"0", "ts":"1700000000000"
+                    }]
+                })
+                .to_string(),
+            )
+            .unwrap()
+        } else {
+            BitgetWsMessage::Data(crate::websocket::messages::BitgetWsEvent {
+                event: None,
+                action: Some("snapshot".to_string()),
+                arg: Some(BitgetWsArg::new(
+                    BitgetProductType::Spot,
+                    "books",
+                    Some("BTCUSDT".to_string()),
+                )),
+                data: vec![json!({
+                    "b": [["100.00", "1.000000"], ["99.00", "3.000000"]],
+                    "a": [["101.00", "2.000000"]],
+                    "seq": 42,
+                    "pseq": 0,
+                    "ts": "1700000000000"
+                })],
+                ts: None,
+                code: None,
+                msg: None,
+            })
+        };
 
         handle_bitget_ws_message(
             message,

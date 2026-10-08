@@ -603,7 +603,10 @@ pub struct BitgetWsAccountData {
     /// Available balance.
     #[serde(default, rename = "available")]
     pub available_balance: Option<String>,
-    /// Frozen/locked amount.
+    /// Frozen amount for pending Classic Spot orders.
+    #[serde(default)]
+    pub frozen: Option<String>,
+    /// Locked amount.
     #[serde(default, rename = "locked")]
     pub locked: Option<String>,
     /// Futures equity.
@@ -638,6 +641,8 @@ struct BitgetWsAccountDataRaw {
     margin_coin: Option<String>,
     #[serde(default, rename = "available")]
     available_balance: Option<String>,
+    #[serde(default)]
+    frozen: Option<String>,
     #[serde(default, rename = "locked")]
     locked: Option<String>,
     #[serde(default, rename = "totalEquity")]
@@ -686,6 +691,7 @@ impl<'de> Deserialize<'de> for BitgetWsAccountData {
             margin_coin: raw.margin_coin,
             assets,
             available_balance: raw.available_balance,
+            frozen: raw.frozen,
             locked: raw.locked,
             account_equity: raw.account_equity,
             usdt_equity: raw.usdt_equity,

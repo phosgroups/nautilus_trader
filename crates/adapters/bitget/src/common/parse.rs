@@ -38,8 +38,10 @@ use nautilus_model::{
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, QUANTITY_MAX, Quantity},
 };
-use rust_decimal::Decimal;
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::{
+    Decimal,
+    prelude::{FromPrimitive, ToPrimitive},
+};
 
 use crate::{
     common::{enums::BitgetProductType, symbol::BitgetSymbol},
@@ -904,7 +906,7 @@ pub fn parse_order_status_report(
 
     let quantity_raw =
         optional_str([order.size.as_ref()]).context("Bitget order status missing qty")?;
-    let quantity =
+    let mut quantity =
         parse_quantity_with_precision(quantity_raw, instrument.size_precision(), "order.size")?;
     let filled_qty_raw = optional_str([
         order.filled_size.as_ref(),
@@ -921,8 +923,46 @@ pub fn parse_order_status_report(
     let status_raw =
         optional_str([order.status.as_ref()]).context("Bitget order status missing status")?;
     let order_status = parse_order_status(status_raw, filled_qty)?;
+    let mut is_quote_quantity = order.is_quote_quantity
+        && matches!(instrument, InstrumentAny::CurrencyPair(_))
+        && order_type == OrderType::Market
+        && order_side == OrderSide::Buy;
+    let avg_px = optional_str([order.avg_price.as_ref(), order.price_avg.as_ref()])
+        .map(|value| {
+            Decimal::from_str(value)
+                .with_context(|| format!("invalid decimal order.avgPrice: {value:?}"))
+        })
+        .transpose()?
+        .filter(|price| !price.is_zero());
     if order_status == OrderStatus::Filled && filled_qty.is_zero() {
+        anyhow::ensure!(
+            !is_quote_quantity,
+            "Bitget filled market buy missing base filled quantity"
+        );
         filled_qty = quantity;
+    }
+    if is_quote_quantity && filled_qty.is_positive() {
+        // Reconciliation applies base fills to an order in base units. Keep an
+        // unfilled market buy's quote budget, then convert once execution data
+        // exists. The terminal quantity must be the actual base fill, not the
+        // original quote budget or an estimate from its average execution price.
+        quantity = if order_status == OrderStatus::Filled {
+            filled_qty
+        } else if let Some(avg_px) = avg_px {
+            let quote_budget = Decimal::from_str(quantity_raw)?;
+            let base_quantity = quote_budget
+                .checked_div(avg_px)
+                .context("Bitget market buy quantity conversion overflow")?
+                .max(filled_qty.as_decimal());
+            parse_quantity_with_precision(
+                &base_quantity.to_string(),
+                instrument.size_precision(),
+                "order.baseQuantity",
+            )?
+        } else {
+            filled_qty
+        };
+        is_quote_quantity = false;
     }
 
     let ts_updated = optional_millis_timestamp(order.u_time.as_deref(), "order.updatedTime")?;
@@ -956,13 +996,10 @@ pub fn parse_order_status_report(
         )?);
     }
 
-    if let Some(avg_price) = optional_str([order.avg_price.as_ref(), order.price_avg.as_ref()])
-        .filter(|value| *value != "0")
-    {
-        let avg_px = Decimal::from_str(avg_price)
-            .with_context(|| format!("invalid decimal order.avgPrice: {avg_price:?}"))?
+    if let Some(avg_px) = avg_px {
+        let avg_px = avg_px
             .to_f64()
-            .with_context(|| format!("order.avgPrice out of f64 range: {avg_price:?}"))?;
+            .with_context(|| format!("order.avgPrice out of f64 range: {avg_px:?}"))?;
         report = report.with_avg_px(avg_px)?;
     }
 
@@ -976,7 +1013,8 @@ pub fn parse_order_status_report(
 
     Ok(report
         .with_post_only(tif_post_only)
-        .with_reduce_only(parse_bitget_bool(order.reduce_only.as_deref())))
+        .with_reduce_only(parse_bitget_bool(order.reduce_only.as_deref()))
+        .with_is_quote_quantity(is_quote_quantity))
 }
 
 /// Parses a Bitget private fill row into a Nautilus [`FillReport`].

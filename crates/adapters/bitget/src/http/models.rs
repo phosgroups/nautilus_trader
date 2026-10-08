@@ -777,6 +777,9 @@ pub struct BitgetOrderStatus {
     pub price_avg: Option<String>,
     #[serde(default, rename = "qty")]
     pub size: Option<String>,
+    /// Quantity units supplied by the protocol codec rather than the wire payload.
+    #[serde(skip)]
+    pub is_quote_quantity: bool,
     #[serde(default, skip)]
     pub filled_size: Option<String>,
     #[serde(default, skip)]

@@ -880,6 +880,18 @@ impl BitgetOrderStatus {
 
 impl From<BitgetOrderStatus> for shared::BitgetOrderStatus {
     fn from(value: BitgetOrderStatus) -> Self {
+        let is_quote_quantity = value
+            .product_type
+            .as_deref()
+            .is_none_or(|product| product.eq_ignore_ascii_case("SPOT"))
+            && value
+                .order_type
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("market"))
+            && value
+                .side
+                .as_deref()
+                .is_some_and(|side| side.eq_ignore_ascii_case("buy"));
         Self {
             symbol: value.symbol,
             product_type: value.product_type,
@@ -895,6 +907,7 @@ impl From<BitgetOrderStatus> for shared::BitgetOrderStatus {
             avg_price: value.avg_price,
             price_avg: value.price_avg,
             size: value.size,
+            is_quote_quantity,
             filled_size: value.filled_size,
             filled_qty: value.filled_qty,
             cumulative_filled_qty: value.cumulative_filled_qty,
@@ -906,7 +919,7 @@ impl From<BitgetOrderStatus> for shared::BitgetOrderStatus {
                 .force
                 .or_else(|| value.trigger_price.as_ref().map(|_| "gtc".to_string())),
             status: value.status.map(|s| match s.as_str() {
-                "executed" => "triggered".to_string(),
+                "executing" | "executed" => "triggered".to_string(),
                 "fail_execute" => "canceled".to_string(),
                 _ => s,
             }),
