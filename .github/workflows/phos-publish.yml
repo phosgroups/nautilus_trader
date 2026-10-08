@@ -1,13 +1,16 @@
 name: phos-publish
 
-# phos publishes nautilus-trader v2 (python/, maturin) to CodeArtifact (ADR-0015 / ADR-0022, CR-0025).
-# Trigger: push main -> build Linux + macOS -> publish (release environment gate).
+# phos publishes nautilus-trader v2 (python/, maturin) to CodeArtifact (ADR-0015 / ADR-0022, CR-0025;
+# Linux-only per CR-0028).
+# Trigger: push main -> build Linux -> publish (release environment gate).
 # NOTE: This repo is a fork, so GitHub does not allow referencing private actions
 # (phosgroups/phos-actions). Build/publish logic is inlined here.
 # Version = python/pyproject.toml version + VERSION_SUFFIX (repo variable, e.g. +phos)
 #   + .{short-sha}.{run_number} -> unique per run, e.g. 2.0.0rc1+phos.a1b2c3d.42 (PEP 440 local).
 # Publish role: arn:aws:iam::${AWS_ACCOUNT_ID}:role/${AWS_ROLE_NAME} (release env secrets).
 # Region: AWS_REGION (release env secret).
+# macOS builds are intentionally removed (CR-0028): Mac developers build locally
+#   (make build-debug-v2 / maturin develop under python/).
 
 on:
   push:
@@ -33,6 +36,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/build-v2-linux
+      # CR-0028: override fat LTO + codegen-units=1 (release profile) to keep
+      # cold-cache builds under 30 min. thin LTO + parallel codegen are much
+      # faster with a small runtime perf tradeoff; opt-level stays 3.
+      CARGO_PROFILE_RELEASE_LTO: "thin"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v4
 
@@ -161,124 +169,8 @@ jobs:
           path: dist/*.whl
           if-no-files-found: error
 
-  build-macos:
-    # Pin macOS 15: maturin derives the wheel platform tag from the build
-    # environment (MACOSX_DEPLOYMENT_TARGET), so macos-15 + target 15.0 yields
-    # macosx_15_0_arm64 (forward-compatible with newer macOS, ISSUE-0046).
-    runs-on: macos-15
-    env:
-      MACOSX_DEPLOYMENT_TARGET: "15.0"
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/build-v2-macos
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Free disk space (macOS)
-        run: |
-          echo "=== Disk usage before cleanup ==="
-          df -h /
-          sudo rm -rf /Library/Developer/CoreSimulator || true
-          sudo rm -rf ~/Library/Android || true
-          sudo rm -rf /usr/local/share/dotnet || true
-          sudo rm -rf /usr/local/share/powershell || true
-          sudo rm -rf /usr/local/.ghcup || true
-          echo "=== Disk usage after cleanup ==="
-          df -h /
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Get uv version
-        run: echo "UV_VERSION=$(bash scripts/uv-version.sh)" >> "$GITHUB_ENV"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.2.0
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: auto
-          prune-cache: true
-
-      - name: Update Rust toolchain (rustup)
-        run: bash scripts/ci/install-rust.sh
-
-      - name: Get Rust toolchain version
-        run: echo "RUST_TOOLCHAIN=$(bash scripts/rust-toolchain.sh)" >> "$GITHUB_ENV"
-
-      - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          cache: false
-          override: true
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ". -> target/build-v2-macos"
-          key: build-v2-macos
-          cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' }}
-
-      - name: Install Cap'n Proto
-        uses: ./.github/actions/install-capnp
-
-      - name: Update version suffix (python/pyproject.toml)
-        if: ${{ env.VERSION_SUFFIX != '' }}
-        run: |
-          set -euo pipefail
-          current=$(grep '^version = ' python/pyproject.toml | head -1 | cut -d '"' -f2)
-          SHORT_SHA="${GITHUB_SHA::7}"
-          RUN_NUMBER="${{ github.run_number }}"
-          new="${current}${VERSION_SUFFIX}.${SHORT_SHA}.${RUN_NUMBER}"
-          sed -i.bak "s/^version = \".*\"/version = \"${new}\"/" python/pyproject.toml && rm -f python/pyproject.toml.bak
-          echo "Version: ${current} -> ${new}"
-
-      - name: Build wheel (macOS arm64, v2)
-        working-directory: ${{ env.PACKAGE_DIR }}
-        run: |
-          set -euo pipefail
-          MATURIN_VERSION="$(bash ../scripts/maturin-version.bash)"
-          uv run --no-project --no-build --with "maturin==${MATURIN_VERSION}" -- \
-            maturin build --release --out ../dist
-          ls -lh ../dist/
-
-      - name: Verify wheel name (macOS)
-        run: |
-          set -euo pipefail
-          WHL=$(ls dist/nautilus_trader-*.whl | head -1)
-          NAME=$(basename "$WHL")
-          echo "wheel: ${NAME}"
-          case "$NAME" in
-            nautilus_trader-*) ;;
-            *) echo "::error::wheel name does not start with nautilus_trader-"; exit 1 ;;
-          esac
-          EXPECTED_PLAT="macosx_${MACOSX_DEPLOYMENT_TARGET//./_}_arm64"
-          case "$NAME" in
-            *"${EXPECTED_PLAT}"*) echo "platform tag ${EXPECTED_PLAT}: OK" ;;
-            *) echo "::error::expected wheel platform ${EXPECTED_PLAT}, got ${NAME}"; exit 1 ;;
-          esac
-          if [ -n "${VERSION_SUFFIX}" ]; then
-            EXPECTED="${VERSION_SUFFIX//-/.}.${GITHUB_SHA::7}.${{ github.run_number }}"
-            case "$NAME" in
-              *"${EXPECTED}"*) echo "version suffix present: OK" ;;
-              *) echo "::error::expected version to contain ${EXPECTED}, got ${NAME}"; exit 1 ;;
-            esac
-          fi
-
-      - name: Smoke test (v2 API + phos adapters)
-        working-directory: ${{ env.PACKAGE_DIR }}
-        run: bash ../scripts/ci/smoke-test-v2-wheel.sh
-
-      - name: Upload wheel
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheel-macos
-          path: dist/*.whl
-          if-no-files-found: error
-
   publish:
-    needs: [build-linux, build-macos]
+    needs: [build-linux]
     runs-on: ubuntu-latest
     environment: release
     permissions:
