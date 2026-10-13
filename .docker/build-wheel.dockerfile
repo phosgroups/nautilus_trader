@@ -10,8 +10,8 @@
 #
 # The wheel will be written to dist/.
 
-ARG RUST_IMAGE=rust:1.96.0-slim-bookworm
-ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.25@sha256:1e3808aa9023d0980e7c15b1fa7c1ac16ff35925780cf5c459858b2d693f01a9
+ARG RUST_IMAGE=public.ecr.aws/docker/library/rust:1.97.1-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.33@sha256:77280f2f771df71f90786c314fe1bbc1e023feac652969bbf139c280babf2eb7
 
 FROM ${UV_IMAGE} AS uv
 

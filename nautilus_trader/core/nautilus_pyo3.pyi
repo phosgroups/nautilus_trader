@@ -4745,6 +4745,7 @@ class OrderStatusReport:
         cancel_reason: str | None = None,
         ts_triggered: int | None = None,
         report_id: UUID4 | None = None,
+        is_quote_quantity: bool = False,
     ) -> None: ...
     @classmethod
     def from_dict(cls, values: dict[str, str]) -> OrderStatusReport: ...
@@ -4765,6 +4766,8 @@ class OrderStatusReport:
     def order_status(self) -> OrderStatus: ...
     @property
     def quantity(self) -> Quantity: ...
+    @property
+    def is_quote_quantity(self) -> bool: ...
     @property
     def filled_qty(self) -> Quantity: ...
     @property
@@ -9107,10 +9110,12 @@ class BitgetProductType(Enum):
 
 def get_bitget_http_base_url(environment: BitgetEnvironment) -> str: ...
 def get_bitget_ws_url_public(
-    environment: BitgetEnvironment, account_mode: BitgetAccountMode = ...,
+    environment: BitgetEnvironment,
+    account_mode: BitgetAccountMode = ...,
 ) -> str: ...
 def get_bitget_ws_url_private(
-    environment: BitgetEnvironment, account_mode: BitgetAccountMode = ...,
+    environment: BitgetEnvironment,
+    account_mode: BitgetAccountMode = ...,
 ) -> str: ...
 def bitget_extract_raw_symbol(symbol: str) -> str: ...
 def bitget_product_type_from_symbol(symbol: str) -> BitgetProductType: ...
@@ -9142,6 +9147,20 @@ class BitgetHttpClient:
         proxy_url: str | None = None,
         account_mode: BitgetAccountMode = ...,
     ) -> None: ...
+    def parse_execution_ws_event(
+        self,
+        event: dict[str, Any],
+        product_type: BitgetProductType,
+        trader_id: TraderId,
+        account_id: AccountId,
+    ) -> list[
+        OrderStatusReport
+        | FillReport
+        | PositionStatusReport
+        | OrderUpdated
+        | OrderModifyRejected
+        | dict[str, Any]
+    ]: ...
     async def request_instruments(
         self,
         product_type: BitgetProductType,

@@ -38,6 +38,10 @@ PROFILE_MODE = bool(os.getenv("PROFILE_MODE", ""))
 ANNOTATION_MODE = bool(os.getenv("ANNOTATION_MODE", ""))
 # If PARALLEL build is enabled, uses all CPUs for compile stage of build
 PARALLEL_BUILD = os.getenv("PARALLEL_BUILD", "true").lower() == "true"
+# Limit both Cython translation and C extension compilation when requested.
+BUILD_JOBS = int(os.getenv("BUILD_JOBS", str(os.cpu_count() or 1)))
+if BUILD_JOBS < 1:
+    raise ValueError("BUILD_JOBS must be a positive integer")
 # If COPY_TO_SOURCE is enabled, copy built *.so files back into the source tree
 COPY_TO_SOURCE = os.getenv("COPY_TO_SOURCE", "true").lower() == "true"
 # Force stripping of debug symbols even in non-release builds
@@ -335,7 +339,7 @@ def _build_extensions() -> list[Extension]:
 
 
 def _build_distribution(extensions: list[Extension]) -> Distribution:
-    nthreads = os.cpu_count() or 1
+    nthreads = BUILD_JOBS if PARALLEL_BUILD else 1
 
     if IS_WINDOWS:
         nthreads = min(nthreads, 60)
@@ -601,7 +605,7 @@ def build() -> None:
         cmd: build_ext = build_ext(distribution)
 
         if PARALLEL_BUILD:
-            cmd.parallel = os.cpu_count()
+            cmd.parallel = BUILD_JOBS
         cmd.ensure_finalized()
         cmd.run()
 
@@ -641,6 +645,7 @@ if __name__ == "__main__":
     print(f"PROFILE_MODE={PROFILE_MODE}")
     print(f"ANNOTATION_MODE={ANNOTATION_MODE}")
     print(f"PARALLEL_BUILD={PARALLEL_BUILD}")
+    print(f"BUILD_JOBS={BUILD_JOBS}")
     print(f"COPY_TO_SOURCE={COPY_TO_SOURCE}")
     print(f"FORCE_STRIP={FORCE_STRIP}")
     print(f"PYO3_ONLY={PYO3_ONLY}")

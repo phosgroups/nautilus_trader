@@ -374,7 +374,7 @@ def create_order_updated_event(
         ts_event=report.ts_last,
         ts_init=ts_now,
         reconciliation=True,
-        is_quote_quantity=order.is_quote_quantity,
+        is_quote_quantity=report.is_quote_quantity,
     )
 
 
