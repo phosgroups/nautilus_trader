@@ -42,6 +42,8 @@ PARALLEL_BUILD = os.getenv("PARALLEL_BUILD", "true").lower() == "true"
 BUILD_JOBS = int(os.getenv("BUILD_JOBS", str(os.cpu_count() or 1)))
 if BUILD_JOBS < 1:
     raise ValueError("BUILD_JOBS must be a positive integer")
+# Optional content cache for Cython-generated C files (not compiled extensions).
+CYTHON_CACHE_DIR = os.getenv("CYTHON_CACHE_DIR") or None
 # If COPY_TO_SOURCE is enabled, copy built *.so files back into the source tree
 COPY_TO_SOURCE = os.getenv("COPY_TO_SOURCE", "true").lower() == "true"
 # Force stripping of debug symbols even in non-release builds
@@ -353,6 +355,7 @@ def _build_distribution(extensions: list[Extension]) -> Distribution:
                 compiler_directives=CYTHON_COMPILER_DIRECTIVES,
                 nthreads=nthreads,
                 build_dir=BUILD_DIR,
+                cache=CYTHON_CACHE_DIR if not (PROFILE_MODE or ANNOTATION_MODE) else None,
                 gdb_debug=PROFILE_MODE,
             ),
             "zip_safe": False,
@@ -646,6 +649,7 @@ if __name__ == "__main__":
     print(f"ANNOTATION_MODE={ANNOTATION_MODE}")
     print(f"PARALLEL_BUILD={PARALLEL_BUILD}")
     print(f"BUILD_JOBS={BUILD_JOBS}")
+    print(f"CYTHON_CACHE_DIR={CYTHON_CACHE_DIR}")
     print(f"COPY_TO_SOURCE={COPY_TO_SOURCE}")
     print(f"FORCE_STRIP={FORCE_STRIP}")
     print(f"PYO3_ONLY={PYO3_ONLY}")

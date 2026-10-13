@@ -35,6 +35,18 @@ for the build. `BUILD_JOBS` limits both Cython translation and C compilation;
 `PARALLEL_BUILD=false` runs both stages with one worker. The phos workflows
 set `BUILD_JOBS=2`, independently of the Cargo job limit.
 
+Both workflows reuse the Cargo dependency cache and use sccache for Rust and C
+compilation. PR runs save their own dependency cache; GitHub scopes it to that
+PR, while main builds can seed caches for future PRs. Cython's content cache
+reuses generated C sources. Final linking, wheel packaging, and manylinux repair
+still run, and the workflows print compiler cache statistics.
+
+CI builds use `.venv-build` with the root `build-system.requires` installed before
+`uv build --no-build-isolation`. This keeps NumPy header and PyO3 interpreter
+paths stable for compiler caching. Neither compiled extensions nor the entire
+`build/` directory are restored: they must be linked against the current Rust
+libraries. Local `uv build` retains its default isolated environment.
+
 Run the smoke script from the repository root. It installs the wheel from `dist/`
 and imports it from a neutral directory. It checks the v1 `TradingNode`, strategy
 claim configuration, Bitget factories/bindings, and Gate.io's expected rejection.

@@ -107,6 +107,7 @@ env/
 !scripts/ci/install-rust.sh
 !scripts/ci/osv-severity-gate.sh
 !scripts/ci/plan.sh
+!scripts/ci/prepare-v1-build-env.sh
 !scripts/ci/publish-cargo-crates.sh
 !scripts/ci/publish-cli-r2-prune.sh
 !scripts/ci/publish-cli-r2-upload.sh

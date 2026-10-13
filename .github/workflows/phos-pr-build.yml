@@ -33,6 +33,12 @@ jobs:
     env:
       BUILD_MODE: release
       BUILD_JOBS: "2"
+      # Compiler caches cover workspace Rust crates and Cython's generated C.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CC: "sccache clang"
+      CXX: "sccache clang++"
+      CYTHON_CACHE_DIR: ${{ github.workspace }}/.cache/cython-v1
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/build-v1-linux
       # CR-0028: override fat LTO + codegen-units=1 (release profile) to keep
       # cold-cache builds under 30 min. thin LTO + parallel codegen are much
@@ -45,7 +51,7 @@ jobs:
       - name: Free disk space (Linux)
         uses: jlumbroso/free-disk-space@v1.3.1
         with:
-          tool-cache: true
+          tool-cache: false
           android: true
           dotnet: true
           haskell: true
@@ -99,13 +105,27 @@ jobs:
           cache: false
           override: true
 
+      - name: Set up compiler cache
+        id: compiler-cache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.16.0"
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target/build-v1-linux"
           key: build-v1-linux
+          env-vars: PYTHON_VERSION
           cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' }}
+
+      - name: Cache Cython generated sources
+        uses: actions/cache@v6.1.0
+        with:
+          path: ${{ env.CYTHON_CACHE_DIR }}
+          key: cython-v1-${{ runner.os }}-${{ runner.arch }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('build.py', 'pyproject.toml', 'rust-toolchain.toml') }}-${{ hashFiles('nautilus_trader/**/*.pyx', 'nautilus_trader/**/*.pxd', 'nautilus_trader/**/*.pxi') }}
+          restore-keys: |
+            cython-v1-${{ runner.os }}-${{ runner.arch }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('build.py', 'pyproject.toml', 'rust-toolchain.toml') }}-
 
       - name: Limit Cargo build jobs on cold cache
         run: bash scripts/ci/set-cargo-build-jobs.sh
@@ -115,6 +135,9 @@ jobs:
 
       - name: Install Cap'n Proto
         uses: ./.github/actions/install-capnp
+
+      - name: Prepare stable Python build environment
+        run: bash scripts/ci/prepare-v1-build-env.sh
 
       - name: Update version suffix (pyproject.toml)
         if: ${{ env.VERSION_SUFFIX != '' }}
@@ -130,8 +153,7 @@ jobs:
       - name: Build wheel (Linux x86_64, v1)
         run: |
           set -euo pipefail
-          export PYO3_PYTHON="$(command -v python)"
-          uv build --wheel --python "$PYO3_PYTHON" --out-dir dist/unrepaired
+          uv build --wheel --no-build-isolation --python "$PYO3_PYTHON" --out-dir dist/unrepaired
 
       - name: Repair wheel for manylinux
         run: |
@@ -167,6 +189,10 @@ jobs:
 
       - name: Smoke test (v1 API + phos adapters)
         run: bash scripts/ci/smoke-test-v1-wheel.sh
+
+      - name: Compiler cache statistics
+        if: ${{ always() && steps.compiler-cache.outcome == 'success' }}
+        run: sccache --show-stats
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
