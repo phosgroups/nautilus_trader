@@ -16,9 +16,10 @@
 //! Python bindings for the Bitget HTTP client.
 
 use chrono::{DateTime, Utc};
+use nautilus_common::messages::{ExecutionEvent, ExecutionReport};
 use nautilus_core::{
     UUID4, UnixNanos,
-    python::{params::pydict_to_params, to_pyvalue_err},
+    python::{params::pydict_to_params, serialization::from_pyobject_pyo3, to_pyvalue_err},
 };
 use nautilus_model::{
     data::BarType,
@@ -26,7 +27,10 @@ use nautilus_model::{
     events::OrderInitialized,
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     instruments::Instrument,
-    python::instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
+    python::{
+        events::order::order_event_to_pyobject,
+        instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
+    },
     types::{Price, Quantity},
 };
 use pyo3::{
@@ -41,7 +45,9 @@ use crate::{
         order::{map_cancel_order_for_account, map_submit_order_for_account},
         parse::{parse_fill_report, parse_order_status_report, parse_position_status_report},
     },
+    execution::parse_python_execution_ws_message,
     http::client::{BitgetHttpClient, BitgetRawHttpClient},
+    websocket::messages::{BitgetWsEvent, BitgetWsMessage},
 };
 
 fn bitget_order_ack_to_pydict(
@@ -197,6 +203,56 @@ impl BitgetHttpClient {
             .collect::<PyResult<Vec<_>>>()?;
         self.cache_instruments(&instruments);
         Ok(())
+    }
+
+    /// Parses a normalized private WebSocket push with the Rust execution dispatcher.
+    /// Bundled order/fill pushes retain real trade IDs and commissions through v1 reconciliation.
+    #[pyo3(name = "parse_execution_ws_event")]
+    fn py_parse_execution_ws_event(
+        &self,
+        py: Python<'_>,
+        event: &Bound<'_, PyDict>,
+        product_type: BitgetProductType,
+        trader_id: TraderId,
+        account_id: AccountId,
+    ) -> PyResult<Py<PyAny>> {
+        let event: BitgetWsEvent<serde_json::Value> = from_pyobject_pyo3(py, event.as_any())?;
+        let events = parse_python_execution_ws_message(
+            BitgetWsMessage::Data(event),
+            product_type,
+            trader_id,
+            account_id,
+            self.clone(),
+        )
+        .map_err(to_pyvalue_err)?;
+        let result = PyList::empty(py);
+        for event in events {
+            let value = match event {
+                ExecutionEvent::Order(event) => order_event_to_pyobject(py, event)?,
+                ExecutionEvent::Report(ExecutionReport::Order(report)) => {
+                    (*report).into_py_any(py)?
+                }
+                ExecutionEvent::Report(ExecutionReport::Fill(report)) => {
+                    (*report).into_py_any(py)?
+                }
+                ExecutionEvent::Report(ExecutionReport::Position(report)) => {
+                    (*report).into_py_any(py)?
+                }
+                ExecutionEvent::Report(ExecutionReport::OrderWithFills(report, fills)) => {
+                    let batch = PyDict::new(py);
+                    batch.set_item("order", *report)?;
+                    batch.set_item("fills", fills)?;
+                    batch.into_py_any(py)?
+                }
+                other => {
+                    return Err(to_pyvalue_err(format!(
+                        "Unexpected Bitget execution event: {other:?}"
+                    )));
+                }
+            };
+            result.append(value)?;
+        }
+        result.into_py_any(py)
     }
 
     /// Requests instruments for a Bitget product type.
@@ -681,6 +737,7 @@ impl BitgetHttpClient {
             ts_event,
             ts_init,
             price,
+            None,
             trigger_price,
             trigger_type,
             None,

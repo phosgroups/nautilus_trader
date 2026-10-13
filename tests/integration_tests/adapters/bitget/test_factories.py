@@ -60,8 +60,12 @@ def test_bitget_python_configs_accept_spot_and_fixture_urls():
 
 
 def test_bitget_pyo3_factory_bindings_are_registered():
-    data_factory = BitgetLiveDataClientFactory()
-    exec_factory = BitgetLiveExecClientFactory(
+    # The v1 facade exposes Python Live* factories; Rust factory bindings are
+    # still available separately for the retained v2 implementation.
+    assert callable(BitgetLiveDataClientFactory.create)
+    assert callable(BitgetLiveExecClientFactory.create)
+    data_factory = nautilus_pyo3.BitgetDataClientFactory()
+    exec_factory = nautilus_pyo3.BitgetExecutionClientFactory(
         nautilus_pyo3.TraderId("TRADER-001"),
         nautilus_pyo3.AccountId("BITGET-001"),
     )
@@ -74,7 +78,9 @@ def test_bitget_url_and_symbol_helpers():
     assert nautilus_pyo3.get_bitget_http_base_url(BitgetEnvironment.MAINNET).startswith("https://")
     assert nautilus_pyo3.get_bitget_ws_url_public(BitgetEnvironment.MAINNET).startswith("wss://")
     assert nautilus_pyo3.get_bitget_ws_url_private(BitgetEnvironment.MAINNET).startswith("wss://")
-    assert nautilus_pyo3.get_bitget_http_base_url(BitgetEnvironment.DEMO) == "https://api.bitget.com"
+    assert (
+        nautilus_pyo3.get_bitget_http_base_url(BitgetEnvironment.DEMO) == "https://api.bitget.com"
+    )
     assert (
         nautilus_pyo3.get_bitget_ws_url_public(BitgetEnvironment.DEMO)
         == "wss://wspap.bitget.com/v3/ws/public"
@@ -101,6 +107,10 @@ def test_bitget_classic_mode_is_part_of_http_client_cache_key():
     assert classic is not uta
     config = BitgetExecClientConfig(account_mode=BitgetAccountMode.CLASSIC)
     assert config.account_mode == BitgetAccountMode.CLASSIC
-    assert nautilus_pyo3.get_bitget_ws_url_private(
-        BitgetEnvironment.MAINNET, BitgetAccountMode.CLASSIC,
-    ) == "wss://ws.bitget.com/v2/ws/private"
+    assert (
+        nautilus_pyo3.get_bitget_ws_url_private(
+            BitgetEnvironment.MAINNET,
+            BitgetAccountMode.CLASSIC,
+        )
+        == "wss://ws.bitget.com/v2/ws/private"
+    )

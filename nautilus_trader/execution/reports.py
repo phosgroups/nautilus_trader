@@ -164,6 +164,9 @@ class OrderStatusReport(ExecutionReport):
         The reported reason for order cancellation.
     ts_triggered : int, optional
         UNIX timestamp (nanoseconds) when the object was initialized.
+    is_quote_quantity : bool, default False
+        If the reported original quantity is denominated in quote currency.
+        Filled quantities remain in instrument units (base units for spot).
 
     Raises
     ------
@@ -212,6 +215,7 @@ class OrderStatusReport(ExecutionReport):
         reduce_only: bool = False,
         cancel_reason: str | None = None,
         ts_triggered: int | None = None,
+        is_quote_quantity: bool = False,
     ) -> None:
         PyCondition.positive(quantity, "quantity")
         PyCondition.not_negative(filled_qty, "filled_qty")
@@ -252,6 +256,7 @@ class OrderStatusReport(ExecutionReport):
         self.trailing_offset = trailing_offset
         self.trailing_offset_type = trailing_offset_type
         self.quantity = quantity
+        self.is_quote_quantity = is_quote_quantity
         self.filled_qty = filled_qty
 
         # Clamp to minimum zero for robustness
@@ -308,7 +313,7 @@ class OrderStatusReport(ExecutionReport):
         ):
             return True
 
-        return order.quantity != self.quantity
+        return order.quantity != self.quantity or order.is_quote_quantity != self.is_quote_quantity
 
     def __eq__(self, other: object) -> bool:
         if other is None:
@@ -382,6 +387,7 @@ class OrderStatusReport(ExecutionReport):
             "time_in_force": self.time_in_force.value,
             "order_status": self.order_status.value,
             "quantity": str(self.quantity),
+            "is_quote_quantity": self.is_quote_quantity,
             "filled_qty": str(self.filled_qty),
             "report_id": self.id.value,
             "ts_accepted": self.ts_accepted,
@@ -478,6 +484,7 @@ class OrderStatusReport(ExecutionReport):
             reduce_only=values["reduce_only"],
             cancel_reason=values["cancel_reason"],
             ts_triggered=values["ts_triggered"],
+            is_quote_quantity=values.get("is_quote_quantity", False),
         )
 
     def to_pyo3(self) -> nautilus_pyo3.OrderStatusReport:
@@ -544,6 +551,7 @@ class OrderStatusReport(ExecutionReport):
             cancel_reason=self.cancel_reason,
             ts_triggered=self.ts_triggered,
             report_id=nautilus_pyo3.UUID4.from_str(self.id.value),
+            is_quote_quantity=self.is_quote_quantity,
         )
 
     @staticmethod
@@ -613,6 +621,7 @@ class OrderStatusReport(ExecutionReport):
             reduce_only=pyo3_report.reduce_only,
             cancel_reason=pyo3_report.cancel_reason,
             ts_triggered=pyo3_report.ts_triggered,
+            is_quote_quantity=getattr(pyo3_report, "is_quote_quantity", False),
         )
 
 

@@ -3218,7 +3218,7 @@ class LiveExecutionEngine(ExecutionEngine):
             # state, or if commissions differed from the default.
             try:
                 fill: OrderFilled = self._generate_inferred_fill(order, report, instrument)
-                self._handle_event_with_tracking(fill)
+                self._handle_event_with_tracking(fill, inferred_fill=True)
             except ValueError as e:
                 self._log.error(
                     f"Cannot generate inferred fill for {order.client_order_id}: {e}. "
@@ -3305,7 +3305,9 @@ class LiveExecutionEngine(ExecutionEngine):
         return None  # Continue with fill reconciliation
 
     def _should_update(self, order: Order, report: OrderStatusReport) -> bool:
-        if report.quantity != order.quantity and report.quantity >= order.filled_qty:
+        if (
+            report.quantity != order.quantity or report.is_quote_quantity != order.is_quote_quantity
+        ) and report.quantity >= order.filled_qty:
             return True  # Valid quantity update
 
         match order.order_type:
@@ -3591,7 +3593,7 @@ class LiveExecutionEngine(ExecutionEngine):
             time_in_force=report.time_in_force,
             post_only=report.post_only,
             reduce_only=report.reduce_only,
-            quote_quantity=False,
+            quote_quantity=report.is_quote_quantity,
             options=options,
             emulation_trigger=TriggerType.NO_TRIGGER,
             trigger_instrument_id=None,
@@ -3718,19 +3720,27 @@ class LiveExecutionEngine(ExecutionEngine):
         if drop_last_query:
             self._ts_last_query.pop(client_order_id, None)
 
-    def _handle_event_with_tracking(self, event: OrderEvent) -> None:
+    def _handle_event_with_tracking(
+        self,
+        event: OrderEvent,
+        *,
+        inferred_fill: bool = False,
+    ) -> None:
         # Handle an order event with activity tracking, recording fills in cache and
         # cleaning up tracking data for closed orders.
         self._record_local_activity(event)
 
         if isinstance(event, OrderFilled):
-            self._recent_fills_cache[event.trade_id] = self._clock.timestamp_ns()
-            self._position_local_activity_ns[(event.instrument_id, event.account_id)] = (
-                event.ts_event
-            )
+            ts_now = self._clock.timestamp_ns()
+            self._recent_fills_cache[event.trade_id] = ts_now
 
-            # Track inferred fill timestamps to prevent duplicate historical fills
-            if event.reconciliation:
+            # Stamp receipt time: a venue ts_event ahead of this clock would make
+            # the grace delta negative and suppress the position check.
+            self._position_local_activity_ns[(event.instrument_id, event.account_id)] = ts_now
+
+            # Real venue fills also carry reconciliation=True. Only inferred
+            # fills establish a cutoff; real fills can arrive out of order.
+            if inferred_fill:
                 client_order_id = event.client_order_id
                 if client_order_id not in self._inferred_fill_ts:
                     self._inferred_fill_ts[client_order_id] = event.ts_event

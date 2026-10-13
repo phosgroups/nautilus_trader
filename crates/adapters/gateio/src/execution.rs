@@ -1462,12 +1462,7 @@ fn report_from_order(
         )?)
     };
     let report = if let Some(avg_px) = spot_average_fill_price(value)? {
-        report.with_avg_px(
-            avg_px
-                .to_string()
-                .parse::<f64>()
-                .context("invalid Gate.io order average price")?,
-        )?
+        report.with_avg_px(avg_px)
     } else {
         report
     };

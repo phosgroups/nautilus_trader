@@ -26,6 +26,8 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+#[cfg(feature = "python")]
+use nautilus_common::messages::ExecutionEvent;
 use nautilus_common::{
     clients::ExecutionClient,
     live::{runner::get_exec_event_sender, runtime::get_runtime},
@@ -48,6 +50,8 @@ use nautilus_model::{
     reports::{FillReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance},
 };
+#[cfg(feature = "python")]
+use nautilus_model::{enums::AccountType, identifiers::TraderId};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -1224,6 +1228,50 @@ async fn reconcile_after_reconnect(
     );
 
     summary
+}
+
+/// Parses execution pushes for the Cython client using the same dispatcher as the Rust client.
+/// Account pushes and reconnects are refreshed by the Python client, which owns its event loop.
+#[cfg(feature = "python")]
+pub(crate) fn parse_python_execution_ws_message(
+    message: BitgetWsMessage,
+    product_type: BitgetProductType,
+    trader_id: TraderId,
+    account_id: AccountId,
+    http_client: BitgetHttpClient,
+) -> anyhow::Result<Vec<ExecutionEvent>> {
+    let clock = get_atomic_clock_realtime();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let account_type = match product_type {
+        BitgetProductType::Spot => AccountType::Cash,
+        BitgetProductType::UsdtFutures => AccountType::Margin,
+    };
+    let mut emitter = ExecutionEventEmitter::new(clock, trader_id, account_id, account_type, None);
+    emitter.set_sender(sender);
+    let instruments = http_client.cached_instruments(product_type);
+    let ctx = BitgetExecutionWsDispatchContext::new(
+        product_type,
+        account_id,
+        clock,
+        emitter,
+        http_client,
+        None,
+        instruments,
+    );
+    anyhow::ensure!(
+        matches!(&message, BitgetWsMessage::Data(event) if event.arg.as_ref().is_some_and(|arg| matches!(arg.topic.as_str(), "order" | "orders" | "strategy-order" | "fill" | "fills" | "position" | "positions"))),
+        "Expected an order, fill, or position execution push"
+    );
+    let summary = handle_bitget_execution_ws_message_with_context(message, Some(&ctx));
+    if summary.errors > 0 {
+        // One malformed row must not discard valid executions in the same push.
+        log::warn!("Failed to parse {} Bitget execution row(s)", summary.errors);
+    }
+    let mut events = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        events.push(event);
+    }
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -3676,6 +3724,69 @@ mod tests {
         let summary = handle_bitget_execution_ws_message_with_context(message, Some(&ctx));
         assert_eq!(summary.errors, 1);
         assert!(drain_execution_events(&mut rx).is_empty());
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn python_bridge_preserves_classic_market_buy_execution_and_base_units() {
+        let (ctx, _) = classic_spot_test_context();
+        ctx.http_client
+            .cache_instruments(&ctx.instruments_by_id.values().cloned().collect::<Vec<_>>());
+        let message = classic_spot_order_message(&json!({
+            "instId":"BTCUSDT", "orderId":"123", "clientOid":"C-1", "side":"buy",
+            "orderType":"market", "status":"filled", "size":"100", "newSize":"100",
+            "accBaseVolume":"0.5", "priceAvg":"200", "fillPrice":"200",
+            "tradeId":"REAL-T-1", "baseVolume":"0.5", "fillFee":"-0.0001",
+            "fillFeeCoin":"BTC", "tradeScope":"T", "fillTime":"1700000000001"
+        }));
+        let events = parse_python_execution_ws_message(
+            message,
+            ctx.product_type,
+            "TESTER-001".into(),
+            ctx.account_id,
+            ctx.http_client,
+        )
+        .unwrap();
+        let ExecutionEvent::Report(ExecutionReport::OrderWithFills(order, fills)) = &events[0]
+        else {
+            panic!("expected bundled order/fills");
+        };
+        assert_eq!(order.quantity.to_string(), "0.500000");
+        assert!(!order.is_quote_quantity);
+        assert_eq!(fills[0].last_qty, order.filled_qty);
+        assert_eq!(fills[0].trade_id.as_str(), "REAL-T-1");
+        assert_eq!(fills[0].commission.currency.code.as_str(), "BTC");
+        assert_eq!(
+            fills[0].commission.as_decimal(),
+            rust_decimal::Decimal::new(1, 4)
+        );
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn python_bridge_keeps_valid_rows_when_another_execution_is_invalid() {
+        let (ctx, _) = classic_test_context();
+        ctx.http_client.cache_instruments(&[usdt_perp_instrument()]);
+        let raw = json!({
+            "arg":{"instType":"USDT-FUTURES", "channel":"orders", "instId":"default"},
+            "data":[
+                {"instId":"BTCUSDT", "orderId":"good", "side":"buy", "orderType":"market", "status":"live", "size":"0.010", "accBaseVolume":"0"},
+                {"instId":"BTCUSDT", "orderId":"bad", "side":"buy", "orderType":"market", "status":"live", "size":"not-a-number"}
+            ]
+        });
+        let events = parse_python_execution_ws_message(
+            crate::classic::websocket::parse(&raw.to_string()).unwrap(),
+            ctx.product_type,
+            "TESTER-001".into(),
+            ctx.account_id,
+            ctx.http_client,
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        let ExecutionEvent::Report(ExecutionReport::Order(report)) = &events[0] else {
+            panic!("expected accepted order");
+        };
+        assert_eq!(report.venue_order_id.as_str(), "good");
     }
 
     #[test]

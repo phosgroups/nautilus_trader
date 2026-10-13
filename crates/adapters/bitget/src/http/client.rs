@@ -1571,6 +1571,18 @@ impl BitgetHttpClient {
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id).into())
     }
 
+    #[cfg(feature = "python")]
+    pub(crate) fn cached_instruments(&self, product_type: BitgetProductType) -> Vec<InstrumentAny> {
+        self.instruments_cache
+            .load()
+            .values()
+            .filter(|instrument| {
+                BitgetProductType::from_symbol(instrument.id().symbol.as_str()) == product_type
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Requests instruments for the configured Bitget product type.
     ///
     /// # Errors

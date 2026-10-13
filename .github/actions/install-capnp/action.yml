@@ -14,7 +14,7 @@ runs:
       if: runner.os == 'macOS'
       shell: bash
       run: |
-        brew update || { sleep 5; brew update; }
+        brew untap aws/tap 2>/dev/null || true
         brew install capnp ripgrep || { sleep 5; brew install capnp ripgrep; }
         brew cleanup
 
@@ -39,7 +39,7 @@ runs:
     - name: Cache Cap'n Proto (Linux)
       if: runner.os == 'Linux' && inputs.cache-enabled == 'true'
       id: cache-capnp
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache@v6.1.0
       with:
         path: ${{ github.workspace }}/.cache/capnp
         key: capnp-linux-${{ steps.linux-version.outputs.release }}-${{ env.CAPNP_VERSION }}-${{ runner.arch }}

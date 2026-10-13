@@ -71,3 +71,4 @@ class BitgetExecClientConfig(LiveExecClientConfig, frozen=True):
     base_url_ws_private: str | None = None
     proxy_url: str | None = None
     ignore_uncached_instrument_executions: bool = False
+    reconnect_reconciliation_lookback_mins: PositiveInt = 60

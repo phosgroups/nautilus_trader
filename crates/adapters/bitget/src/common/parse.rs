@@ -997,10 +997,7 @@ pub fn parse_order_status_report(
     }
 
     if let Some(avg_px) = avg_px {
-        let avg_px = avg_px
-            .to_f64()
-            .with_context(|| format!("order.avgPrice out of f64 range: {avg_px:?}"))?;
-        report = report.with_avg_px(avg_px)?;
+        report = report.with_avg_px(avg_px);
     }
 
     if let Some(trigger_price) = trigger_price_raw.filter(|value| *value != "0") {

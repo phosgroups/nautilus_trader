@@ -63,6 +63,7 @@ impl OrderStatusReport {
         contingency_type=None,
         expire_time=None,
         price=None,
+        activation_price=None,
         trigger_price=None,
         trigger_type=None,
         limit_offset=None,
@@ -98,6 +99,7 @@ impl OrderStatusReport {
         contingency_type: Option<ContingencyType>,
         expire_time: Option<u64>,
         price: Option<Price>,
+        activation_price: Option<Price>,
         trigger_price: Option<Price>,
         trigger_type: Option<TriggerType>,
         limit_offset: Option<Decimal>,
@@ -154,6 +156,10 @@ impl OrderStatusReport {
 
         if let Some(price) = price {
             report = report.with_price(price);
+        }
+
+        if let Some(activation_price) = activation_price {
+            report = report.with_activation_price(activation_price);
         }
 
         if let Some(trigger_price) = trigger_price {
@@ -350,6 +356,12 @@ impl OrderStatusReport {
     }
 
     #[getter]
+    #[pyo3(name = "activation_price")]
+    const fn py_activation_price(&self) -> Option<Price> {
+        self.activation_price
+    }
+
+    #[getter]
     #[pyo3(name = "trigger_price")]
     const fn py_trigger_price(&self) -> Option<Price> {
         self.trigger_price
@@ -512,6 +524,11 @@ impl OrderStatusReport {
         match &self.price {
             Some(p) => dict.set_item("price", p.to_string())?,
             None => dict.set_item("price", py.None())?,
+        }
+
+        match &self.activation_price {
+            Some(p) => dict.set_item("activation_price", p.to_string())?,
+            None => dict.set_item("activation_price", py.None())?,
         }
 
         match &self.trigger_price {

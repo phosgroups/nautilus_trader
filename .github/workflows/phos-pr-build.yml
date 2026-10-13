@@ -1,14 +1,14 @@
 name: phos-pr-build
 
-# phos PR build verification for nautilus-trader v2 (python/, maturin)
+# phos PR build verification for nautilus-trader v1 (root Poetry/Cython package)
 # (ADR-0015 / ADR-0022, CR-0025; Linux-only per CR-0028).
 # Trigger: PR -> main -> Linux build + smoke test, no publish.
 # NOTE: This repo is a fork, so GitHub does not allow referencing private actions
 # (phosgroups/phos-actions). Build logic is inlined here.
-# Version = python/pyproject.toml version + VERSION_SUFFIX (repo variable, e.g. +phos)
-#   + .{short-sha}.{run_number} -> unique per run, e.g. 2.0.0rc1+phos.a1b2c3d.42 (PEP 440 local).
+# Version = pyproject.toml version + VERSION_SUFFIX (repo variable, e.g. +phos)
+#   + .{short-sha}.{run_number} -> unique per run, e.g. 1.231.0+phos.a1b2c3d.42 (PEP 440 local).
 # macOS builds are intentionally removed (CR-0028): Mac developers build locally
-#   (make build-debug-v2 / maturin develop under python/).
+#   (make build-debug from the repository root).
 
 on:
   pull_request:
@@ -23,16 +23,23 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.14"
-  PACKAGE_DIR: python
-  VERSION_SUFFIX: ${{ vars.VERSION_SUFFIX }}
+  VERSION_SUFFIX: ${{ vars.VERSION_SUFFIX || '+phos' }}
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/build-v2-linux
+      BUILD_MODE: release
+      BUILD_JOBS: "2"
+      # Compiler caches cover workspace Rust crates and Cython's generated C.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CC: "sccache clang"
+      CXX: "sccache clang++"
+      CYTHON_CACHE_DIR: ${{ github.workspace }}/.cache/cython-v1
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/build-v1-linux
       # CR-0028: override fat LTO + codegen-units=1 (release profile) to keep
       # cold-cache builds under 30 min. thin LTO + parallel codegen are much
       # faster with a small runtime perf tradeoff; opt-level stays 3.
@@ -44,7 +51,7 @@ jobs:
       - name: Free disk space (Linux)
         uses: jlumbroso/free-disk-space@v1.3.1
         with:
-          tool-cache: true
+          tool-cache: false
           android: true
           dotnet: true
           haskell: true
@@ -98,39 +105,64 @@ jobs:
           cache: false
           override: true
 
+      - name: Set up compiler cache
+        id: compiler-cache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.16.0"
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ". -> target/build-v2-linux"
-          key: build-v2-linux
+          workspaces: ". -> target/build-v1-linux"
+          key: build-v1-linux
+          env-vars: PYTHON_VERSION
           cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' }}
+
+      - name: Cache Cython generated sources
+        uses: actions/cache@v6.1.0
+        with:
+          path: ${{ env.CYTHON_CACHE_DIR }}
+          key: cython-v1-${{ runner.os }}-${{ runner.arch }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('build.py', 'pyproject.toml', 'rust-toolchain.toml') }}-${{ hashFiles('nautilus_trader/**/*.pyx', 'nautilus_trader/**/*.pxd', 'nautilus_trader/**/*.pxi') }}
+          restore-keys: |
+            cython-v1-${{ runner.os }}-${{ runner.arch }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('build.py', 'pyproject.toml', 'rust-toolchain.toml') }}-
 
       - name: Limit Cargo build jobs on cold cache
         run: bash scripts/ci/set-cargo-build-jobs.sh
 
+      - name: Install native build tools
+        run: sudo apt-get update && sudo apt-get install -y clang lld patchelf
+
       - name: Install Cap'n Proto
         uses: ./.github/actions/install-capnp
 
-      - name: Update version suffix (python/pyproject.toml)
+      - name: Prepare stable Python build environment
+        run: bash scripts/ci/prepare-v1-build-env.sh
+
+      - name: Update version suffix (pyproject.toml)
         if: ${{ env.VERSION_SUFFIX != '' }}
         run: |
           set -euo pipefail
-          current=$(grep '^version = ' python/pyproject.toml | head -1 | cut -d '"' -f2)
+          current=$(grep '^version = ' pyproject.toml | head -1 | cut -d '"' -f2)
           SHORT_SHA="${GITHUB_SHA::7}"
           RUN_NUMBER="${{ github.run_number }}"
           new="${current}${VERSION_SUFFIX}.${SHORT_SHA}.${RUN_NUMBER}"
-          sed -i.bak "s/^version = \".*\"/version = \"${new}\"/" python/pyproject.toml && rm -f python/pyproject.toml.bak
+          sed -i.bak "s/^version = \".*\"/version = \"${new}\"/" pyproject.toml && rm -f pyproject.toml.bak
           echo "Version: ${current} -> ${new}"
 
-      - name: Build wheel (Linux x86_64, v2)
-        working-directory: ${{ env.PACKAGE_DIR }}
+      - name: Build wheel (Linux x86_64, v1)
         run: |
           set -euo pipefail
-          MATURIN_VERSION="$(bash ../scripts/maturin-version.bash)"
-          uv run --no-project --no-build --with "maturin==${MATURIN_VERSION}" -- \
-            maturin build --release --out ../dist
-          ls -lh ../dist/
+          uv build --wheel --no-build-isolation --python "$PYO3_PYTHON" --out-dir dist/unrepaired
+
+      - name: Repair wheel for manylinux
+        run: |
+          set -euo pipefail
+          # ubuntu-24.04 uses glibc 2.39, matching the existing phos wheel policy.
+          uvx --from auditwheel==6.8.2 auditwheel repair \
+            --plat manylinux_2_39_x86_64 --wheel-dir dist dist/unrepaired/*.whl
+          rm -rf dist/unrepaired
+          ls -lh dist/
 
       - name: Verify wheel name (Linux)
         run: |
@@ -144,7 +176,7 @@ jobs:
           esac
           case "$NAME" in
             *manylinux_*) echo "platform tag manylinux: OK" ;;
-            *linux_x86_64*) echo "::error::wheel tagged linux_x86_64 (not manylinux); enable maturin --zig fallback per ADR-0022"; exit 1 ;;
+            *linux_x86_64*) echo "::error::wheel tagged linux_x86_64 (not manylinux); auditwheel repair must run before publishing"; exit 1 ;;
             *) echo "::error::unexpected Linux platform tag: ${NAME}"; exit 1 ;;
           esac
           if [ -n "${VERSION_SUFFIX}" ]; then
@@ -155,9 +187,12 @@ jobs:
             esac
           fi
 
-      - name: Smoke test (v2 API + phos adapters)
-        working-directory: ${{ env.PACKAGE_DIR }}
-        run: bash ../scripts/ci/smoke-test-v2-wheel.sh
+      - name: Smoke test (v1 API + phos adapters)
+        run: bash scripts/ci/smoke-test-v1-wheel.sh
+
+      - name: Compiler cache statistics
+        if: ${{ always() && steps.compiler-cache.outcome == 'success' }}
+        run: sccache --show-stats
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
@@ -175,7 +210,7 @@ jobs:
             echo "|---|---|---|"
             for WHL in dist/nautilus_trader-*.whl; do
               VER=$(basename "$WHL" | sed -E 's/^nautilus_trader-([^-]+)-.*/\1/')
-              PLAT=$(basename "$WHL" | sed -E 's/^nautilus_trader-[^-]+-[^-]+-[^-]+-([^.]+)\.whl/\1/')
+              PLAT=$(basename "$WHL" | sed -E 's/^nautilus_trader-[^-]+-[^-]+-[^-]+-(.+)\.whl/\1/')
               echo "| nautilus-trader | \`${VER}\` | \`${PLAT}\` |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
