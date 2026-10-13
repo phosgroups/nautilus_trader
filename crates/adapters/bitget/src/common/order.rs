@@ -699,6 +699,7 @@ mod tests {
             TS,
             TS,
             price.map(Price::from),
+            None,
             trigger_price.map(Price::from),
             Some(TriggerType::LastPrice),
             None,

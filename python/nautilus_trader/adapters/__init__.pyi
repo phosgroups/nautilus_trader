@@ -13,6 +13,7 @@ from . import derive
 from . import dydx
 from . import gateio
 from . import hyperliquid
+from . import interactive_brokers
 from . import kraken
 from . import lighter
 from . import okx
@@ -34,6 +35,7 @@ __all__ = [
     "dydx",
     "gateio",
     "hyperliquid",
+    "interactive_brokers",
     "kraken",
     "lighter",
     "okx",
