@@ -32,14 +32,17 @@ use crate::{
 
 type Result<T> = std::result::Result<T, BitgetHttpError>;
 
-fn query(params: Vec<(&str, String)>) -> Result<String> {
+fn query(params: Vec<(&str, String)>) -> Result<Option<String>> {
+    if params.is_empty() {
+        return Ok(None);
+    }
     let mut params = params;
     params.sort_by(|a, b| a.0.cmp(b.0));
-    Ok(format!(
+    Ok(Some(format!(
         "?{}",
         serde_urlencoded::to_string(params)
             .map_err(|e| BitgetHttpError::ValidationError(e.to_string()))?
-    ))
+    )))
 }
 
 fn product_params(product: BitgetProductType) -> Vec<(&'static str, String)> {
@@ -59,10 +62,10 @@ impl BitgetRawHttpClient {
     ) -> Result<T> {
         let query = query(params)?;
         if private {
-            self.send_private::<T, serde_json::Value>(Method::GET, path, Some(&query), None)
+            self.send_private::<T, serde_json::Value>(Method::GET, path, query.as_deref(), None)
                 .await
         } else {
-            self.get_public(path, Some(&query)).await
+            self.get_public(path, query.as_deref()).await
         }
     }
 

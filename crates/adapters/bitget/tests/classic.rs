@@ -17,11 +17,14 @@
 
 use std::sync::{Arc, Mutex};
 
+use aws_lc_rs::hmac;
 use axum::{
     Json, Router,
     body::to_bytes,
     extract::{Request, State},
+    http::HeaderMap,
 };
+use base64::{Engine, engine::general_purpose};
 use nautilus_bitget::{
     common::{
         enums::{BitgetAccountMode, BitgetProductType},
@@ -37,12 +40,14 @@ struct Fixture {
     response: Arc<Mutex<Value>>,
     plan_response: Arc<Mutex<Option<Value>>>,
     error: Arc<Mutex<Option<String>>>,
+    headers: Arc<Mutex<HeaderMap>>,
     requests: Arc<Mutex<Vec<(String, String, Value)>>>,
 }
 
 async fn handle(State(fixture): State<Fixture>, request: Request) -> Json<Value> {
     let uri = request.uri().to_string();
     let method = request.method().to_string();
+    *fixture.headers.lock().unwrap() = request.headers().clone();
     if !uri.contains("/market/") && !uri.contains("/public/") {
         assert!(request.headers().contains_key("ACCESS-SIGN"));
     }
@@ -104,6 +109,15 @@ impl Fixture {
     fn assert_path(&self, path: &str) {
         assert_eq!(self.last().1.split('?').next().unwrap(), path);
     }
+    fn assert_get_signature(&self, request_target: &str) {
+        let headers = self.headers.lock().unwrap();
+        let timestamp = headers["ACCESS-TIMESTAMP"].to_str().unwrap();
+        let message = format!("{timestamp}GET{request_target}");
+        let key = hmac::Key::new(hmac::HMAC_SHA256, b"secret");
+        let signature =
+            general_purpose::STANDARD.encode(hmac::sign(&key, message.as_bytes()).as_ref());
+        assert_eq!(headers["ACCESS-SIGN"].to_str().unwrap(), signature);
+    }
 }
 
 #[test]
@@ -154,6 +168,24 @@ fn old_configs_remain_uta_and_classic_is_explicit() {
     assert_eq!(ws.with_account_mode(BitgetAccountMode::Uta).url(), custom);
 }
 
+#[rstest::rstest]
+#[case::without_query(None, "/api/v2/spot/account/assets")]
+#[case::with_query(Some("USDT"), "/api/v2/spot/account/assets?coin=USDT")]
+#[tokio::test]
+async fn classic_spot_assets_signs_the_request_target(
+    #[case] coin: Option<&str>,
+    #[case] request_target: &str,
+) {
+    let (client, fixture, task) = setup().await;
+    fixture.respond(json!([]));
+
+    client.request_spot_account_assets(coin).await.unwrap();
+
+    fixture.assert_get_signature(request_target);
+    assert_eq!(fixture.last().1, request_target);
+    task.abort();
+}
+
 #[tokio::test]
 async fn classic_market_and_account_responses_use_classic_shapes() {
     let (client, fixture, task) = setup().await;
@@ -161,7 +193,7 @@ async fn classic_market_and_account_responses_use_classic_shapes() {
     let symbols = client.request_spot_symbols().await.unwrap();
     assert_eq!(symbols[0].min_trade_amount.as_deref(), Some("0.0001"));
     assert_eq!(symbols[0].min_trade_usdt.as_deref(), Some("5"));
-    fixture.assert_path("/api/v2/spot/public/symbols");
+    assert_eq!(fixture.last().1, "/api/v2/spot/public/symbols");
 
     fixture.respond(json!([{"symbol":"BTCUSDT","baseCoin":"BTC","quoteCoin":"USDT","symbolType":"perpetual","pricePlace":"1","priceEndStep":"1","volumePlace":"3","sizeMultiplier":"0.001","minTradeNum":"0.001","minTradeUSDT":"5","symbolStatus":"normal"}]));
     let contracts = client.request_usdt_futures_contracts().await.unwrap();
