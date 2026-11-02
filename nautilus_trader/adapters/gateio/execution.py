@@ -125,6 +125,22 @@ class GateioExecutionClient(LiveExecutionClient):
         self._publish_account(rows)
 
     def _publish_account(self, rows):
+        # Gate omits currencies with zero balances. Publish explicit zeroes
+        # for configured instruments and previously observed currencies so NT
+        # does not treat an empty wallet as unready or retain a spent balance.
+        rows = list(rows)
+        currencies = {
+            currency.code
+            for instrument in self._instrument_provider.get_all().values()
+            for currency in (instrument.base_currency, instrument.quote_currency)
+        }
+        account = self._cache.account(self.account_id)
+        if account is not None:
+            currencies.update(currency.code for currency in account.balances())
+        currencies.difference_update(row["currency"] for row in rows)
+        rows.extend(
+            {"currency": code, "available": "0", "locked": "0"} for code in sorted(currencies)
+        )
         balances = []
         for row in rows:
             currency = Currency.from_str(row["currency"])

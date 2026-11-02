@@ -34,6 +34,7 @@ from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientOrderId
+from nautilus_trader.model.objects import Currency
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 
@@ -439,3 +440,44 @@ def test_read_transport_timeouts_and_non_json_server_errors_are_retried():
         assert client.transport.request.await_count == 3
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("reported", [[], [{"currency": "USDT", "available": "0", "locked": "0"}]])
+def test_empty_gate_wallet_has_explicit_configured_currency_balances(reported):
+    instrument = parse_instrument(PAIR, 0)
+    client = SimpleNamespace(
+        _instrument_provider=SimpleNamespace(get_all=lambda: {instrument.id: instrument}),
+        _cache=SimpleNamespace(account=lambda _: None),
+        account_id=AccountId("GATEIO-master"),
+        _clock=TestClock(),
+        generate_account_state=Mock(),
+    )
+    GateioExecutionClient._publish_account(client, reported)
+    balances = client.generate_account_state.call_args.kwargs["balances"]
+    by_code = {b.currency.code: b for b in balances}
+    assert set(by_code) == {"BTC", "USDT"}
+    assert all(b.total.as_decimal() == 0 for b in balances)
+    assert all(b.free.as_decimal() == 0 for b in balances)
+    assert all(b.locked.as_decimal() == 0 for b in balances)
+
+
+def test_omitted_previously_reported_currency_does_not_keep_stale_money():
+    instrument = parse_instrument(PAIR, 0)
+    account = SimpleNamespace(balances=lambda: {Currency.from_str("GT"): object()})
+    client = SimpleNamespace(
+        _instrument_provider=SimpleNamespace(get_all=lambda: {instrument.id: instrument}),
+        _cache=SimpleNamespace(account=lambda _: account),
+        account_id=AccountId("GATEIO-master"),
+        _clock=TestClock(),
+        generate_account_state=Mock(),
+    )
+    GateioExecutionClient._publish_account(
+        client, [{"currency": "USDT", "available": "9", "locked": "1"}]
+    )
+    by_code = {
+        b.currency.code: b for b in client.generate_account_state.call_args.kwargs["balances"]
+    }
+    assert by_code["USDT"].total.as_decimal() == 10
+    assert by_code["USDT"].locked.as_decimal() == 1
+    assert by_code["GT"].total.as_decimal() == 0
+    assert by_code["BTC"].total.as_decimal() == 0
