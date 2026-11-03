@@ -44,6 +44,8 @@ class GateioWebSocket:
         self.client = None
         self.subscriptions = []
         self.pending = {}
+        self._pending_request_ids = {}
+        self._request_id = clock.timestamp_ns() // 1000
         self.queue = asyncio.Queue(maxsize=10000)
         self.worker = None
         self.recovery = None
@@ -104,6 +106,8 @@ class GateioWebSocket:
         if key in self.pending:
             raise RuntimeError("Concurrent Gate subscription for the same channel")
         self.pending[key] = future
+        self._request_id += 1
+        self._pending_request_ids[key] = self._request_id
         message = subscription(
             channel,
             payload,
@@ -112,12 +116,14 @@ class GateioWebSocket:
             self.secret,
             event,
         )
+        message["id"] = self._request_id
         try:
             await self.client.send_text(json.dumps(message).encode())
             await asyncio.wait_for(future, timeout=10)
         finally:
             if self.pending.get(key) is future:
                 self.pending.pop(key, None)
+                self._pending_request_ids.pop(key, None)
 
     def _receive(self, raw):
         try:
@@ -127,6 +133,8 @@ class GateioWebSocket:
             key = (value.get("channel"), value.get("event"))
             future = self.pending.get(key)
             if future is not None and not future.done():
+                if value.get("id") != self._pending_request_ids.get(key):
+                    return  # A late acknowledgement must not confirm a newer subscription.
                 result = value.get("result")
                 if (
                     value.get("error")
@@ -170,6 +178,7 @@ class GateioWebSocket:
             if not future.done():
                 future.set_exception(ConnectionError("Gate reconnected during subscription"))
         self.pending.clear()
+        self._pending_request_ids.clear()
         if self.recovery is not None:
             self.recovery.cancel()
         self.recovery = self.loop.create_task(self._recover())
@@ -228,6 +237,7 @@ class GateioWebSocket:
                 if not future.done():
                     future.cancel()
             self.pending.clear()
+            self._pending_request_ids.clear()
             self.worker = self.recovery = None
             self.client = None
             self._drain()

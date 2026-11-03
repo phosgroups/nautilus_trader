@@ -39,18 +39,49 @@ class GateioHttpClient:
         self.base_url = base_url.rstrip("/")
         self.key, self.secret = api_key, api_secret
         self.max_retries = config.max_retries
+        self._request_interval = 1 / config.http_rate_per_second
+        self._rate_condition = asyncio.Condition()
+        self._waiting_requests = [0, 0, 0]
+        self._next_request_at = 0.0
         self.transport = HttpClient(
             timeout_secs=config.http_timeout_secs,
             default_quota=Quota.rate_per_second(config.http_rate_per_second),
             proxy_url=config.proxy_url,
         )
 
-    async def request(self, method, path, params=None, body=None, private=False):
+    async def _throttle(self, priority=1):
+        # Queue before signing, rather than aging signatures in native quota waits.
+        # Cancels and account/recovery reads must not queue behind an entire ladder.
+        async with self._rate_condition:
+            self._waiting_requests[priority] += 1
+            try:
+                loop = asyncio.get_running_loop()
+                while True:
+                    if any(self._waiting_requests[:priority]):
+                        await self._rate_condition.wait()
+                        continue
+                    delay = self._next_request_at - loop.time()
+                    if delay <= 0:
+                        self._next_request_at = loop.time() + self._request_interval
+                        return
+                    try:
+                        async with asyncio.timeout(delay):
+                            await self._rate_condition.wait()
+                    except TimeoutError:
+                        pass
+            finally:
+                self._waiting_requests[priority] -= 1
+                self._rate_condition.notify_all()
+
+    async def request(self, method, path, params=None, body=None, private=False, before_send=None):
         query = urlencode([(k, str(v)) for k, v in (params or {}).items() if v is not None])
         payload = json.dumps(body, separators=(",", ":")).encode() if body is not None else b""
         url = self.base_url + path + ("?" + query if query else "")
         attempts = self.max_retries + 1 if method == "GET" else 1
         for attempt in range(attempts):
+            await self._throttle(0 if method == "DELETE" else 2 if method == "POST" else 1)
+            if before_send is not None:
+                before_send()  # Synchronous final check; no yield before transport dispatch.
             headers = {"Accept": "application/json", "Content-Type": "application/json"}
             if private:
                 if not self.key or not self.secret:

@@ -32,6 +32,7 @@ class LocalGate:
         self.ticker = None
         self.fill_on_cancel = None
         self.reject_next = False
+        self.history_available = True
 
     async def start(self):
         app = web.Application()
@@ -116,7 +117,7 @@ class LocalGate:
             else:
                 channels.discard(channel)
             await ws.send_json(
-                {"channel": channel, "event": event, "result": {"status": "success"}}
+                {"id": row.get("id"), "channel": channel, "event": event, "result": {"status": "success"}}
             )
         return ws
 
@@ -167,6 +168,8 @@ class LocalGate:
         if tail == "spot/accounts":
             return web.json_response(self.balances())
         if tail == "spot/my_trades":
+            if not self.history_available:
+                return web.json_response([])
             oid = request.query.get("order_id")
             return web.json_response([f for f in self.fills if oid is None or f["order_id"] == oid])
         if tail == "spot/orders" and request.method == "POST":

@@ -1,6 +1,7 @@
 """Slow balance reads must not delay Gate order reports or lose account updates."""
 
 import asyncio
+import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import patch
@@ -59,7 +60,15 @@ class RecordingClient(GateioExecutionClient):
 
 def client_for(request, interval=10, **config):
     clock = TestClock()
-    http = SimpleNamespace(request=AsyncMock(side_effect=request), pages=AsyncMock(return_value=[]))
+
+    async def dispatch(*args, **kwargs):
+        before_send = kwargs.pop("before_send", None)
+        if before_send is not None:
+            before_send()
+        result = request(*args, **kwargs)
+        return await result if inspect.isawaitable(result) else result
+
+    http = SimpleNamespace(request=AsyncMock(side_effect=dispatch), pages=AsyncMock(return_value=[]))
     provider = GateioInstrumentProvider(http, clock, InstrumentProviderConfig())
     provider.add(parse_instrument(PAIR, 0))
     client = RecordingClient(

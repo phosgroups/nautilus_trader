@@ -9,7 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 
-def cold_scenario():
+def cold_scenario(periodic=False):
     from nautilus_trader.adapters.gateio import GateioDataClientConfig
     from nautilus_trader.adapters.gateio import GateioExecClientConfig
     from nautilus_trader.adapters.gateio import GateioLiveDataClientFactory
@@ -19,6 +19,8 @@ def cold_scenario():
     from nautilus_trader.config import LoggingConfig
     from nautilus_trader.config import StrategyConfig
     from nautilus_trader.config import TradingNodeConfig
+    from nautilus_trader.core.uuid import UUID4
+    from nautilus_trader.execution.messages import GenerateOrderStatusReports
     from nautilus_trader.live.node import TradingNode
     from nautilus_trader.model.events import OrderFilled
     from nautilus_trader.model.identifiers import InstrumentId
@@ -44,7 +46,8 @@ def cold_scenario():
             "time_in_force": "gtc",
             "create_time_ms": str(int(time.time() * 1000)),
         }
-        await server.partial_fill("123")
+        if not periodic:
+            await server.partial_fill("123")
         options = {
             "instrument_provider": InstrumentProviderConfig(load_ids=frozenset({instrument_id})),
             "base_url_http": server.url,
@@ -86,6 +89,28 @@ def cold_scenario():
         node.kernel.msgbus.subscribe(f"events.order.{observer.id}", events.append)
         task = asyncio.create_task(node.run_async())
         try:
+            if periodic:
+                async with asyncio.timeout(15):
+                    while not node.kernel.cache.orders_open(instrument_id=instrument_id):
+                        await asyncio.sleep(0.05)
+                server.history_available = False
+                await server.fill("123", Decimal("0.00004"), publish=False)
+                client = next(iter(node.kernel.exec_engine.get_clients_for_orders(
+                    node.kernel.cache.orders_open(instrument_id=instrument_id)
+                )))
+                command = GenerateOrderStatusReports(
+                    instrument_id=instrument_id, start=None, end=None, open_only=True,
+                    command_id=UUID4(),
+                    ts_init=time.time_ns(),
+                )
+                try:
+                    await client.generate_order_status_reports(command)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("Incomplete periodic query must remain unresolved")
+                assert not any(isinstance(e, OrderFilled) for e in events)
+                server.history_available = True
             async with asyncio.timeout(15):
                 while not any(isinstance(e, OrderFilled) for e in events):
                     await asyncio.sleep(0.05)
@@ -99,6 +124,9 @@ def cold_scenario():
             assert server.post_count == 0
             assert server.cancel_ids == []
         finally:
+            server.history_available = True
+            await server.manual_cancel("123")
+            await asyncio.sleep(0.2)
             await node.stop_async()
             await asyncio.wait_for(task, 15)
             await server.stop()
@@ -118,5 +146,13 @@ def test_cold_partial_fill_is_a_real_trade_not_an_inferred_execution():
         text=True,
         timeout=45,
         check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_periodic_partial_fill_waits_for_real_history_in_native_engine():
+    script = f"import runpy; runpy.run_path({__file__!r})['cold_scenario'](periodic=True)"
+    result = subprocess.run(  # noqa: S603 (fixed local protocol scenario)
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=45, check=False
     )
     assert result.returncode == 0, result.stdout + result.stderr

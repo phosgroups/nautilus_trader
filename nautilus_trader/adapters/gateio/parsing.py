@@ -39,8 +39,8 @@ def public_trade_tick(row, instrument, now):
     side = {"buy": AggressorSide.BUYER, "sell": AggressorSide.SELLER}[row["side"]]
     return TradeTick(
         instrument.id,
-        Price.from_str(f"{price:.{instrument.price_precision}f}"),
-        Quantity.from_str(f"{size:.{instrument.size_precision}f}"),
+        Price.from_str(f"{price:f}"),
+        Quantity.from_str(f"{size:f}"),
         side,
         TradeId(str(row["id"])),
         event_ns(row, "create_time", now),
@@ -62,20 +62,23 @@ def public_quote_tick(row, instrument, now):
         raise ValueError("Crossed Gate public quote")
     return QuoteTick(
         instrument.id,
-        Price.from_str(f"{bid:.{instrument.price_precision}f}"),
-        Price.from_str(f"{ask:.{instrument.price_precision}f}"),
-        Quantity.from_str(f"{bid_size:.{instrument.size_precision}f}"),
-        Quantity.from_str(f"{ask_size:.{instrument.size_precision}f}"),
+        Price.from_str(f"{bid:f}"),
+        Price.from_str(f"{ask:f}"),
+        Quantity.from_str(f"{bid_size:f}"),
+        Quantity.from_str(f"{ask_size:f}"),
         int(Decimal(str(row["t"])) * 1_000_000),
         now,
     )
 
 
-def order_report(row, instrument, account_id, client_order_id, now):
+def order_report(row, instrument, account_id, client_order_id, now):  # noqa: C901 (explicit venue states)
     amount, left = Decimal(row["amount"]), Decimal(row.get("left", row["amount"]))
     if not amount.is_finite() or not left.is_finite() or amount <= 0 or not 0 <= left <= amount:
         raise ValueError("Invalid Gate order quantities")
     validate_assets(row, instrument)
+    price = Decimal(row["price"])
+    if not price.is_finite() or price <= 0:
+        raise ValueError("Invalid Gate limit order price")
     status = row.get("status")
     finish = row.get("finish_as")
     if status is None:
@@ -127,9 +130,9 @@ def order_report(row, instrument, account_id, client_order_id, now):
             "fok": TimeInForce.FOK,
         }[row.get("time_in_force", "gtc")],
         order_status=status,
-        quantity=Quantity.from_str(f"{amount:.{instrument.size_precision}f}"),
-        filled_qty=Quantity.from_str(f"{amount - left:.{instrument.size_precision}f}"),
-        price=Price.from_str(f"{Decimal(row['price']):.{instrument.price_precision}f}"),
+        quantity=Quantity.from_str(f"{amount:f}"),
+        filled_qty=Quantity.from_str(f"{amount - left:f}"),
+        price=Price.from_str(f"{price:f}"),
         avg_px=Decimal(str(row["avg_deal_price"])) if row.get("avg_deal_price") else None,
         post_only=row.get("time_in_force") == "poc",
         report_id=UUID4(),
@@ -141,6 +144,9 @@ def order_report(row, instrument, account_id, client_order_id, now):
 
 def fill_report(row, instrument, account_id, client_order_id, now):
     validate_assets(row, instrument)
+    amount, price = Decimal(row["amount"]), Decimal(row["price"])
+    if any(not value.is_finite() or value <= 0 for value in (amount, price)):
+        raise ValueError("Invalid Gate execution price or amount")
     # GT/points discounts are additional dimensions, not zero quote fees.
     if Decimal(str(row.get("gt_fee", "0"))) or Decimal(str(row.get("point_fee", "0"))):
         raise ValueError("Gate GT/points fee deductions are not supported by this PMM profile")
@@ -164,8 +170,8 @@ def fill_report(row, instrument, account_id, client_order_id, now):
         client_order_id=client_order_id,
         trade_id=TradeId(str(row["id"])),
         order_side={"buy": OrderSide.BUY, "sell": OrderSide.SELL}[row["side"]],
-        last_qty=Quantity.from_str(f"{Decimal(row['amount']):.{instrument.size_precision}f}"),
-        last_px=Price.from_str(f"{Decimal(row['price']):.{instrument.price_precision}f}"),
+        last_qty=Quantity.from_str(f"{amount:f}"),
+        last_px=Price.from_str(f"{price:f}"),
         commission=commission,
         liquidity_side={"maker": LiquiditySide.MAKER, "taker": LiquiditySide.TAKER}[row["role"]],
         report_id=UUID4(),
@@ -176,7 +182,9 @@ def fill_report(row, instrument, account_id, client_order_id, now):
 
 def validate_assets(row, instrument):
     if (
-        int(row.get("trade_mode", 0)) != 0
+        row.get("currency_pair", instrument.raw_symbol.value) != instrument.raw_symbol.value
+        or row.get("account", "spot") != "spot"
+        or int(row.get("trade_mode", 0)) != 0
         or row.get("stock", instrument.base_currency.code) != instrument.base_currency.code
         or row.get("money", instrument.quote_currency.code) != instrument.quote_currency.code
     ):

@@ -206,8 +206,8 @@ class GateioDataClient(LiveMarketDataClient):
                     action,
                     BookOrder(
                         side,
-                        Price.from_str(f"{price:.{instrument.price_precision}f}"),
-                        Quantity.from_str(f"{size:.{instrument.size_precision}f}"),
+                        Price.from_str(f"{price:f}"),
+                        Quantity.from_str(f"{size:f}"),
                         0,
                     ),
                     flags,

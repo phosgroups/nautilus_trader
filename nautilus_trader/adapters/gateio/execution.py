@@ -5,6 +5,7 @@ import base64
 import hashlib
 import math
 import re
+from collections import OrderedDict
 from contextlib import suppress
 from decimal import Decimal
 from uuid import UUID
@@ -85,6 +86,10 @@ def submit_payload(order):
     }
 
 
+class _SubmissionDeferred(ValueError):
+    """The request has not been sent; wait for private execution readiness again."""
+
+
 class GateioExecutionClient(LiveExecutionClient):
     def __init__(self, loop, client, msgbus, cache, clock, instrument_provider, config, name=None):
         super().__init__(
@@ -101,8 +106,7 @@ class GateioExecutionClient(LiveExecutionClient):
         )
         self._set_account_id(AccountId(f"{name or 'GATEIO'}-master"))
         self.http, self.config = client, config
-        self._client_ids = {}
-        self._seen_fills = set()
+        self._seen_fills = OrderedDict()
         self._report_lock = asyncio.Lock()
         self._recovery_lock = asyncio.Lock()
         if config.account_refresh_interval_ms <= 0:
@@ -129,6 +133,7 @@ class GateioExecutionClient(LiveExecutionClient):
         self._execution_recovery_task = None
         self._execution_generation = 0
         self._waiting_submissions = {}
+        self._inflight_submissions = {}
         self.ws = GateioWebSocket(
             loop,
             clock,
@@ -224,9 +229,6 @@ class GateioExecutionClient(LiveExecutionClient):
         return instrument
 
     def _resolve(self, row):
-        result = self._client_ids.get(row.get("text"))
-        if result is not None:
-            return result
         decoded = original_order_id(row.get("text"))
         if decoded is not None:
             return decoded
@@ -235,6 +237,8 @@ class GateioExecutionClient(LiveExecutionClient):
             cached_id = self._cache.client_order_id(VenueOrderId(venue_id))
             if cached_id is not None:
                 return cached_id
+        if not re.fullmatch(r"t-[0-9a-f]{28}", row.get("text") or ""):
+            return None
         for order in self._cache.orders(venue=GATEIO):
             # Retain recovery of pre-upgrade hashes when the NT Cache is restored.
             legacy = "t-" + hashlib.sha256(str(order.client_order_id).encode()).hexdigest()[:28]
@@ -342,6 +346,10 @@ class GateioExecutionClient(LiveExecutionClient):
     async def _publish_fills(self, rows):
         for row in sorted(rows, key=lambda r: event_ns(r, "create_time", 0)):
             key = (row["currency_pair"], str(row["id"]))
+            cached = self._cached_order(row)
+            if cached is not None and str(row["id"]) in {str(t) for t in cached.trade_ids}:
+                self._remember_fill(key)
+                continue
             if key not in self._seen_fills:
                 # Validate fees/assets before buffering. Unknown orders need a
                 # matching status; sending the fill first can make NT drop it.
@@ -357,7 +365,7 @@ class GateioExecutionClient(LiveExecutionClient):
                 cached = self._cached_order(row)
                 if cached is not None and order_key not in self._pending_orders:
                     self._send_fill_report(parsed)
-                    self._seen_fills.add(key)
+                    self._remember_fill(key)
                     self._pending_fills[order_key].pop(str(row["id"]), None)
                     if not self._pending_fills[order_key]:
                         self._pending_fills.pop(order_key, None)
@@ -365,6 +373,13 @@ class GateioExecutionClient(LiveExecutionClient):
                     self._flush_order(order_key)
         if self._pending_orders or self._pending_fills:
             self._schedule_execution_recovery()
+
+    def _remember_fill(self, key):
+        # Cache trade IDs remain authoritative after this bounded fast path evicts.
+        self._seen_fills[key] = None
+        self._seen_fills.move_to_end(key)
+        if len(self._seen_fills) > 100000:
+            self._seen_fills.popitem(last=False)
 
     def _cached_order(self, row):
         cid = self._resolve(row)
@@ -457,7 +472,8 @@ class GateioExecutionClient(LiveExecutionClient):
                         self._clock.timestamp_ns(),
                     )
                 )
-        self._seen_fills.update(unique)
+        for key in unique:
+            self._remember_fill(key)
 
     async def _load_order_fills(self, row, report):
         if report.filled_qty.as_decimal() == 0:
@@ -611,46 +627,109 @@ class GateioExecutionClient(LiveExecutionClient):
             self._account_paused = False
             self._request_account_refresh()
 
-    async def _collect_reconciliation(self):
+    async def _collect_reconciliation(self, lookback_mins=None, include_account=True):
         now = self._clock.timestamp_ns() // 1_000_000_000
-        since = now - self.config.reconciliation_lookback_mins * 60
+        minutes = self.config.reconciliation_lookback_mins if lookback_mins is None else lookback_mins
+        if minutes < 0:
+            raise ValueError("Gate reconciliation lookback must be nonnegative")
+        since = max(0, now - minutes * 60)
         fills, reports = [], []
         for instrument in self._instrument_provider.get_all().values():
-            symbol = instrument.raw_symbol.value
-            fills.extend(
-                await self.http.pages("/spot/my_trades", {"currency_pair": symbol, "from": since})
-            )
-            for status in ("open", "finished"):
-                for row in await self.http.pages(
-                    "/spot/orders",
-                    {
-                        "currency_pair": symbol,
-                        "status": status,
-                        **({"from": since} if status == "finished" else {}),
-                    },
-                ):
-                    report = order_report(
-                        row,
-                        instrument,
-                        self.account_id,
-                        self._resolve(row),
-                        self._clock.timestamp_ns(),
-                    )
-                    if report.filled_qty.as_decimal() > 0:
-                        trades = await self.http.pages(
-                            "/spot/my_trades", {"currency_pair": symbol, "order_id": row["id"]}
-                        )
-                        unique_trades = {str(r["id"]): r for r in trades}
-                        known = sum(
-                            (Decimal(r["amount"]) for r in unique_trades.values()), Decimal(0)
-                        )
-                        if known != report.filled_qty.as_decimal():
-                            raise RuntimeError("Gate reconciliation trade history is incomplete")
-                        fills.extend(trades)
-                    reports.append(report)
-        self._account_last_request = self._loop.time()
-        balances = await self.http.request("GET", "/spot/accounts", private=True)
+            paired_orders, paired_fills = await self._collect_instrument_reconciliation(instrument, since)
+            reports.extend(paired_orders)
+            fills.extend(paired_fills)
+        balances = None
+        if include_account:
+            self._account_last_request = self._loop.time()
+            balances = await self.http.request("GET", "/spot/accounts", private=True)
         return reports, fills, balances
+
+    async def _reconciliation_orders(self, instrument, since, needed):
+        symbol, orders = instrument.raw_symbol.value, {}
+        for status in ("open", "finished"):
+            params = {"currency_pair": symbol, "status": status}
+            if status == "finished":
+                params["from"] = since
+            for row in await self.http.pages("/spot/orders", params):
+                if row["currency_pair"] != symbol:
+                    raise ValueError("Gate returned an order for another instrument")
+                orders[str(row["id"])] = row
+        active = self._cache.orders_open(instrument_id=instrument.id)
+        active += self._cache.orders_inflight(instrument_id=instrument.id)
+        needed = set(needed) | {str(o.venue_order_id) for o in active if o.venue_order_id is not None}
+        for oid in needed - orders.keys():
+            row = await self.http.request(
+                "GET", "/spot/orders/" + oid, {"currency_pair": symbol}, private=True
+            )
+            if row["currency_pair"] != symbol or str(row["id"]) != oid:
+                raise ValueError("Gate returned a status for another order")
+            orders[oid] = row
+        return orders
+
+    async def _collect_instrument_reconciliation(self, instrument, since):
+        symbol, by_order = instrument.raw_symbol.value, {}
+        for fill in await self.http.pages("/spot/my_trades", {"currency_pair": symbol, "from": since}):
+            self._validate_execution(fill, instrument)
+            by_order.setdefault(str(fill["order_id"]), {})[str(fill["id"])] = fill
+        # Pair recent fills and cached active orders even when their creation
+        # time lies outside Gate's finished-order filter.
+        orders = await self._reconciliation_orders(instrument, since, by_order)
+        fills, reports = {}, []
+        for oid, row in orders.items():
+            report = order_report(
+                row, instrument, self.account_id, self._resolve(row), self._clock.timestamp_ns()
+            )
+            trades = dict(by_order.get(oid, {}))
+            known = sum((Decimal(r["amount"]) for r in trades.values()), Decimal(0))
+            if known != report.filled_qty.as_decimal():
+                # Reuse bulk history; query individual partial lifecycles only.
+                for fill in await self.http.pages(
+                    "/spot/my_trades", {"currency_pair": symbol, "order_id": oid}
+                ):
+                    self._validate_execution(fill, instrument, oid)
+                    trades[str(fill["id"])] = fill
+                known = sum((Decimal(r["amount"]) for r in trades.values()), Decimal(0))
+            if known != report.filled_qty.as_decimal():
+                raise RuntimeError("Gate reconciliation trade history is incomplete")
+            fills.update(((symbol, tid), fill) for tid, fill in trades.items())
+            reports.append(report)
+        return reports, list(fills.values())
+
+    def _validate_execution(self, row, instrument, order_id=None):
+        if row["currency_pair"] != instrument.raw_symbol.value or (
+            order_id is not None and str(row["order_id"]) != str(order_id)
+        ):
+            raise ValueError("Gate returned executions for another order or instrument")
+        return fill_report(
+            row, instrument, self.account_id, self._resolve(row), self._clock.timestamp_ns()
+        )
+
+    async def generate_mass_status(self, lookback_mins=None):
+        # The base client gathers orders and fills independently. Gate history
+        # can lag its statuses, so return only a complete, paired execution view.
+        self.reconciliation_active = True
+        try:
+            reports, fills, _ = await self._collect_reconciliation(
+                lookback_mins=lookback_mins, include_account=False
+            )
+            mass = ExecutionMassStatus(
+                client_id=self.id,
+                account_id=self.account_id,
+                venue=GATEIO,
+                report_id=UUID4(),
+                ts_init=self._clock.timestamp_ns(),
+            )
+            mass.add_order_reports(reports)
+            mass.add_fill_reports([
+                self._validate_execution(row, self._instrument(row["currency_pair"]))
+                for row in sorted(fills, key=lambda r: event_ns(r, "create_time", 0))
+            ])
+            return mass
+        except Exception as error:
+            self._log.warning(f"Gate mass reconciliation incomplete: {type(error).__name__}")
+            return None
+        finally:
+            self.reconciliation_active = False
 
     def _account_is_fresh(self):
         return (
@@ -658,8 +737,9 @@ class GateioExecutionClient(LiveExecutionClient):
             < self.config.account_stale_after_ms / 1000
         )
 
-    async def _await_submission_ready(self, canceled):
-        deadline = self._loop.time() + self.config.submission_ready_timeout_secs
+    async def _await_submission_ready(self, canceled, timeout_secs=None):
+        timeout = self.config.submission_ready_timeout_secs if timeout_secs is None else timeout_secs
+        deadline = self._loop.time() + timeout
         while not self._account_stopping:
             if canceled.is_set():
                 return
@@ -682,40 +762,67 @@ class GateioExecutionClient(LiveExecutionClient):
             "Gate private stream, execution facts or account balance is not ready before submission deadline"
         )
 
-    async def _submit_order(self, command):
-        order = command.order
-        if order.is_closed:
-            return
-        canceled = asyncio.Event()
-        self._waiting_submissions[order.client_order_id] = canceled
-        try:
-            payload = submit_payload(order)
-            await self._await_submission_ready(canceled)
-            if order.is_closed or canceled.is_set():
-                return
-        except ValueError as error:
-            self.generate_order_denied(
-                strategy_id=order.strategy_id,
-                instrument_id=order.instrument_id,
-                client_order_id=order.client_order_id,
-                reason=str(error),
-                ts_event=self._clock.timestamp_ns(),
-            )
-            return
-        finally:
-            self._waiting_submissions.pop(order.client_order_id, None)
-        self._client_ids[payload["text"]] = order.client_order_id
+    def _prepare_submission(self, order, canceled, finished):
+        if order.is_closed or canceled.is_set():
+            raise ValueError("Gate submission canceled before transport dispatch")
+        if (
+            self._account_stopping or self._account_paused or not self.ws.is_ready()
+            or not self._account_is_fresh() or self._pending_orders or self._pending_fills
+        ):
+            raise _SubmissionDeferred("Gate execution/account state expired while submission was queued")
+        self._waiting_submissions.pop(order.client_order_id, None)
+        self._inflight_submissions[order.client_order_id] = finished
         self.generate_order_submitted(
             strategy_id=order.strategy_id,
             instrument_id=order.instrument_id,
             client_order_id=order.client_order_id,
             ts_event=self._clock.timestamp_ns(),
         )
+
+    async def _send_submission(self, order, payload, canceled, finished):
+        budget = self.config.submission_ready_timeout_secs
+        while True:
+            started = self._loop.time()
+            await self._await_submission_ready(canceled, max(0, budget))
+            budget -= self._loop.time() - started
+            if order.is_closed or canceled.is_set():
+                return None
+            try:
+                return await self.http.request(
+                    "POST", "/spot/orders", body=payload, private=True,
+                    before_send=lambda: self._prepare_submission(order, canceled, finished),
+                )
+            except _SubmissionDeferred:
+                # Re-queue only an explicitly unsent request. Quota waits do
+                # not consume the private-readiness budget.
+                continue
+
+    async def _submit_order(self, command):
+        order = command.order
+        if order.is_closed:
+            return
+        canceled, finished = asyncio.Event(), asyncio.Event()
+        self._waiting_submissions[order.client_order_id] = canceled
         try:
-            row = await self.http.request("POST", "/spot/orders", body=payload, private=True)
+            payload = submit_payload(order)
+            row = await self._send_submission(order, payload, canceled, finished)
+            if order.is_closed or canceled.is_set():
+                return
             async with self._report_lock:
                 await self._publish_order(row)
             self._request_account_refresh()
+        except ValueError as error:
+            if order.client_order_id not in self._inflight_submissions:
+                if not order.is_closed and not canceled.is_set():
+                    self.generate_order_denied(
+                        strategy_id=order.strategy_id,
+                        instrument_id=order.instrument_id,
+                        client_order_id=order.client_order_id,
+                        reason=str(error),
+                        ts_event=self._clock.timestamp_ns(),
+                    )
+            else:
+                self._log.warning("Gate submission response invalid; query before replacement")
         except GateioHttpError as error:
             if error.definite_rejection:
                 self.generate_order_rejected(
@@ -729,8 +836,12 @@ class GateioExecutionClient(LiveExecutionClient):
                 self._log.warning("Gate submission outcome unknown; query before any replacement")
         except Exception:
             self._log.warning("Gate submission outcome unknown; request is not retried")
+        finally:
+            self._waiting_submissions.pop(order.client_order_id, None)
+            self._inflight_submissions.pop(order.client_order_id, None)
+            finished.set()
 
-    async def _cancel_order(self, command):
+    async def _cancel_order(self, command):  # noqa: C901 (local, in-flight and exchange outcomes)
         waiting = self._waiting_submissions.get(command.client_order_id)
         if waiting is not None:
             # The POST has not started: cancellation is a known local outcome,
@@ -747,6 +858,16 @@ class GateioExecutionClient(LiveExecutionClient):
         order = self._cache.order(command.client_order_id)
         if order is not None and order.is_closed:
             return
+        inflight = self._inflight_submissions.get(command.client_order_id)
+        if inflight is not None and not (
+            command.venue_order_id or (order is not None and order.venue_order_id)
+        ):
+            # A custom-ID cancel must not overtake an HTTP POST still in flight.
+            # No report lock is held while waiting; WS confirmations keep flowing.
+            await inflight.wait()
+            order = self._cache.order(command.client_order_id)
+            if order is not None and order.is_closed:
+                return
         venue_id = command.venue_order_id or (order.venue_order_id if order is not None else None)
         target = str(venue_id) if venue_id is not None else order_text(command.client_order_id)
         try:
@@ -912,15 +1033,24 @@ class GateioExecutionClient(LiveExecutionClient):
                 if command.end is not None:
                     params["to"] = int(command.end.timestamp())
                 for row in await self.http.pages("/spot/orders", params):
-                    reports.append(
-                        order_report(
-                            row,
-                            instrument,
-                            self.account_id,
-                            self._resolve(row),
-                            self._clock.timestamp_ns(),
-                        )
+                    if row["currency_pair"] != instrument.raw_symbol.value:
+                        raise ValueError("Gate returned an order for another instrument")
+                    report = order_report(
+                        row, instrument, self.account_id, self._resolve(row), self._clock.timestamp_ns()
                     )
+                    async with self._report_lock:
+                        await self._load_order_fills(row, report)
+                        if (row["currency_pair"], str(row["id"])) in self._pending_orders:
+                            # Periodic NT open-order checks reconcile with trades=[],
+                            # so never expose a filled total before real fills land.
+                            raise RuntimeError("Gate order query awaits matching real executions")
+                    cached = self._cached_order(row)
+                    if cached is not None and (
+                        cached.filled_qty > report.filled_qty
+                        or (cached.is_closed and report.is_open)
+                    ):
+                        continue
+                    reports.append(report)
         return reports
 
     async def generate_fill_reports(self, command):

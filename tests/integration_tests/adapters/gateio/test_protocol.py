@@ -472,6 +472,7 @@ def test_cancel_not_found_requires_a_confirmed_terminal_state(status):
         client = SimpleNamespace(
             _cache=SimpleNamespace(order=lambda _: cached),
             _waiting_submissions={},
+            _inflight_submissions={},
             http=SimpleNamespace(
                 request=AsyncMock(
                     side_effect=[
@@ -522,6 +523,7 @@ def test_cancel_error_after_private_terminal_event_does_not_reject_again():
         client = SimpleNamespace(
             _cache=SimpleNamespace(order=lambda _: cached),
             _waiting_submissions={},
+            _inflight_submissions={},
             http=SimpleNamespace(request=AsyncMock(side_effect=cancel)),
             generate_order_cancel_rejected=Mock(),
         )

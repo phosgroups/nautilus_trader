@@ -127,6 +127,42 @@ account orders to work around missing identity.
 Instrument definitions retain maximum base quantity and quote notional limits,
 and exchange price-protection cancellations map to an explicit terminal state.
 
+## Queued commands and periodic reconciliation
+
+The HTTP budget is shared by all methods. A cancellable Python queue runs before
+signing and native dispatch; cancellations take priority over reads, and reads
+over new submissions. This prevents full ladders from starving authoritative
+account reads. Native quota enforcement remains enabled as a second limit.
+Queued submissions recheck stream readiness, balances, execution facts and local
+cancellation immediately before dispatch. An explicitly unsent request may wait
+for readiness again; unknown POST outcomes are never retried. A cancellation
+without a venue ID waits for an already dispatched submit response instead of
+overtaking it. Shutdown prevents queued writes from appearing afterwards.
+
+Gate overrides the engine's mass-status query to return paired order/trade facts.
+Periodic order-list queries also defer filled totals until real executions have
+been applied. A missing history window returns an incomplete-reconciliation
+failure, never a fabricated fee-free fill. Recent fills of older orders and
+cached active orders are queried explicitly when absent from creation-time
+filters. Complete bulk history is reused rather than re-fetching every filled
+order separately. Reconciliation flags are reset on failure and cancellation.
+
+Subscriptions carry unique request IDs and require matching acknowledgements;
+a late acknowledgement from an earlier attempt cannot confirm a newer batch.
+
+Execution and book prices/sizes retain the exchange decimal values rather than
+being rounded to the current instrument rules. Other wallets/instruments and
+invalid execution numbers fail validation. The fill fast-dedup cache is bounded
+to 100,000 IDs; native Cache trade IDs remain authoritative after eviction.
+Reversible client IDs need no unbounded process-local mapping.
+
+Native node tests additionally exercise the Gate example's unchanged 3-second
+book timeout, 2x imbalance threshold, enabled depth-coverage check and 2% cancel
+boundary at 50 levels per side. They verify imbalance/staleness withdrawal,
+automatic recovery and confirmed clean shutdown. This controlled protocol test
+does not assert that a quiet or imbalanced real testnet market satisfies those
+guards, or that unsupported account/execution modes are production-ready.
+
 ## Build and test
 
 Normal NT wheel builds include `nautilus_trader/adapters/gateio`. PMM deployment
