@@ -6,11 +6,13 @@ from decimal import Decimal
 
 from nautilus_trader.adapters.gateio.config import GATEIO
 from nautilus_trader.adapters.gateio.http import GateioHttpError
+from nautilus_trader.adapters.gateio.parsing import event_ns
 from nautilus_trader.adapters.gateio.parsing import fill_report
 from nautilus_trader.adapters.gateio.parsing import order_report
 from nautilus_trader.adapters.gateio.websocket import GateioWebSocket
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import CancelOrder
+from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OmsType
@@ -181,9 +183,37 @@ class GateioExecutionClient(LiveExecutionClient):
         report = order_report(
             row, instrument, self.account_id, self._resolve(row), self._clock.timestamp_ns()
         )
-        await self._load_order_fills(row, report)
-        self._send_order_status_report(report)
+        if not await self._load_order_fills(row, report):
+            self._send_order_status_report(report)
         return report
+
+    def _publish_facts(self, reports, rows):
+        # Reconcile status and executions atomically, as the Bitget adapter
+        # does. Separate reports can otherwise create inferred zero-fee fills
+        # when an external order is first discovered already partially filled.
+        mass = ExecutionMassStatus(
+            client_id=self.id,
+            account_id=self.account_id,
+            venue=GATEIO,
+            report_id=UUID4(),
+            ts_init=self._clock.timestamp_ns(),
+        )
+        mass.add_order_reports(reports)
+        unique = {(r["currency_pair"], str(r["id"])): r for r in rows}
+        mass.add_fill_reports(
+            [
+                fill_report(
+                    row,
+                    self._instrument(row["currency_pair"]),
+                    self.account_id,
+                    self._resolve(row),
+                    self._clock.timestamp_ns(),
+                )
+                for row in sorted(unique.values(), key=lambda r: event_ns(r, "create_time", 0))
+            ]
+        )
+        self._send_mass_status_report(mass)
+        self._seen_fills.update(unique)
 
     async def _load_order_fills(self, row, report):
         if report.filled_qty.as_decimal() > 0:
@@ -194,11 +224,13 @@ class GateioExecutionClient(LiveExecutionClient):
                     "order_id": row["id"],
                 },
             )
-            await self._publish_fills(fills)
             # Do not let aggregate order reports invent trades with unknown fees.
             known = sum((Decimal(r["amount"]) for r in fills), Decimal(0))
             if known < report.filled_qty.as_decimal():
                 raise RuntimeError("Gate filled quantity is not explained by trade records")
+            self._publish_facts([report], fills)
+            return True
+        return False
 
     async def _message(self, message):
         async with self._report_lock:
@@ -256,9 +288,7 @@ class GateioExecutionClient(LiveExecutionClient):
             # Recovery facts are collected before publishing any callbacks. New
             # PMM replacements triggered by those callbacks can use the restored
             # private stream, instead of receiving a spurious reconnect denial.
-            await self._publish_fills(fills)
-            for report in reports:
-                self._send_order_status_report(report)
+            self._publish_facts(reports, fills)
             self._publish_account(balances)
             self.ws.ready = True
 

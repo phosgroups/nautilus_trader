@@ -34,7 +34,9 @@ PMM's own 50 working orders per side and does not guarantee ±2% market coverage
 POST/DELETE requests with unknown outcomes are not blindly retried. NT order
 queries and reconciliation determine their outcome; PMM keeps its existing
 fault/shutdown policy. Partial-fill order totals are checked against trade
-records rather than generating fictitious fills or fees. WS `event/finish_as`
+records rather than generating fictitious fills or fees. Status and real fills
+are reconciled together, including external orders already filled at startup,
+so NT retains the exchange trade IDs, prices and fee currencies. WS `event/finish_as`
 and REST `status` are both supported. Immediate post-only cancellation is
 reported as rejection.
 
