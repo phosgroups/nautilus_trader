@@ -33,6 +33,8 @@ class LocalGate:
         self.fill_on_cancel = None
         self.reject_next = False
         self.history_available = True
+        self.push_acceptance = False
+        self.cancel_delay = 0
 
     async def start(self):
         app = web.Application()
@@ -188,6 +190,9 @@ class LocalGate:
             if self.reject_next:
                 self.reject_next = False
                 row.update(status="closed", finish_as="poc")
+            if self.push_acceptance:
+                await self.broadcast("spot.orders", [self.order_notification(row)])
+                await asyncio.sleep(0.05)
             return web.json_response(row)
         if tail == "spot/orders":
             status = request.query["status"]
@@ -203,6 +208,7 @@ class LocalGate:
             if row is None:
                 return web.json_response({"label": "ORDER_NOT_FOUND"}, status=404)
             if request.method == "DELETE":
+                await asyncio.sleep(self.cancel_delay)
                 if row["status"] != "open":
                     return web.json_response({"label": "ORDER_NOT_FOUND"}, status=404)
                 if self.fill_on_cancel == row["id"]:

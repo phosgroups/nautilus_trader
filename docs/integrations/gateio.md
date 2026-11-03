@@ -146,6 +146,9 @@ failure, never a fabricated fee-free fill. Recent fills of older orders and
 cached active orders are queried explicitly when absent from creation-time
 filters. Complete bulk history is reused rather than re-fetching every filled
 order separately. Reconciliation flags are reset on failure and cancellation.
+Identical REST/WS acceptance acknowledgements cannot overwrite a confirmed
+order's local pending-cancel state or emit another acceptance; the first venue
+acknowledgement and genuine price/quantity changes remain observable.
 
 Subscriptions carry unique request IDs and require matching acknowledgements;
 a late acknowledgement from an earlier attempt cannot confirm a newer batch.

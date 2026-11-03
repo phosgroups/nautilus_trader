@@ -17,7 +17,11 @@ from nautilus_trader.adapters.gateio.parsing import fill_report
 from nautilus_trader.adapters.gateio.parsing import order_report
 from nautilus_trader.adapters.gateio.websocket import GateioWebSocket
 from nautilus_trader.common.component import TestClock
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.identifiers import AccountId
+from nautilus_trader.model.identifiers import VenueOrderId
+from nautilus_trader.model.objects import Price
+from nautilus_trader.model.objects import Quantity
 
 
 helpers = runpy.run_path(str(Path(__file__).with_name("test_recovery_edges.py")))
@@ -412,3 +416,24 @@ def test_cash_spot_reports_do_not_accept_other_wallets_or_instruments(key, value
     instrument = helpers["parse_instrument"](helpers["PAIR"], 0)
     with pytest.raises(ValueError):
         fill_report(fill(**{key: value}), instrument, AccountId("GATEIO-master"), None, 0)
+
+
+@pytest.mark.parametrize("already_accepted", [False, True])
+def test_pending_cancel_keeps_first_ack_but_drops_a_duplicate_acceptance(already_accepted):
+    async def run():
+        client = client_for(lambda *args, **kwargs: balances())
+        row = helpers["canceled_order"]()
+        row["status"] = "open"
+        cached = SimpleNamespace(
+            is_closed=False, status=OrderStatus.PENDING_CANCEL, ts_accepted=int(already_accepted),
+            filled_qty=Quantity.from_str("0"), quantity=Quantity.from_str(row["amount"]),
+            price=Price.from_str(row["price"]), venue_order_id=VenueOrderId(row["id"]),
+        )
+        client._cached_order = lambda _: cached
+        try:
+            await client._publish_order(row)
+            assert len(client.reports) == (0 if already_accepted else 1)
+        finally:
+            await cleanup(client)
+
+    asyncio.run(bounded(run()))

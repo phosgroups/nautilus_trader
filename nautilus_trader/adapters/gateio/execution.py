@@ -388,12 +388,30 @@ class GateioExecutionClient(LiveExecutionClient):
             cid = self._cache.client_order_id(VenueOrderId(oid))
         return self._cache.order(cid) if cid is not None else None
 
+    @staticmethod
+    def _duplicate_pending_acceptance(cached, report):
+        # REST and WS may acknowledge the same submit after a local cancel.
+        # Replaying it into NT would overwrite PENDING_CANCEL and emit another
+        # OrderAccepted. Preserve first acknowledgements and genuine amendments.
+        return (
+            report.order_status == OrderStatus.ACCEPTED
+            and cached is not None
+            and not cached.is_closed
+            and cached.status == OrderStatus.PENDING_CANCEL
+            and cached.ts_accepted > 0
+            and cached.venue_order_id == report.venue_order_id
+            and cached.quantity == report.quantity
+            and cached.price == report.price
+        )
+
     async def _publish_order(self, row):
         instrument = self._instrument(row["currency_pair"])
         report = order_report(
             row, instrument, self.account_id, self._resolve(row), self._clock.timestamp_ns()
         )
         cached = self._cached_order(row)
+        if self._duplicate_pending_acceptance(cached, report):
+            return report
         if cached is not None and (
             cached.filled_qty.as_decimal() > report.filled_qty.as_decimal()
             or (
@@ -432,8 +450,10 @@ class GateioExecutionClient(LiveExecutionClient):
             )
             if (
                 cached is not None
-                and cached.is_closed
-                and report.order_status in {OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED}
+                and (
+                    (cached.is_closed and report.order_status in {OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED})
+                    or self._duplicate_pending_acceptance(cached, report)
+                )
             ):
                 stale_open.add((report.instrument_id.symbol.value, str(report.venue_order_id)))
             else:
@@ -719,7 +739,13 @@ class GateioExecutionClient(LiveExecutionClient):
                 report_id=UUID4(),
                 ts_init=self._clock.timestamp_ns(),
             )
-            mass.add_order_reports(reports)
+            mass.add_order_reports([
+                report for report in reports
+                if not self._duplicate_pending_acceptance(self._cached_order({
+                    "currency_pair": report.instrument_id.symbol.value,
+                    "id": str(report.venue_order_id),
+                }), report)
+            ])
             mass.add_fill_reports([
                 self._validate_execution(row, self._instrument(row["currency_pair"]))
                 for row in sorted(fills, key=lambda r: event_ns(r, "create_time", 0))
@@ -1011,6 +1037,10 @@ class GateioExecutionClient(LiveExecutionClient):
             self._resolve(row),
             self._clock.timestamp_ns(),
         )
+        if report.order_status == OrderStatus.ACCEPTED and self._duplicate_pending_acceptance(
+            self._cached_order(row), report
+        ):
+            return None
         async with self._report_lock:
             await self._load_order_fills(row, report)
             if (row["currency_pair"], str(row["id"])) in self._pending_orders:
@@ -1048,6 +1078,7 @@ class GateioExecutionClient(LiveExecutionClient):
                     if cached is not None and (
                         cached.filled_qty > report.filled_qty
                         or (cached.is_closed and report.is_open)
+                        or self._duplicate_pending_acceptance(cached, report)
                     ):
                         continue
                     reports.append(report)
