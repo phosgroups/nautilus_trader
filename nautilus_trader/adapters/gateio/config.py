@@ -50,3 +50,4 @@ class GateioExecClientConfig(LiveExecClientConfig, frozen=True):
     http_rate_per_second: int = 10
     max_retries: int = 3
     reconciliation_lookback_mins: int = 60
+    account_refresh_interval_ms: int = 250

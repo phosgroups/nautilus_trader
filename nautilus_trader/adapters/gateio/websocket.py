@@ -58,13 +58,13 @@ class GateioWebSocket:
             self.error_handler(f"Gate WebSocket is not ready: {self.error}")
 
     async def connect(self):
-        self.worker = self.loop.create_task(self._consume())
         self.client = await WebSocketClient.connect(
             loop_=self.loop,
             config=WebSocketConfig(url=self.url, headers=[], heartbeat=10, proxy_url=self.proxy),
             handler=self._receive,
             post_reconnection=self._reconnected,
         )
+        self.worker = self.loop.create_task(self._consume())
         self.ready = True
 
     async def subscribe(self, channel, payload=None):
@@ -158,12 +158,16 @@ class GateioWebSocket:
 
     async def disconnect(self):
         self.ready = False
-        if self.client is not None:
-            await self.client.disconnect()
-        tasks = [t for t in (self.worker, self.recovery) if t is not None]
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        for future in self.pending.values():
-            if not future.done():
-                future.cancel()
+        try:
+            if self.client is not None:
+                await self.client.disconnect()
+        finally:
+            tasks = [t for t in (self.worker, self.recovery) if t is not None]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for future in self.pending.values():
+                if not future.done():
+                    future.cancel()
+            self.pending.clear()
+            self.worker = self.recovery = None

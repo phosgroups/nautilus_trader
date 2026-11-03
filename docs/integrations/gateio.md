@@ -61,6 +61,22 @@ The conservative HTTP throttle is 10 requests/second per client, not an asserted
 Gate account limit. The Gate PMM example allows 30 seconds for command/in-flight
 checks and 60 seconds for confirmed shutdown of a 100-order ladder.
 
+Balance pushes are partial currency updates. They mark the account dirty rather
+than making REST calls in the ordered private-stream consumer. One background
+worker coalesces notifications and command completions into full `/spot/accounts`
+reads, with `account_refresh_interval_ms=250` between request starts by default.
+Order/cancel reports never wait for these reads or hold their report lock while
+refreshing balances. Notifications arriving during a read trigger a follow-up;
+failed reads retry with bounded backoff and preserve the last valid account.
+Explicit account queries share an in-flight read. Reconnect cancels/fences old
+reads before restoring orders, fills and balances; disconnect cancels background
+work and performs a bounded final account reconciliation. Initial account
+registration still completes before private-stream startup.
+
+This follows Binance/OKX's separation of account handling from execution reports,
+while retaining full REST account reconciliation and paired order/fill recovery
+as in Bitget. Gate balance pushes are not treated as complete wallet snapshots.
+
 ## Build and test
 
 Normal NT wheel builds include `nautilus_trader/adapters/gateio`. PMM deployment

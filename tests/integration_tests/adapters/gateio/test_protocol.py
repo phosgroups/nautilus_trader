@@ -482,7 +482,7 @@ def test_cancel_not_found_requires_a_confirmed_terminal_state(status):
             ),
             _report_lock=asyncio.Lock(),
             _publish_order=AsyncMock(return_value=SimpleNamespace(order_status=status)),
-            _update_account=AsyncMock(),
+            _request_account_refresh=Mock(),
             _clock=TestClock(),
             _log=SimpleNamespace(warning=Mock()),
             generate_order_cancel_rejected=Mock(),
@@ -503,7 +503,7 @@ def test_cancel_not_found_requires_a_confirmed_terminal_state(status):
         )
         if status is not None:
             client._publish_order.assert_awaited_once_with(query_result)
-            client._update_account.assert_awaited_once()
+            client._request_account_refresh.assert_called_once()
 
     asyncio.run(run())
 

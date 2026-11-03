@@ -68,6 +68,15 @@ class GateioExecutionClient(LiveExecutionClient):
         self._client_ids = {}
         self._seen_fills = set()
         self._report_lock = asyncio.Lock()
+        if config.account_refresh_interval_ms <= 0:
+            raise ValueError("Gate account refresh interval must be positive")
+        self._account_refresh_task = None
+        self._account_read_task = None
+        self._account_dirty = False
+        self._account_paused = True
+        self._account_stopping = False
+        self._account_generation = 0
+        self._account_last_request = float("-inf")
         self.ws = GateioWebSocket(
             loop,
             clock,
@@ -81,6 +90,7 @@ class GateioExecutionClient(LiveExecutionClient):
         )
 
     async def _connect(self):
+        self._account_stopping = False
         await self._instrument_provider.initialize()
         if not self._instrument_provider.get_all():
             raise ValueError("Configure Gate instrument_provider.load_ids before connecting")
@@ -88,15 +98,52 @@ class GateioExecutionClient(LiveExecutionClient):
             self._cache.add_instrument(instrument)
         await self._update_account()
         await self._await_account_registered()
-        await self.ws.connect()
-        symbols = [i.symbol.value for i in self._instrument_provider.get_all()]
-        await self.ws.subscribe("spot.orders", symbols)
-        await self.ws.subscribe("spot.usertrades", symbols)
-        await self.ws.subscribe("spot.balances")
-        await self._reconcile()
+        try:
+            await self.ws.connect()
+            symbols = [i.symbol.value for i in self._instrument_provider.get_all()]
+            await self.ws.subscribe("spot.orders", symbols)
+            await self.ws.subscribe("spot.usertrades", symbols)
+            await self.ws.subscribe("spot.balances")
+            await self._reconcile()
+        except BaseException:
+            self._account_paused = True
+            await self.ws.disconnect()
+            await self._cancel_account_tasks()
+            raise
 
     async def _disconnect(self):
-        await self.ws.disconnect()
+        self._account_stopping = True
+        self._account_paused = True
+        try:
+            await self.ws.disconnect()
+        finally:
+            await self._cancel_account_tasks()
+        # Order shutdown has already drained. Keep the final Cache balances
+        # authoritative even if the last coalesced refresh was still pending.
+        try:
+            async with asyncio.timeout(min(self.config.http_timeout_secs, 5)):
+                await self._update_account()
+        except Exception as error:
+            self._log.warning(f"Gate final account refresh failed: {type(error).__name__}")
+        finally:
+            # The shielded HTTP read also needs cancellation if the bounded
+            # final refresh timed out. No task may publish after disconnect.
+            await self._cancel_account_tasks()
+            self._account_paused = True
+            self._account_dirty = False
+
+    async def _cancel_account_tasks(self):
+        # Responses from the previous connection must never overwrite recovery.
+        self._account_generation += 1
+        tasks = [
+            task
+            for task in (self._account_refresh_task, self._account_read_task)
+            if task is not None and task is not asyncio.current_task()
+        ]
+        self._account_refresh_task = self._account_read_task = None
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def _instrument(self, symbol):
         instrument = next(
@@ -124,8 +171,54 @@ class GateioExecutionClient(LiveExecutionClient):
         return None  # External orders must not be claimed by PMM.
 
     async def _update_account(self):
+        # Explicit queries and the background worker share one in-flight read.
+        # Shielding lets one canceled waiter leave other account queries intact.
+        task = self._account_read_task
+        if task is None or task.done():
+            task = self.create_task(self._read_account(self._account_generation))
+            self._account_read_task = task
+        await asyncio.shield(task)
+
+    async def _read_account(self, generation):
+        self._account_last_request = self._loop.time()
         rows = await self.http.request("GET", "/spot/accounts", private=True)
-        self._publish_account(rows)
+        if generation == self._account_generation:
+            self._publish_account(rows)
+
+    def _request_account_refresh(self):
+        if self._account_stopping:
+            return
+        self._account_dirty = True
+        if self._account_paused:
+            return
+        task = self._account_refresh_task
+        if task is None or task.done():
+            self._account_refresh_task = self.create_task(self._refresh_account())
+
+    async def _refresh_account(self):
+        failures = 0
+        try:
+            while self._account_dirty and not self._account_stopping and not self._account_paused:
+                interval = self.config.account_refresh_interval_ms / 1000
+                await asyncio.sleep(
+                    max(0, self._account_last_request + interval - self._loop.time())
+                )
+                # Fold notifications during the delay into this read. Updates
+                # arriving during the read remain dirty and get a follow-up.
+                self._account_dirty = False
+                try:
+                    await self._update_account()
+                    failures = 0
+                except Exception as error:
+                    self._account_dirty = True
+                    failures += 1
+                    self._log.warning(
+                        f"Gate account refresh failed; retrying: {type(error).__name__}"
+                    )
+                    await asyncio.sleep(min(0.25 * 2 ** min(failures - 1, 3), 2))
+        finally:
+            if self._account_refresh_task is asyncio.current_task():
+                self._account_refresh_task = None
 
     def _publish_account(self, rows):
         # Gate omits currencies with zero balances. Publish explicit zeroes
@@ -233,19 +326,26 @@ class GateioExecutionClient(LiveExecutionClient):
         return False
 
     async def _message(self, message):
+        channel, rows = message["channel"], message["result"]
+        if channel == "spot.balances":
+            # Balance pushes are partial currency updates. Like the Bitget
+            # account path, retain full REST reconciliation, but never wait for
+            # it in the ordered order/fill consumer (or under its report lock).
+            self._request_account_refresh()
+            return
         async with self._report_lock:
-            channel, rows = message["channel"], message["result"]
             if channel == "spot.orders":
                 for row in rows:
                     await self._publish_order(row)
             elif channel == "spot.usertrades":
                 await self._publish_fills(rows)
-                await self._update_account()
-            elif channel == "spot.balances":
-                # Refresh a coherent complete account rather than combine partial WS rows.
-                await self._update_account()
+        if channel in {"spot.orders", "spot.usertrades"}:
+            self._request_account_refresh()
 
     async def _reconcile(self):
+        self._account_paused = True
+        self.ws.ready = False
+        await self._cancel_account_tasks()
         async with self._report_lock:
             now = self._clock.timestamp_ns() // 1_000_000_000
             since = now - self.config.reconciliation_lookback_mins * 60
@@ -291,6 +391,9 @@ class GateioExecutionClient(LiveExecutionClient):
             self._publish_facts(reports, fills)
             self._publish_account(balances)
             self.ws.ready = True
+        self._account_paused = False
+        if self._account_dirty:
+            self._request_account_refresh()
 
     async def _submit_order(self, command):
         order = command.order
@@ -320,7 +423,7 @@ class GateioExecutionClient(LiveExecutionClient):
             row = await self.http.request("POST", "/spot/orders", body=payload, private=True)
             async with self._report_lock:
                 await self._publish_order(row)
-                await self._update_account()
+            self._request_account_refresh()
         except GateioHttpError as error:
             if error.definite_rejection:
                 self.generate_order_rejected(
@@ -350,7 +453,7 @@ class GateioExecutionClient(LiveExecutionClient):
             )
             async with self._report_lock:
                 await self._publish_order(row)
-                await self._update_account()
+            self._request_account_refresh()
         except GateioHttpError as error:
             if error.definite_rejection:
                 # Cancellation can queue behind rate-limited requests while a
@@ -368,7 +471,7 @@ class GateioExecutionClient(LiveExecutionClient):
                         )
                         async with self._report_lock:
                             report = await self._publish_order(row)
-                            await self._update_account()
+                        self._request_account_refresh()
                         if report.order_status in {
                             OrderStatus.CANCELED,
                             OrderStatus.FILLED,
@@ -426,6 +529,8 @@ class GateioExecutionClient(LiveExecutionClient):
         )
 
     async def _query_account(self, command):
+        if self._account_paused or self._account_stopping:
+            raise RuntimeError("Gate account reconciliation is not ready")
         await self._update_account()
 
     async def generate_order_status_report(self, command):
