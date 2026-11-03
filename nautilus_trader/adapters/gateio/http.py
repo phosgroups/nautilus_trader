@@ -69,6 +69,9 @@ class GateioHttpClient:
                     url=url,
                     headers=headers,
                     body=payload or None,
+                    # NT's default quota is applied only to explicitly keyed requests.
+                    # Share one budget across reads, submissions, and cancellations.
+                    keys=["gateio"],
                 )
             except Exception:
                 if attempt + 1 >= attempts:

@@ -245,6 +245,46 @@ def test_uncertain_writes_are_never_retried():
     asyncio.run(run())
 
 
+def test_native_http_rate_limit_is_shared_between_get_submit_and_cancel():
+    async def run():
+        arrivals = []
+        loop = asyncio.get_running_loop()
+
+        async def respond(reader, writer):
+            try:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                arrivals.append((headers.split(b" ", 1)[0].decode(), loop.time()))
+                for line in headers.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        await reader.readexactly(int(line.split(b":", 1)[1]))
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]")
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        server = await asyncio.start_server(respond, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            client = GateioHttpClient(
+                TestClock(),
+                f"http://127.0.0.1:{port}/api/v4",
+                GateioDataClientConfig(http_rate_per_second=2),
+            )
+            await asyncio.gather(
+                client.request("GET", "/spot/accounts"),
+                client.request("POST", "/spot/orders", body={}),
+                client.request("DELETE", "/spot/orders/1"),
+            )
+            assert {method for method, _ in arrivals} == {"GET", "POST", "DELETE"}
+            assert arrivals[-1][1] - arrivals[0][1] >= 0.4
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+
 def test_wire_signature_matches_transport_and_empty_query_has_no_question_mark():
     async def run():
         clock = TestClock()
@@ -414,6 +454,82 @@ def test_timed_out_submission_can_be_queried_after_it_has_already_closed():
         assert report.client_order_id == cid
         assert client.http.pages.call_args.args[1]["status"] == "finished"
         fill_check.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "status",
+    [OrderStatus.CANCELED, OrderStatus.FILLED, OrderStatus.ACCEPTED, None],
+)
+def test_cancel_not_found_requires_a_confirmed_terminal_state(status):
+    async def run():
+        instrument = parse_instrument(PAIR, 0)
+        cid = ClientOrderId("cancel-race")
+        cached = SimpleNamespace(is_closed=False, venue_order_id="123")
+        query_result = order()
+        client = SimpleNamespace(
+            _cache=SimpleNamespace(order=lambda _: cached),
+            http=SimpleNamespace(
+                request=AsyncMock(
+                    side_effect=[
+                        GateioHttpError(404, "ORDER_NOT_FOUND"),
+                        query_result
+                        if status is not None
+                        else GateioHttpError(404, "ORDER_NOT_FOUND"),
+                    ]
+                )
+            ),
+            _report_lock=asyncio.Lock(),
+            _publish_order=AsyncMock(return_value=SimpleNamespace(order_status=status)),
+            _update_account=AsyncMock(),
+            _clock=TestClock(),
+            _log=SimpleNamespace(warning=Mock()),
+            generate_order_cancel_rejected=Mock(),
+        )
+        command = SimpleNamespace(
+            client_order_id=cid,
+            venue_order_id="123",
+            strategy_id="PMM-001",
+            instrument_id=instrument.id,
+        )
+        await GateioExecutionClient._cancel_order(client, command)
+        assert [call.args[0] for call in client.http.request.call_args_list] == ["DELETE", "GET"]
+        assert all(
+            call.args[1] == "/spot/orders/123" for call in client.http.request.call_args_list
+        )
+        assert client.generate_order_cancel_rejected.call_count == (
+            0 if status in {OrderStatus.CANCELED, OrderStatus.FILLED} else 1
+        )
+        if status is not None:
+            client._publish_order.assert_awaited_once_with(query_result)
+            client._update_account.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+def test_cancel_error_after_private_terminal_event_does_not_reject_again():
+    async def run():
+        instrument = parse_instrument(PAIR, 0)
+        cached = SimpleNamespace(is_closed=False, venue_order_id="123")
+
+        async def cancel(*args, **kwargs):
+            cached.is_closed = True
+            raise GateioHttpError(404, "ORDER_NOT_FOUND")
+
+        client = SimpleNamespace(
+            _cache=SimpleNamespace(order=lambda _: cached),
+            http=SimpleNamespace(request=AsyncMock(side_effect=cancel)),
+            generate_order_cancel_rejected=Mock(),
+        )
+        command = SimpleNamespace(
+            client_order_id=ClientOrderId("already-closed"),
+            venue_order_id="123",
+            instrument_id=instrument.id,
+        )
+        await GateioExecutionClient._cancel_order(client, command)
+        client.generate_order_cancel_rejected.assert_not_called()
+        assert client.http.request.await_count == 1
 
     asyncio.run(run())
 

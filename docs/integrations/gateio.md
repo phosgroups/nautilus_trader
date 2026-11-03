@@ -76,5 +76,23 @@ duplicate fills, external cancellation/refill, reconnect catch-up, post-only
 rejection, cancel/fill races, and confirmed shutdown with no open orders or
 locked funds. Existing PMM engine, strategy, and POSIX-signal tests also run.
 The optional public smoke test reads live REST and sequence-bridged WS data
-without authentication or order requests. Authenticated Gate testnet/live
-execution remains a separate validation step requiring exchange credentials.
+without authentication or order requests.
+
+Authenticated BTC_USDT spot testnet checks on 2026-11-03 confirmed post-only
+placement at 3 and 50 levels per side, external cancellation and replacement,
+and confirmed shutdown with zero open orders and zero locked BTC/USDT. They
+exposed and fixed a missing native HTTP rate-limit key and cancellation races
+where Gate returns ORDER_NOT_FOUND for an already closed order. A missing
+order is queried before accepting a terminal state; an unresolved or still-open
+order remains a cancellation failure.
+
+The real-feed checks also found quiet L2 intervals longer than the default
+3-second stale-book threshold. Those intervals deliberately cancel the ladder;
+this is not proof of a disconnected socket. An independent 35-second feed
+observation received 12 updates, with an 8.299-second maximum gap. A 50-level
+diagnostic with a 10-second stale threshold still observed a protection cycle
+and an 83.732-second replacement interval. Steady quoting is not validated.
+The test disabled depth-coverage gating, kept the 200-bps quote boundary, used
+a 220-bps cancellation boundary, and allowed 90 seconds for command outcomes;
+PMM defaults were not changed. No natural fills occurred, so real fill/fee
+handling and production trading remain unverified.

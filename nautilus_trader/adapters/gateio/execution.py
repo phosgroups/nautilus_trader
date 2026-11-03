@@ -15,6 +15,7 @@ from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.identifiers import AccountId
@@ -182,6 +183,7 @@ class GateioExecutionClient(LiveExecutionClient):
         )
         await self._load_order_fills(row, report)
         self._send_order_status_report(report)
+        return report
 
     async def _load_order_fills(self, row, report):
         if report.filled_qty.as_decimal() > 0:
@@ -321,6 +323,32 @@ class GateioExecutionClient(LiveExecutionClient):
                 await self._update_account()
         except GateioHttpError as error:
             if error.definite_rejection:
+                # Cancellation can queue behind rate-limited requests while a
+                # private event or another cancellation closes the order.
+                current = self._cache.order(command.client_order_id)
+                if current is not None and current.is_closed:
+                    return
+                if error.status == 404 and error.label == "ORDER_NOT_FOUND":
+                    try:
+                        row = await self.http.request(
+                            "GET",
+                            "/spot/orders/" + target,
+                            {"currency_pair": command.instrument_id.symbol.value},
+                            private=True,
+                        )
+                        async with self._report_lock:
+                            report = await self._publish_order(row)
+                            await self._update_account()
+                        if report.order_status in {
+                            OrderStatus.CANCELED,
+                            OrderStatus.FILLED,
+                            OrderStatus.REJECTED,
+                            OrderStatus.EXPIRED,
+                        }:
+                            return
+                    except Exception:
+                        self._log.warning("Gate cancel target could not be reconciled")
+                # A missing or still-open target is not cancellation proof.
                 self.generate_order_cancel_rejected(
                     strategy_id=command.strategy_id,
                     instrument_id=command.instrument_id,
