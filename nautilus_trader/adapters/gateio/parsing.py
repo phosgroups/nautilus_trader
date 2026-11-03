@@ -5,6 +5,9 @@ from decimal import Decimal
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import FillReport
 from nautilus_trader.execution.reports import OrderStatusReport
+from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.data import TradeTick
+from nautilus_trader.model.enums import AggressorSide
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
@@ -24,6 +27,48 @@ def event_ns(row, prefix, fallback):
     if row.get(prefix) is not None:
         return int(Decimal(str(row[prefix])) * 1_000_000_000)
     return fallback
+
+
+def public_trade_tick(row, instrument, now):
+    """Gate spot.trades reports the taker's side and a potentially fractional ms time."""
+    if row["currency_pair"] != instrument.raw_symbol.value:
+        raise ValueError("Gate trade instrument mismatch")
+    price, size = Decimal(row["price"]), Decimal(row["amount"])
+    if any(not value.is_finite() or value <= 0 for value in (price, size)):
+        raise ValueError("Invalid Gate public trade price or size")
+    side = {"buy": AggressorSide.BUYER, "sell": AggressorSide.SELLER}[row["side"]]
+    return TradeTick(
+        instrument.id,
+        Price.from_str(f"{price:.{instrument.price_precision}f}"),
+        Quantity.from_str(f"{size:.{instrument.size_precision}f}"),
+        side,
+        TradeId(str(row["id"])),
+        event_ns(row, "create_time", now),
+        now,
+    )
+
+
+def public_quote_tick(row, instrument, now):
+    """Return no quote while either side of Gate's best-price channel is empty."""
+    if row["s"] != instrument.raw_symbol.value:
+        raise ValueError("Gate quote instrument mismatch")
+    values = [Decimal(row.get(key) or "0") for key in ("b", "a", "B", "A")]
+    if any(not value.is_finite() or value < 0 for value in values):
+        raise ValueError("Invalid Gate public quote price or size")
+    bid, ask, bid_size, ask_size = values
+    if not all(values):
+        return None
+    if bid >= ask:
+        raise ValueError("Crossed Gate public quote")
+    return QuoteTick(
+        instrument.id,
+        Price.from_str(f"{bid:.{instrument.price_precision}f}"),
+        Price.from_str(f"{ask:.{instrument.price_precision}f}"),
+        Quantity.from_str(f"{bid_size:.{instrument.size_precision}f}"),
+        Quantity.from_str(f"{ask_size:.{instrument.size_precision}f}"),
+        int(Decimal(str(row["t"])) * 1_000_000),
+        now,
+    )
 
 
 def order_report(row, instrument, account_id, client_order_id, now):

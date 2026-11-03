@@ -4,6 +4,8 @@ import asyncio
 from decimal import Decimal
 
 from nautilus_trader.adapters.gateio.config import GATEIO
+from nautilus_trader.adapters.gateio.parsing import public_quote_tick
+from nautilus_trader.adapters.gateio.parsing import public_trade_tick
 from nautilus_trader.adapters.gateio.websocket import GateioWebSocket
 from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.data import BookOrder
@@ -115,6 +117,7 @@ class GateioDataClient(LiveMarketDataClient):
             raise ValueError("Invalid Gate visible depth or buffer limit")
         self.http, self.config = client, config
         self.books, self.resyncs = {}, {}
+        self.public_subscriptions = {"spot.trades": set(), "spot.book_ticker": set()}
         self.ws = GateioWebSocket(
             loop,
             clock,
@@ -224,6 +227,10 @@ class GateioDataClient(LiveMarketDataClient):
         raise BookGap("Gate REST snapshot could not bridge WebSocket updates")
 
     async def _message(self, message):
+        channel = message["channel"]
+        if channel in {"spot.trades", "spot.book_ticker"}:
+            self._public_tick(channel, message["result"])
+            return
         if message["channel"] != "spot.order_book_update":
             return
         row = message["result"]
@@ -240,6 +247,51 @@ class GateioDataClient(LiveMarketDataClient):
         except (BookGap, ValueError, KeyError):
             self._reset(instrument_id)
             self._schedule_resync(instrument_id)
+
+    def _public_tick(self, channel, row):
+        symbol = row["currency_pair"] if channel == "spot.trades" else row["s"]
+        instrument_id = next(
+            (i for i in self.public_subscriptions[channel] if i.symbol.value == symbol), None
+        )
+        if instrument_id is None:
+            return
+        instrument = self._instrument_provider.find(instrument_id)
+        parser = public_trade_tick if channel == "spot.trades" else public_quote_tick
+        tick = parser(row, instrument, self._clock.timestamp_ns())
+        if tick is not None:
+            self._handle_data(tick)
+
+    async def _public_subscription(self, channel, instrument_id, subscribe):
+        if self._instrument_provider.find(instrument_id) is None:
+            raise ValueError("Gate subscription instrument was not loaded")
+        selected = self.public_subscriptions[channel]
+        payload = [instrument_id.symbol.value]
+        if subscribe:
+            if instrument_id in selected:
+                return
+            selected.add(instrument_id)
+            try:
+                await self.ws.subscribe(channel, payload)
+            except BaseException:
+                selected.discard(instrument_id)
+                raise
+        else:
+            if instrument_id not in selected:
+                return
+            await self.ws.unsubscribe(channel, payload)
+            selected.discard(instrument_id)
+
+    async def _subscribe_trade_ticks(self, command):
+        await self._public_subscription("spot.trades", command.instrument_id, True)
+
+    async def _unsubscribe_trade_ticks(self, command):
+        await self._public_subscription("spot.trades", command.instrument_id, False)
+
+    async def _subscribe_quote_ticks(self, command):
+        await self._public_subscription("spot.book_ticker", command.instrument_id, True)
+
+    async def _unsubscribe_quote_ticks(self, command):
+        await self._public_subscription("spot.book_ticker", command.instrument_id, False)
 
     async def _reconnect(self):
         for instrument_id in list(self.books):

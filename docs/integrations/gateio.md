@@ -15,6 +15,8 @@ Gate and Bitget use the same compiled native runtime and public v1 factories.
 | --- | --- |
 | Instruments | Regular cash spot, `BASE_QUOTE.GATEIO`, precision and minimums from Gate REST |
 | Market data | Managed `L2_MBP`, REST snapshot + buffered `spot.order_book_update` |
+| Public trades | `spot.trades` -> native `TradeTick`, taker side, original ID and exchange time |
+| Best prices | `spot.book_ticker` -> native `QuoteTick`; empty sides do not produce zero quotes |
 | Orders | Base-sized GTC post-only limit orders (`time_in_force=poc`) |
 | Cancellation | Individual, batch, or strategy-scoped cancel-all; wait for exchange confirmation |
 | Account | Available + locked balances from `/spot/accounts`, reported to NT Cache |
