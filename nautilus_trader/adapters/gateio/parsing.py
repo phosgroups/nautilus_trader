@@ -104,6 +104,7 @@ def order_report(row, instrument, account_id, client_order_id, now):
             "small",
             "liquidate_cancelled",
             "unified_check_failed",
+            "price_protect_cancelled",
         }
     ):
         status = OrderStatus.CANCELED
@@ -143,6 +144,19 @@ def fill_report(row, instrument, account_id, client_order_id, now):
     # GT/points discounts are additional dimensions, not zero quote fees.
     if Decimal(str(row.get("gt_fee", "0"))) or Decimal(str(row.get("point_fee", "0"))):
         raise ValueError("Gate GT/points fee deductions are not supported by this PMM profile")
+    fee = Decimal(str(row["fee"]))
+    rebate = Decimal(str(row.get("rebated_fee", "0")))
+    if not fee.is_finite() or not rebate.is_finite() or min(fee, rebate) < 0:
+        raise ValueError("Gate fee and rebate must be finite nonnegative amounts")
+    fee_currency = Currency.from_str(row["fee_currency"])
+    if rebate:
+        rebate_currency = Currency.from_str(row["rebated_fee_currency"])
+        if fee and fee_currency != rebate_currency:
+            raise ValueError(
+                "A Gate fill with fee and rebate in different currencies cannot be represented by one NT commission"
+            )
+        fee_currency = rebate_currency
+    commission = Money.from_decimal(fee - rebate, fee_currency)
     return FillReport(
         account_id=account_id,
         instrument_id=instrument.id,
@@ -152,9 +166,7 @@ def fill_report(row, instrument, account_id, client_order_id, now):
         order_side={"buy": OrderSide.BUY, "sell": OrderSide.SELL}[row["side"]],
         last_qty=Quantity.from_str(f"{Decimal(row['amount']):.{instrument.size_precision}f}"),
         last_px=Price.from_str(f"{Decimal(row['price']):.{instrument.price_precision}f}"),
-        commission=Money.from_decimal(
-            Decimal(str(row["fee"])), Currency.from_str(row["fee_currency"])
-        ),
+        commission=commission,
         liquidity_side={"maker": LiquiditySide.MAKER, "taker": LiquiditySide.TAKER}[row["role"]],
         report_id=UUID4(),
         ts_event=event_ns(row, "create_time", now),

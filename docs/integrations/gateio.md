@@ -28,7 +28,14 @@ the managed book on gaps, and obtains a new snapshot. Buffered WS intervals are
 preserved while retrying a lagging REST snapshot. A sequence-advancing update
 refreshes book time even when price and size have not changed.
 
-The visible market book defaults to 100 levels per side. This is separate from
+The visible market book defaults to at most 100 levels per side. The legacy
+100 ms channel supplies a 100-level window, so `book_depth` accepts 1 through
+100; requesting 1000 levels fails at startup instead of presenting a one-time
+REST snapshot as a continuously updated 1000-level feed. Internal maintenance
+retains the full channel window before clipping the published view. `full=true`
+replaces the book with CLEAR + snapshot deltas, including after sequence gaps;
+an older in-flight REST response cannot overwrite a newer full WS image.
+This is separate from
 PMM's own 50 working orders per side and does not guarantee ±2% market coverage.
 
 POST/DELETE requests with unknown outcomes are not blindly retried. NT order
@@ -73,9 +80,52 @@ reads before restoring orders, fills and balances; disconnect cancels background
 work and performs a bounded final account reconciliation. Initial account
 registration still completes before private-stream startup.
 
+Quiet accounts are also polled before `account_stale_after_ms` (default 10000)
+expires. New submissions wait for private-stream recovery, fresh balances, and
+resolved execution facts for at most `submission_ready_timeout_secs` (default
+10). Expiry produces an explicit local denial without sending a POST. Queries
+and cancellations remain available; PMM retains its existing denial/fault policy.
+
+Filled-order statuses are matched against Cache executions and buffered real
+fills. Missing history is fetched by one background recovery worker without
+holding the report lock. Empty/lagging REST history and transport errors leave
+the report pending for retry. A single-order query returns no incomplete filled
+status that NT could turn into inferred executions. Reconnection fences old
+workers and retries failed business reconciliation even while the socket stays
+connected. Private messages wait until recovery completes; overflow invalidates
+the backlog and requests authoritative reconciliation.
+
 This follows Binance/OKX's separation of account handling from execution reports,
 while retaining full REST account reconciliation and paired order/fill recovery
 as in Bitget. Gate balance pushes are not treated as complete wallet snapshots.
+
+## Previous Gate implementation and PR review contracts
+
+The v2 Gate fixes in `1262d9f0e2` and `0443ac771f`, and
+[PR #4](https://github.com/phosgroups/nautilus_trader/pull/4), were checked against
+this spot-only v1 profile:
+
+| Review item | Current contract |
+| --- | --- |
+| 1. Private subscriptions | Explicit spot symbols, batches of at most 50, acknowledged subscriptions and retrying recovery; spot balances have no payload |
+| 2. Commission sign | Positive fee debit, negative rebate credit; same-currency rebates net correctly; unsupported mixed-currency fees/rebates fail explicitly |
+| 3. Post-only | GTC limit orders map to `poc`; other execution semantics are denied locally |
+| 4. Market amount units | Market orders, quote-sized orders and reduce-only orders are explicitly unsupported; no silent base/quote reinterpretation |
+| 5. Client IDs | Canonical UUIDs use a reversible 22-byte encoding; supported short ASCII IDs round-trip; other IDs are rejected without truncation |
+| 6. Grouped open orders | Per-symbol `/spot/orders?status=open` returns a flat array; pagination deduplicates IDs and rejects repeated pages |
+| 7. Candles | Unsupported in this PMM spot profile; no candle channel is falsely advertised |
+| 8. Derivative prices/funding | Unsupported; public spot quotes use `spot.book_ticker` |
+| 9. Balance models/times | Partial spot notifications trigger authoritative REST snapshots; those snapshots use local observation time, not a fabricated exchange event time; derivative balances are unsupported |
+| 10. Order dedup/time | Real trade IDs deduplicate fills; price-only order updates are retained, business timestamps preserve fractional milliseconds, and stale lower cumulative fills cannot overwrite pending newer facts |
+
+Reversible IDs restore identity without process-local mappings, while NT's
+external-order ownership rules still apply. Existing hash IDs from earlier
+versions can be resolved with a restored NT Cache; losing that Cache does not
+make legacy hashed orders safely claimable. Do not claim or cancel unrelated
+account orders to work around missing identity.
+
+Instrument definitions retain maximum base quantity and quote notional limits,
+and exchange price-protection cancellations map to an explicit terminal state.
 
 ## Build and test
 

@@ -51,3 +51,5 @@ class GateioExecClientConfig(LiveExecClientConfig, frozen=True):
     max_retries: int = 3
     reconciliation_lookback_mins: int = 60
     account_refresh_interval_ms: int = 250
+    account_stale_after_ms: int = 10000
+    submission_ready_timeout_secs: float = 10.0

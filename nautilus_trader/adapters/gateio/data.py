@@ -26,12 +26,14 @@ class BookGap(ValueError):
 class GateBook:
     """Buffer WS updates until a REST snapshot and its bridging update agree."""
 
-    def __init__(self, depth, max_buffer=10000):
+    def __init__(self, depth, max_buffer=10000, cache_depth=100):
         self.depth, self.max_buffer = depth, max_buffer
+        self.cache_depth = cache_depth
         self.bids, self.asks = {}, {}
         self.sequence = None
         self.ready = False
         self.buffer = []
+        self.boundaries = [None, None]
 
     @staticmethod
     def levels(rows):
@@ -50,18 +52,41 @@ class GateBook:
         self.bids = {p: q for p, q in self.levels(raw["bids"]).items() if q}
         self.asks = {p: q for p, q in self.levels(raw["asks"]).items() if q}
         self.ready = False
-        self._trim()
+        self._bound_cache()
 
-    def _trim(self):
-        for levels, reverse in ((self.bids, True), (self.asks, False)):
-            keep = set(sorted(levels, reverse=reverse)[: self.depth])
+    def _bound_cache(self):
+        for index, (levels, reverse) in enumerate(((self.bids, True), (self.asks, False))):
+            prices = sorted(levels, reverse=reverse)
+            self.boundaries[index] = (
+                prices[self.cache_depth - 1] if len(prices) >= self.cache_depth else None
+            )
+            keep = set(prices[: self.cache_depth])
             for price in list(levels):
                 if price not in keep:
                     del levels[price]
+        self._validate()
+
+    def _validate(self):
         if self.bids and self.asks and max(self.bids) >= min(self.asks):
             raise BookGap("Crossed Gate book")
 
+    def visible(self):
+        return tuple(
+            {p: levels[p] for p in sorted(levels, reverse=reverse)[: self.depth]}
+            for levels, reverse in ((self.bids, True), (self.asks, False))
+        )
+
     def update(self, raw):
+        if raw.get("full") is True:
+            last = int(raw["u"])
+            if self.sequence is not None and last < self.sequence:
+                return None
+            if int(raw.get("l", self.cache_depth)) < self.depth:
+                raise BookGap("Gate channel depth is smaller than the requested visible depth")
+            # A full image replaces the cache and is valid across sequence gaps.
+            self.snapshot({"id": last, "bids": raw["b"], "asks": raw["a"]})
+            self.ready = True
+            return True, self._changes(({}, {}), True)
         if self.sequence is None:
             if len(self.buffer) >= self.max_buffer:
                 raise BookGap("Gate snapshot buffer overflow")
@@ -74,26 +99,33 @@ class GateBook:
             return None
         if first > self.sequence + 1:
             raise BookGap("Missing Gate order book updates")
-        before = (dict(self.bids), dict(self.asks))
+        before = self.visible()
         self._apply(raw)
         self.sequence = last
         initial, self.ready = not self.ready, True
         return initial, self._changes(before, initial)
 
     def _apply(self, raw):
-        for levels, rows in ((self.bids, raw["b"]), (self.asks, raw["a"])):
+        for index, (levels, rows) in enumerate(((self.bids, raw["b"]), (self.asks, raw["a"]))):
             for price, quantity in self.levels(rows).items():
                 if quantity:
                     levels[price] = quantity
                 else:
                     levels.pop(price, None)
-        self._trim()
+            if self.boundaries[index] is not None and not levels:
+                raise BookGap("Gate visible book exhausted its known snapshot coverage")
+            if len(levels) > self.cache_depth:
+                prices = sorted(levels, reverse=index == 0)
+                self.boundaries[index] = prices[self.cache_depth - 1]
+                for price in prices[self.cache_depth :]:
+                    del levels[price]
+        self._validate()
 
     def _changes(self, before, initial):
         changes = []
         for side, old, new in (
-            (OrderSide.BUY, before[0], self.bids),
-            (OrderSide.SELL, before[1], self.asks),
+            (OrderSide.BUY, before[0], self.visible()[0]),
+            (OrderSide.SELL, before[1], self.visible()[1]),
         ):
             for price in new if initial else old.keys() | new.keys():
                 quantity = new.get(price, Decimal(0))
@@ -113,8 +145,10 @@ class GateioDataClient(LiveMarketDataClient):
             clock=clock,
             instrument_provider=instrument_provider,
         )
-        if not 1 <= config.book_depth <= 1000 or config.max_book_buffer <= 0:
-            raise ValueError("Invalid Gate visible depth or buffer limit")
+        if not 1 <= config.book_depth <= 100 or config.max_book_buffer <= 0:
+            raise ValueError(
+                "Gate 100ms channel supports 1-100 visible levels and a positive buffer limit"
+            )
         self.http, self.config = client, config
         self.books, self.resyncs = {}, {}
         self.public_subscriptions = {"spot.trades": set(), "spot.book_ticker": set()}
@@ -135,11 +169,13 @@ class GateioDataClient(LiveMarketDataClient):
         await self.ws.connect()
 
     async def _disconnect(self):
-        await self.ws.disconnect()
-        for task in self.resyncs.values():
-            task.cancel()
-        await asyncio.gather(*self.resyncs.values(), return_exceptions=True)
-        self.resyncs.clear()
+        try:
+            await self.ws.disconnect()
+        finally:
+            for task in self.resyncs.values():
+                task.cancel()
+            await asyncio.gather(*self.resyncs.values(), return_exceptions=True)
+            self.resyncs.clear()
 
     def _emit(self, instrument_id, snapshot, changes, sequence, ts_event):
         instrument = self._instrument_provider.find(instrument_id)
@@ -189,7 +225,22 @@ class GateioDataClient(LiveMarketDataClient):
     def _schedule_resync(self, instrument_id):
         task = self.resyncs.get(instrument_id)
         if task is None or task.done():
-            self.resyncs[instrument_id] = self.create_task(self._resync(instrument_id))
+            self.resyncs[instrument_id] = self.create_task(self._resync_loop(instrument_id))
+
+    async def _resync_loop(self, instrument_id):
+        failures = 0
+        while instrument_id in self.books:
+            book = self.books[instrument_id]
+            try:
+                await self._resync(instrument_id)
+                if self.books.get(instrument_id) is book:
+                    return  # Snapshot is installed; wait for its bridging delta.
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._log.warning(f"Gate book recovery failed; retrying: {type(error).__name__}")
+                failures += 1
+                await asyncio.sleep(min(0.25 * 2 ** min(failures - 1, 4), 2))
 
     async def _resync(self, instrument_id):
         book = self.books[instrument_id]
@@ -199,11 +250,11 @@ class GateioDataClient(LiveMarketDataClient):
                 "/spot/order_book",
                 {
                     "currency_pair": instrument_id.symbol.value,
-                    "limit": self.config.book_depth,
+                    "limit": 100,
                     "with_id": "true",
                 },
             )
-            if self.books.get(instrument_id) is not book:
+            if self.books.get(instrument_id) is not book or book.ready:
                 return
             book.snapshot(snapshot)
             pending, book.buffer = book.buffer, []
@@ -246,6 +297,8 @@ class GateioDataClient(LiveMarketDataClient):
                 self._schedule_resync(instrument_id)
         except (BookGap, ValueError, KeyError):
             self._reset(instrument_id)
+            if not row.get("full"):
+                self.books[instrument_id].buffer.append(row)
             self._schedule_resync(instrument_id)
 
     def _public_tick(self, channel, row):

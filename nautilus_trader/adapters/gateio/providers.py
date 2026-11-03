@@ -18,6 +18,8 @@ def parse_instrument(row, now):
         raise ValueError("Gate instrument symbol does not match its currencies")
     pp, qp = int(row["precision"]), int(row["amount_precision"])
     base, quote = Currency.from_str(row["base"]), Currency.from_str(row["quote"])
+    max_base = row.get("max_base_amount")
+    max_quote = row.get("max_quote_amount")
     return CurrencyPair(
         instrument_id=InstrumentId.from_str(symbol + ".GATEIO"),
         raw_symbol=Symbol(symbol),
@@ -29,6 +31,8 @@ def parse_instrument(row, now):
         size_increment=Quantity.from_str(f"{Decimal(10) ** -qp:.{qp}f}"),
         min_quantity=Quantity.from_str(str(row.get("min_base_amount") or "0")),
         min_notional=Money(str(row.get("min_quote_amount") or "0"), quote),
+        max_quantity=Quantity.from_str(str(max_base)) if max_base else None,
+        max_notional=Money(str(max_quote), quote) if max_quote else None,
         ts_event=now,
         ts_init=now,
         info=row,

@@ -50,14 +50,33 @@ class GateioWebSocket:
         self.ready = False
         self.error = None
         self.error_handler = error_handler
+        self._closing = False
+        self._generation = 0
+        self._recover_again = False
+        self._resume = asyncio.Event()
+        self._resume.set()
 
     def _failed(self, error):
         self.ready = False
         self.error = type(error).__name__
         if self.error_handler is not None:
             self.error_handler(f"Gate WebSocket is not ready: {self.error}")
+        self._resume.clear()
+        self._drain()
+        if not self._closing and self.client is not None:
+            if self.recovery is None or self.recovery.done():
+                self.recovery = self.loop.create_task(self._recover())
+            else:
+                self._recover_again = True
+
+    def _drain(self):
+        while not self.queue.empty():
+            self.queue.get_nowait()
+            self.queue.task_done()
 
     async def connect(self):
+        self._closing, self.error = False, None
+        self._resume.set()
         self.client = await WebSocketClient.connect(
             loop_=self.loop,
             config=WebSocketConfig(url=self.url, headers=[], heartbeat=10, proxy_url=self.proxy),
@@ -108,14 +127,19 @@ class GateioWebSocket:
             key = (value.get("channel"), value.get("event"))
             future = self.pending.get(key)
             if future is not None and not future.done():
-                if value.get("error") or (value.get("result") or {}).get("status") != "success":
+                result = value.get("result")
+                if (
+                    value.get("error")
+                    or not isinstance(result, dict)
+                    or result.get("status") != "success"
+                ):
                     future.set_exception(RuntimeError("Gate subscription rejected"))
                     self.ready = False
                 else:
                     future.set_result(None)
                 return
             if value.get("event") == "update":
-                self.queue.put_nowait(value)
+                self.queue.put_nowait((self._generation, value))
         except (ValueError, TypeError, asyncio.QueueFull) as error:
             self._failed(error)
 
@@ -123,6 +147,12 @@ class GateioWebSocket:
         while True:
             value = await self.queue.get()
             try:
+                generation = self._generation
+                if isinstance(value, tuple):
+                    generation, value = value
+                await self._resume.wait()
+                if generation != self._generation:
+                    continue
                 await self.handler(value)
             except Exception as error:
                 self._failed(error)
@@ -130,7 +160,12 @@ class GateioWebSocket:
                 self.queue.task_done()
 
     def _reconnected(self):
+        if self._closing:
+            return
+        self._generation += 1
         self.ready = False
+        self._resume.clear()
+        self._drain()
         for future in self.pending.values():
             if not future.done():
                 future.set_exception(ConnectionError("Gate reconnected during subscription"))
@@ -140,13 +175,33 @@ class GateioWebSocket:
         self.recovery = self.loop.create_task(self._recover())
 
     async def _recover(self):
+        generation = self._generation
+        failures = 0
         try:
-            for channel, payload in self.subscriptions:
-                await self._subscription(channel, payload)
-            await self.reconnect()
-            self.error, self.ready = None, True
-        except Exception as error:
-            self._failed(error)
+            while not self._closing and generation == self._generation:
+                self._recover_again = False
+                try:
+                    if self.client is None or not self.client.is_active():
+                        raise ConnectionError("Gate transport is reconnecting")
+                    for channel, payload in list(self.subscriptions):
+                        await self._subscription(channel, payload)
+                    await self.reconnect()
+                    if generation != self._generation or self._closing:
+                        return
+                    if self._recover_again:
+                        continue  # Another overflow/error invalidated this reconciliation.
+                    self.error, self.ready = None, True
+                    self._resume.set()
+                    return
+                except Exception as error:
+                    self.ready, self.error = False, type(error).__name__
+                    if self.error_handler is not None:
+                        self.error_handler(f"Gate recovery failed; retrying: {self.error}")
+                    failures += 1
+                    await asyncio.sleep(min(0.25 * 2 ** min(failures - 1, 5), 5))
+        finally:
+            if self.recovery is asyncio.current_task():
+                self.recovery = None
 
     def is_ready(self):
         return (
@@ -157,7 +212,10 @@ class GateioWebSocket:
         )
 
     async def disconnect(self):
+        self._closing = True
+        self._generation += 1
         self.ready = False
+        self._resume.set()
         try:
             if self.client is not None:
                 await self.client.disconnect()
@@ -171,3 +229,5 @@ class GateioWebSocket:
                     future.cancel()
             self.pending.clear()
             self.worker = self.recovery = None
+            self.client = None
+            self._drain()

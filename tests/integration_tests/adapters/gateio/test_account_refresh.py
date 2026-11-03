@@ -82,6 +82,17 @@ async def wait_for(predicate):
             await asyncio.sleep(0.001)
 
 
+def account_idle(client):
+    return (
+        not client._account_dirty
+        and not client._account_requested.is_set()
+        and client._account_read_task is not None
+        and client._account_read_task.done()
+        and not client._account_read_task.cancelled()
+        and client._account_read_task.exception() is None
+    )
+
+
 def test_balance_burst_is_coalesced_and_slow_rest_does_not_block_ws_cancel():
     async def run():
         entered, release = asyncio.Event(), asyncio.Event()
@@ -104,7 +115,7 @@ def test_balance_burst_is_coalesced_and_slow_rest_does_not_block_ws_cancel():
             assert not client._report_lock.locked()
             assert client.http.request.await_count == 1
             release.set()
-            await wait_for(lambda: client._account_refresh_task is None)
+            await wait_for(lambda: account_idle(client))
             # The order notification during the first read requires one final read.
             assert client.http.request.await_count == 2
             assert len(client.states) == 2
@@ -136,7 +147,7 @@ def test_notification_during_read_is_not_lost_and_uses_latest_full_balances():
             for _ in range(100):
                 client._request_account_refresh()
             release.set()
-            await wait_for(lambda: client._account_refresh_task is None)
+            await wait_for(lambda: account_idle(client))
             assert count == 2
             latest = {b.currency.code: b for b in client.states[-1]["balances"]}
             assert latest["USDT"].free.as_decimal() == 1000
@@ -188,7 +199,7 @@ def test_failed_refresh_retries_without_another_ws_notification(failure):
         client = client_for(request)
         client._request_account_refresh()
         await wait_for(lambda: len(client.states) == 1)
-        await wait_for(lambda: client._account_refresh_task is None)
+        await wait_for(lambda: account_idle(client))
         assert client.http.request.await_count == 2
         assert not client._account_dirty
         await client._cancel_account_tasks()
@@ -201,7 +212,7 @@ def test_invalid_snapshot_is_not_published_and_retry_recovers():
         replies = iter([balances("-1"), balances()])
         client = client_for(lambda *args, **kwargs: next(replies))
         client._request_account_refresh()
-        await wait_for(lambda: client._account_refresh_task is None)
+        await wait_for(lambda: account_idle(client))
         assert client.http.request.await_count == 2
         assert len(client.states) == 1
         await client._cancel_account_tasks()
@@ -227,8 +238,8 @@ def test_reconnect_cancels_old_read_and_old_response_cannot_overwrite_recovery()
         client._request_account_refresh()
         await entered.wait()
         await client._reconcile()
-        await wait_for(lambda: client._account_refresh_task is None)
-        assert client.ws.ready
+        await wait_for(lambda: account_idle(client))
+        assert client._account_is_fresh()
         assert not client._account_paused
         assert all(
             b.free.as_decimal() == 1000

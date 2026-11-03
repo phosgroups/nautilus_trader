@@ -100,6 +100,7 @@ class GateioHttpClient:
 
     async def pages(self, path, params):
         rows = []
+        seen = set()
         for page in range(1, 1001):
             batch = await self.request(
                 "GET",
@@ -109,7 +110,15 @@ class GateioHttpClient:
             )
             if not isinstance(batch, list):
                 raise ValueError("Gate paginated response must be a list")
-            rows.extend(batch)
+            new_rows = []
+            for row in batch:
+                key = (row.get("currency_pair"), str(row["id"]))
+                if key not in seen:
+                    seen.add(key)
+                    new_rows.append(row)
+            if len(batch) == 100 and not new_rows:
+                raise RuntimeError("Gate pagination repeated a page without progress")
+            rows.extend(new_rows)
             if len(batch) < 100:
                 return rows
         raise RuntimeError("Gate pagination exceeded safety bound; reconciliation incomplete")
