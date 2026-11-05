@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import patch
@@ -10,6 +11,7 @@ import pytest
 
 from nautilus_trader.adapters.gateio.config import GateioExecClientConfig
 from nautilus_trader.adapters.gateio.execution import GateioExecutionClient
+from nautilus_trader.adapters.gateio.http import GateioHttpClient
 from nautilus_trader.adapters.gateio.providers import GateioInstrumentProvider
 from nautilus_trader.adapters.gateio.providers import parse_instrument
 from nautilus_trader.adapters.gateio.websocket import GateioWebSocket
@@ -69,6 +71,7 @@ def client_for(request, interval=10, **config):
         return await result if inspect.isawaitable(result) else result
 
     http = SimpleNamespace(request=AsyncMock(side_effect=dispatch), pages=AsyncMock(return_value=[]))
+    http.open_orders = partial(GateioHttpClient.open_orders, http)
     provider = GateioInstrumentProvider(http, clock, InstrumentProviderConfig())
     provider.add(parse_instrument(PAIR, 0))
     client = RecordingClient(

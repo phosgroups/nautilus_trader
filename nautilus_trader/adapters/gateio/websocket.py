@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 
+from nautilus_trader.adapters.gateio.http import GateioHttpError
 from nautilus_trader.core.nautilus_pyo3 import WebSocketClient
 from nautilus_trader.core.nautilus_pyo3 import WebSocketConfig
 
@@ -37,13 +38,16 @@ class GateioWebSocket:
         key=None,
         secret=None,
         error_handler=None,
+        invalidate=None,
     ):
         self.loop, self.clock, self.url = loop, clock, url
         self.handler, self.reconnect = handler, reconnect
         self.proxy, self.key, self.secret = proxy, key, secret
         self.client = None
+        self._connecting = False
         self.subscriptions = []
         self.pending = {}
+        self._subscription_lock = asyncio.Lock()
         self._pending_request_ids = {}
         self._request_id = clock.timestamp_ns() // 1000
         self.queue = asyncio.Queue(maxsize=10000)
@@ -52,14 +56,19 @@ class GateioWebSocket:
         self.ready = False
         self.error = None
         self.error_handler = error_handler
+        self.invalidate = invalidate
         self._closing = False
         self._generation = 0
+        self._message_epoch = 0
         self._recover_again = False
         self._resume = asyncio.Event()
         self._resume.set()
 
     def _failed(self, error):
         self.ready = False
+        self._message_epoch += 1
+        if self.invalidate is not None:
+            self.invalidate()
         self.error = type(error).__name__
         if self.error_handler is not None:
             self.error_handler(f"Gate WebSocket is not ready: {self.error}")
@@ -77,16 +86,40 @@ class GateioWebSocket:
             self.queue.task_done()
 
     async def connect(self):
+        if self.client is not None or self._connecting:
+            raise RuntimeError("Gate connection must be disconnected before opening again")
         self._closing, self.error = False, None
+        generation = self._generation
         self._resume.set()
-        self.client = await WebSocketClient.connect(
-            loop_=self.loop,
-            config=WebSocketConfig(url=self.url, headers=[], heartbeat=10, proxy_url=self.proxy),
-            handler=self._receive,
-            post_reconnection=self._reconnected,
-        )
+        self._connecting = True
+        try:
+            client = await WebSocketClient.connect(
+                loop_=self.loop,
+                config=WebSocketConfig(url=self.url, headers=[], heartbeat=10, proxy_url=self.proxy),
+                handler=self._receive,
+                post_reconnection=self._reconnected,
+            )
+        finally:
+            self._connecting = False
+        if self._closing or generation != self._generation:
+            await client.disconnect()
+            raise ConnectionError("Gate connection closed while transport was opening")
+        self.client = client
         self.worker = self.loop.create_task(self._consume())
+        if self.subscriptions:
+            self._resume.clear()
+            try:
+                for channel, payload in list(self.subscriptions):
+                    await self._subscription(channel, payload)
+                await self.reconnect()
+                if self._closing or generation != self._generation:
+                    raise ConnectionError("Gate connection changed during subscription restoration")
+            except BaseException:
+                if self.client is client:
+                    await self.disconnect()
+                raise
         self.ready = True
+        self._resume.set()
 
     async def subscribe(self, channel, payload=None):
         item = (channel, tuple(payload) if payload is not None else None)
@@ -101,6 +134,21 @@ class GateioWebSocket:
             self.subscriptions.remove(item)
 
     async def _subscription(self, channel, payload, event="subscribe"):
+        # NT dispatches subscriptions for different instruments concurrently.
+        # Gate acknowledgements share a channel/event key, so serialize these
+        # requests while retaining the request-ID check against stale replies.
+        async with self._subscription_lock:
+            if self._closing or self.client is None:
+                raise ConnectionError("Gate subscription requires an active connection")
+            try:
+                await self._send_subscription(channel, payload, event)
+            except BaseException:
+                self.ready = False
+                raise
+            if self.error is None and self._resume.is_set():
+                self.ready = True
+
+    async def _send_subscription(self, channel, payload, event):
         future = self.loop.create_future()
         key = (channel, event)
         if key in self.pending:
@@ -147,7 +195,7 @@ class GateioWebSocket:
                     future.set_result(None)
                 return
             if value.get("event") == "update":
-                self.queue.put_nowait((self._generation, value))
+                self.queue.put_nowait((self._message_epoch, value))
         except (ValueError, TypeError, asyncio.QueueFull) as error:
             self._failed(error)
 
@@ -155,11 +203,11 @@ class GateioWebSocket:
         while True:
             value = await self.queue.get()
             try:
-                generation = self._generation
+                generation = self._message_epoch
                 if isinstance(value, tuple):
                     generation, value = value
                 await self._resume.wait()
-                if generation != self._generation:
+                if generation != self._message_epoch:
                     continue
                 await self.handler(value)
             except Exception as error:
@@ -171,6 +219,9 @@ class GateioWebSocket:
         if self._closing:
             return
         self._generation += 1
+        self._message_epoch += 1
+        if self.invalidate is not None:
+            self.invalidate()
         self.ready = False
         self._resume.clear()
         self._drain()
@@ -205,7 +256,8 @@ class GateioWebSocket:
                 except Exception as error:
                     self.ready, self.error = False, type(error).__name__
                     if self.error_handler is not None:
-                        self.error_handler(f"Gate recovery failed; retrying: {self.error}")
+                        detail = str(error) if isinstance(error, GateioHttpError) else self.error
+                        self.error_handler(f"Gate recovery failed; retrying: {detail}")
                     failures += 1
                     await asyncio.sleep(min(0.25 * 2 ** min(failures - 1, 5), 5))
         finally:

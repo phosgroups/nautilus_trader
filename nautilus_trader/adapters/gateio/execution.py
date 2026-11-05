@@ -90,6 +90,17 @@ class _SubmissionDeferred(ValueError):
     """The request has not been sent; wait for private execution readiness again."""
 
 
+def _check_order_response(row, instrument_id, venue_order_id=None, client_order_id=None):
+    if row["currency_pair"] != instrument_id.symbol.value or (
+        venue_order_id is not None and str(row["id"]) != str(venue_order_id)
+    ):
+        raise ValueError("Gate response does not match the requested instrument/order")
+    if venue_order_id is None and client_order_id is not None and (
+        row.get("text") != order_text(client_order_id)
+    ):
+        raise ValueError("Gate response does not match the requested client order")
+
+
 class GateioExecutionClient(LiveExecutionClient):
     def __init__(self, loop, client, msgbus, cache, clock, instrument_provider, config, name=None):
         super().__init__(
@@ -230,22 +241,34 @@ class GateioExecutionClient(LiveExecutionClient):
 
     def _resolve(self, row):
         decoded = original_order_id(row.get("text"))
-        if decoded is not None:
-            return decoded
         venue_id = str(row.get("order_id", row.get("id", "")))
+        cached_id = None
         if venue_id:
             cached_id = self._cache.client_order_id(VenueOrderId(venue_id))
-            if cached_id is not None:
-                return cached_id
+        if decoded is not None and cached_id is not None and decoded != cached_id:
+            raise ValueError("Gate client and venue order identities conflict")
+        if decoded is not None or cached_id is not None:
+            return self._checked_identity(decoded or cached_id, row, venue_id)
         if not re.fullmatch(r"t-[0-9a-f]{28}", row.get("text") or ""):
             return None
         for order in self._cache.orders(venue=GATEIO):
             # Retain recovery of pre-upgrade hashes when the NT Cache is restored.
             legacy = "t-" + hashlib.sha256(str(order.client_order_id).encode()).hexdigest()[:28]
             if str(order.venue_order_id) == venue_id or legacy == row.get("text"):
-                return order.client_order_id
+                return self._checked_identity(order.client_order_id, row, venue_id)
         # Recover identity only. NT's external-order ownership rules still apply.
         return None
+
+    def _checked_identity(self, client_order_id, row, venue_id):
+        cached = self._cache.order(client_order_id)
+        if cached is not None and (
+            cached.instrument_id.venue != GATEIO
+            or cached.instrument_id.symbol.value != row["currency_pair"]
+            or cached.account_id not in (None, self.account_id)
+            or (cached.venue_order_id is not None and str(cached.venue_order_id) != venue_id)
+        ):
+            raise ValueError("Gate report conflicts with the cached account/instrument/order")
+        return client_order_id
 
     async def _update_account(self):
         # Explicit queries and the background worker share one in-flight read.
@@ -567,8 +590,9 @@ class GateioExecutionClient(LiveExecutionClient):
                         failures = 0
                     except Exception as error:
                         failures += 1
+                        detail = str(error) if isinstance(error, GateioHttpError) else type(error).__name__
                         self._log.warning(
-                            f"Gate execution recovery deferred: {type(error).__name__}"
+                            f"Gate execution recovery deferred: {detail}"
                         )
                 if self._pending_orders or self._pending_fills:
                     await asyncio.sleep(min(0.25 * 2 ** min(failures, 3), 2))
@@ -670,7 +694,12 @@ class GateioExecutionClient(LiveExecutionClient):
             params = {"currency_pair": symbol, "status": status}
             if status == "finished":
                 params["from"] = since
-            for row in await self.http.pages("/spot/orders", params):
+            rows = (
+                await self.http.open_orders(symbol)
+                if status == "open"
+                else await self.http.pages("/spot/orders", params)
+            )
+            for row in rows:
                 if row["currency_pair"] != symbol:
                     raise ValueError("Gate returned an order for another instrument")
                 orders[str(row["id"])] = row
@@ -752,7 +781,8 @@ class GateioExecutionClient(LiveExecutionClient):
             ])
             return mass
         except Exception as error:
-            self._log.warning(f"Gate mass reconciliation incomplete: {type(error).__name__}")
+            detail = str(error) if isinstance(error, GateioHttpError) else type(error).__name__
+            self._log.warning(f"Gate mass reconciliation incomplete: {detail}")
             return None
         finally:
             self.reconciliation_active = False
@@ -831,9 +861,12 @@ class GateioExecutionClient(LiveExecutionClient):
         self._waiting_submissions[order.client_order_id] = canceled
         try:
             payload = submit_payload(order)
+            if self._instrument_provider.find(order.instrument_id) is None:
+                raise ValueError("Gate submission instrument is not configured for this client")
             row = await self._send_submission(order, payload, canceled, finished)
             if order.is_closed or canceled.is_set():
                 return
+            _check_order_response(row, order.instrument_id, client_order_id=order.client_order_id)
             async with self._report_lock:
                 await self._publish_order(row)
             self._request_account_refresh()
@@ -903,6 +936,9 @@ class GateioExecutionClient(LiveExecutionClient):
                 {"currency_pair": command.instrument_id.symbol.value},
                 private=True,
             )
+            _check_order_response(
+                row, command.instrument_id, venue_id, command.client_order_id,
+            )
             async with self._report_lock:
                 await self._publish_order(row)
             self._request_account_refresh()
@@ -920,6 +956,9 @@ class GateioExecutionClient(LiveExecutionClient):
                             "/spot/orders/" + target,
                             {"currency_pair": command.instrument_id.symbol.value},
                             private=True,
+                        )
+                        _check_order_response(
+                            row, command.instrument_id, venue_id, command.client_order_id,
                         )
                         async with self._report_lock:
                             report = await self._publish_order(row)
@@ -951,7 +990,11 @@ class GateioExecutionClient(LiveExecutionClient):
         # Never issue venue-wide cancel-all: another program may share this account.
         orders = {
             o.client_order_id: o
-            for o in self._cache.orders_open(instrument_id=command.instrument_id)
+            for o in (
+                self._cache.orders_open(instrument_id=command.instrument_id)
+                + self._cache.orders_inflight(instrument_id=command.instrument_id)
+            )
+            if o.account_id == self.account_id
         }
         for cid in tuple(self._waiting_submissions):
             order = self._cache.order(cid)
@@ -1030,6 +1073,9 @@ class GateioExecutionClient(LiveExecutionClient):
                     return None
             else:
                 raise
+        _check_order_response(
+            row, command.instrument_id, command.venue_order_id, command.client_order_id,
+        )
         report = order_report(
             row,
             self._instrument(row["currency_pair"]),
@@ -1058,11 +1104,16 @@ class GateioExecutionClient(LiveExecutionClient):
         for instrument in self._symbols(command):
             for status in ("open",) if command.open_only else ("open", "finished"):
                 params = {"currency_pair": instrument.raw_symbol.value, "status": status}
-                if command.start is not None:
+                if status == "finished" and command.start is not None:
                     params["from"] = int(command.start.timestamp())
-                if command.end is not None:
+                if status == "finished" and command.end is not None:
                     params["to"] = int(command.end.timestamp())
-                for row in await self.http.pages("/spot/orders", params):
+                rows = (
+                    await self.http.open_orders(instrument.raw_symbol.value)
+                    if status == "open"
+                    else await self.http.pages("/spot/orders", params)
+                )
+                for row in rows:
                     if row["currency_pair"] != instrument.raw_symbol.value:
                         raise ValueError("Gate returned an order for another instrument")
                     report = order_report(
@@ -1085,6 +1136,8 @@ class GateioExecutionClient(LiveExecutionClient):
         return reports
 
     async def generate_fill_reports(self, command):
+        if command.venue_order_id is not None and command.instrument_id is None:
+            raise ValueError("Gate order-specific fill query requires an instrument")
         reports = []
         for instrument in self._symbols(command):
             params = {
@@ -1097,13 +1150,7 @@ class GateioExecutionClient(LiveExecutionClient):
                 params["to"] = int(command.end.timestamp())
             for row in await self.http.pages("/spot/my_trades", params):
                 reports.append(
-                    fill_report(
-                        row,
-                        instrument,
-                        self.account_id,
-                        self._resolve(row),
-                        self._clock.timestamp_ns(),
-                    )
+                    self._validate_execution(row, instrument, command.venue_order_id)
                 )
         return reports
 
