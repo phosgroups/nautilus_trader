@@ -260,6 +260,47 @@ jobs:
           PUBLISH_URL="https://aws:${{ steps.codeartifact.outputs.token }}@phos-${{ secrets.AWS_ACCOUNT_ID }}.d.codeartifact.${{ secrets.AWS_REGION }}.amazonaws.com/pypi/nautilus-pypi/"
           uv publish --publish-url "${PUBLISH_URL}" dist/*.whl
 
+      - name: Record installation metadata
+        env:
+          PACKAGE_REPOSITORY_URL: https://phos-${{ secrets.AWS_ACCOUNT_ID }}.d.codeartifact.${{ secrets.AWS_REGION }}.amazonaws.com/pypi/nautilus-pypi/
+          PACKAGE_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          wheels = sorted(Path("dist").glob("nautilus_trader-*.whl"))
+          assert len(wheels) == 1, wheels
+          wheel = wheels[0]
+          repository_url = os.environ["PACKAGE_REPOSITORY_URL"]
+          metadata = {
+              "package": "nautilus-trader",
+              "version": wheel.name.split("-")[1],
+              "wheel": wheel.name,
+              "sha256": hashlib.file_digest(wheel.open("rb"), "sha256").hexdigest(),
+              "repository_url": repository_url,
+              "index_url": repository_url + "simple/",
+              "domain": "phos",
+              "repository": "nautilus-pypi",
+              "region": os.environ["PACKAGE_REGION"],
+              "source_commit": os.environ["GITHUB_SHA"],
+              "runtime_tree": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD:nautilus_trader"], text=True
+              ).strip(),
+          }
+          Path("installation.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          PY
+
+      - name: Upload installation metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: nt-installation-info
+          path: installation.json
+          if-no-files-found: error
+
       - name: Write publish summary
         run: |
           {

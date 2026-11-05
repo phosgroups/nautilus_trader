@@ -1,46 +1,55 @@
-# -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
-#  https://nautechsystems.io
-#
-#  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
-#  You may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-# -------------------------------------------------------------------------------------------------
+"""Explicit spot endpoints and client settings; no environment credential fallback."""
+
+from enum import Enum
 
 from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.config import LiveExecClientConfig
-from nautilus_trader.core.nautilus_pyo3 import GateioEnvironment
-from nautilus_trader.core.nautilus_pyo3 import GateioProductType
 from nautilus_trader.model.identifiers import Venue
 
 
-class GateioDataClientConfig(LiveDataClientConfig, frozen=True):
-    """Configuration placeholder for the unsupported Gate.io v1 data client."""
+GATEIO = Venue("GATEIO")
 
-    venue: Venue = Venue("GATEIO")
-    product_type: GateioProductType = GateioProductType.SPOT
-    environment: GateioEnvironment = GateioEnvironment.LIVE
-    api_key: str | None = None
-    api_secret: str | None = None
+
+class GateioEnvironment(str, Enum):
+    LIVE = "LIVE"
+    TESTNET = "TESTNET"
+
+
+def endpoints(environment, http=None, ws=None):
+    environment = GateioEnvironment(environment)
+    if environment == GateioEnvironment.TESTNET:
+        return (
+            http or "https://api-testnet.gateapi.io/api/v4",
+            ws or "wss://ws-testnet.gate.com/v4/ws/spot",
+        )
+    return http or "https://api.gateio.ws/api/v4", ws or "wss://api.gateio.ws/ws/v4/"
+
+
+class GateioDataClientConfig(LiveDataClientConfig, frozen=True):
+    venue: Venue = GATEIO
+    environment: GateioEnvironment = GateioEnvironment.TESTNET
     base_url_http: str | None = None
     base_url_ws: str | None = None
     proxy_url: str | None = None
+    http_timeout_secs: int = 10
+    http_rate_per_second: int = 10
+    max_retries: int = 3
+    book_depth: int = 100
+    max_book_buffer: int = 10000
 
 
 class GateioExecClientConfig(LiveExecClientConfig, frozen=True):
-    """Configuration placeholder for the unsupported Gate.io v1 execution client."""
-
-    venue: Venue = Venue("GATEIO")
-    product_type: GateioProductType = GateioProductType.SPOT
-    environment: GateioEnvironment = GateioEnvironment.LIVE
+    venue: Venue = GATEIO
+    environment: GateioEnvironment = GateioEnvironment.TESTNET
     api_key: str | None = None
     api_secret: str | None = None
     base_url_http: str | None = None
     base_url_ws: str | None = None
     proxy_url: str | None = None
+    http_timeout_secs: int = 10
+    http_rate_per_second: int = 10
+    max_retries: int = 3
+    reconciliation_lookback_mins: int = 60
+    account_refresh_interval_ms: int = 250
+    account_stale_after_ms: int = 10000
+    submission_ready_timeout_secs: float = 10.0

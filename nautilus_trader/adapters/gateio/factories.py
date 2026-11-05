@@ -1,67 +1,43 @@
-# -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
-#  https://nautechsystems.io
-#
-#  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
-#  You may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-# -------------------------------------------------------------------------------------------------
+"""Construct NT v1 clients without loading the Rust/v2 factory registry."""
 
-import asyncio
-
-from nautilus_trader.adapters.gateio.config import GateioDataClientConfig
-from nautilus_trader.adapters.gateio.config import GateioExecClientConfig
-from nautilus_trader.cache.cache import Cache
-from nautilus_trader.common.component import LiveClock
-from nautilus_trader.common.component import MessageBus
-from nautilus_trader.live.data_client import LiveDataClient
-from nautilus_trader.live.execution_client import LiveExecutionClient
+from nautilus_trader.adapters.gateio.config import endpoints
+from nautilus_trader.adapters.gateio.data import GateioDataClient
+from nautilus_trader.adapters.gateio.execution import GateioExecutionClient
+from nautilus_trader.adapters.gateio.http import GateioHttpClient
+from nautilus_trader.adapters.gateio.providers import GateioInstrumentProvider
 from nautilus_trader.live.factories import LiveDataClientFactory
 from nautilus_trader.live.factories import LiveExecClientFactory
 
 
-GATEIO_V1_UNSUPPORTED = (
-    "Gate.io is not supported by the NautilusTrader v1 Python runtime. "
-    "Its Rust/v2 adapter is retained, but no v1 live client is implemented."
-)
+def dependencies(config, clock, private=False):
+    http_url, ws_url = endpoints(config.environment, config.base_url_http, config.base_url_ws)
+    config = type(config)(**dict(config.dict(), base_url_http=http_url, base_url_ws=ws_url))
+    if private and (not config.api_key or not config.api_secret):
+        raise ValueError("Gate execution requires api_key and api_secret")
+    http = GateioHttpClient(
+        clock,
+        http_url,
+        config,
+        config.api_key if private else None,
+        config.api_secret if private else None,
+    )
+    provider = GateioInstrumentProvider(http, clock, config.instrument_provider)
+    return http, provider, config
 
 
 class GateioLiveDataClientFactory(LiveDataClientFactory):
-    """Reject Gate.io data client creation in the v1 runtime."""
-
     @staticmethod
-    def create(
-        loop: asyncio.AbstractEventLoop,
-        name: str,
-        config: GateioDataClientConfig,
-        msgbus: MessageBus,
-        cache: Cache,
-        clock: LiveClock,
-    ) -> LiveDataClient:
-        raise NotImplementedError(GATEIO_V1_UNSUPPORTED)
+    def create(loop, name, config, msgbus, cache, clock):
+        client, provider, config = dependencies(config, clock)
+        return GateioDataClient(loop, client, msgbus, cache, clock, provider, config, name)
 
 
 class GateioLiveExecClientFactory(LiveExecClientFactory):
-    """Reject Gate.io execution client creation in the v1 runtime."""
-
     @staticmethod
-    def create(
-        loop: asyncio.AbstractEventLoop,
-        name: str,
-        config: GateioExecClientConfig,
-        msgbus: MessageBus,
-        cache: Cache,
-        clock: LiveClock,
-    ) -> LiveExecutionClient:
-        raise NotImplementedError(GATEIO_V1_UNSUPPORTED)
+    def create(loop, name, config, msgbus, cache, clock):
+        client, provider, config = dependencies(config, clock, private=True)
+        return GateioExecutionClient(loop, client, msgbus, cache, clock, provider, config, name)
 
 
-# Preserve facade import names while routing all creation through the v1 rejection.
 GateioDataClientFactory = GateioLiveDataClientFactory
 GateioExecutionClientFactory = GateioLiveExecClientFactory

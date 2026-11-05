@@ -11,6 +11,7 @@ uv pip install --no-deps "${pkg_dir}/dist/"*.whl
 
 cd "$neutral_dir"
 uv run --project "$pkg_dir" --no-sync python - << 'PY'
+import asyncio
 import importlib
 from importlib.metadata import version
 
@@ -40,6 +41,7 @@ from nautilus_trader.adapters.gateio import GateioExecClientConfig
 from nautilus_trader.adapters.gateio import GateioLiveDataClientFactory
 from nautilus_trader.adapters.gateio import GateioLiveExecClientFactory
 from nautilus_trader.config import StrategyConfig
+from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.live.factories import LiveDataClientFactory
@@ -66,16 +68,31 @@ assert issubclass(BitgetLiveExecClientFactory, LiveExecClientFactory)
 for name in ("BitgetHttpClient", "BitgetWebSocketClient", "BitgetAccountMode"):
     assert hasattr(nautilus_pyo3, name), name
 
-for factory, config in (
-    (GateioLiveDataClientFactory, GateioDataClientConfig()),
-    (GateioLiveExecClientFactory, GateioExecClientConfig()),
-):
-    try:
-        factory.create(loop=None, name="GATEIO", config=config, msgbus=None, cache=None, clock=None)
-    except NotImplementedError as exc:
-        assert "Gate.io" in str(exc) and "v1" in str(exc), str(exc)
-    else:
-        raise AssertionError(f"{factory.__name__} must reject unsupported v1 usage")
+assert issubclass(GateioLiveDataClientFactory, LiveDataClientFactory)
+assert issubclass(GateioLiveExecClientFactory, LiveExecClientFactory)
+loop = asyncio.new_event_loop()
+node = TradingNode(
+    TradingNodeConfig(
+        logging=LoggingConfig(log_level="ERROR"),
+        data_clients={"GATEIO": GateioDataClientConfig()},
+        exec_clients={
+            "GATEIO": GateioExecClientConfig(
+                api_key="build-only-smoke-key",
+                api_secret="build-only-smoke-secret",
+            ),
+        },
+    ),
+    loop=loop,
+)
+try:
+    node.add_data_client_factory("GATEIO", GateioLiveDataClientFactory)
+    node.add_exec_client_factory("GATEIO", GateioLiveExecClientFactory)
+    node.build()
+    assert node.is_built()
+    assert not node.is_running()
+finally:
+    node.dispose()
+    loop.close()
 
-print(f"nautilus_trader {wheel_version} imported OK (v1 API + Bitget; Gate.io explicitly unsupported)")
+print(f"nautilus_trader {wheel_version} imported OK (v1 API + Bitget + Gate spot factories)")
 PY

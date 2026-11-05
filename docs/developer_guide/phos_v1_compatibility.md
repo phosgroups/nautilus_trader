@@ -49,8 +49,10 @@ libraries. Local `uv build` retains its default isolated environment.
 
 Run the smoke script from the repository root. It installs the wheel from `dist/`
 and imports it from a neutral directory. It checks the v1 `TradingNode`, strategy
-claim configuration, Bitget factories/bindings, and Gate.io's expected rejection.
-It does not connect to a live exchange.
+claim configuration, Bitget factories/bindings, and construction of a native
+Gate.io spot node with data and execution clients. It does not connect to a live
+exchange. Successful publication also uploads `nt-installation-info`, containing
+the credential-free installation endpoint, wheel version/hash, and source identity.
 
 `.docker/build-wheel.dockerfile` also builds the root wheel using the pinned Rust
 and uv images. Its local output is a native Linux wheel; the phos publishing
@@ -85,11 +87,11 @@ exchange validation.
 
 ## Gate.io
 
-The v1 wheel provides importable Gate.io configuration types and
+The v1 wheel provides Gate.io spot data and execution clients through
 `GateioLiveDataClientFactory` / `GateioLiveExecClientFactory`. The shorter facade
-factory names remain aliases. Configuration construction is supported, but
-calling either factory's `create()` raises an explicit `NotImplementedError`
-before creating a client or connecting to an exchange.
+factory names remain aliases. This is the Python v1 implementation; it does not
+select the retained Rust/v2 factory registry.
 
-The Gate.io Rust adapter and v2 Python facade remain in place. Gate.io live client
-support is not implemented for the v1 Python runtime.
+See `docs/integrations/gateio.md` for supported orders, account behavior,
+reconciliation, and the remaining scope restrictions. The wheel smoke test builds
+both clients using dummy credentials without connecting or trading.

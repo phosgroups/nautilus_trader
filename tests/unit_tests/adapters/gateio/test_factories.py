@@ -13,6 +13,10 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import subprocess
+import sys
+from unittest.mock import patch
+
 import pytest
 
 from nautilus_trader.adapters.gateio import GateioDataClientConfig
@@ -32,16 +36,61 @@ from nautilus_trader.adapters.gateio import GateioLiveExecClientFactory
         (GateioExecutionClientFactory, GateioExecClientConfig),
     ],
 )
-def test_gateio_v1_factory_explicitly_rejects_unsupported_usage(factory, config_type):
-    # Importing and constructing configs is safe. Reject usage before touching
-    # a runtime dependency, credential, or network connection.
+def test_gateio_v1_factory_constructs_the_matching_live_client(factory, config_type):
     config = config_type()
-    with pytest.raises(NotImplementedError, match=r"Gate\.io.*not supported.*v1"):
-        factory.create(
-            loop=None,
+    module = "nautilus_trader.adapters.gateio.factories"
+    client_name = (
+        "GateioDataClient" if config_type is GateioDataClientConfig else "GateioExecutionClient"
+    )
+    dependencies = (object(), object(), config)
+    loop, msgbus, cache, clock = object(), object(), object(), object()
+    with (
+        patch(f"{module}.dependencies", return_value=dependencies),
+        patch(f"{module}.{client_name}") as client,
+    ):
+        result = factory.create(
+            loop=loop,
             name="GATEIO",
             config=config,
-            msgbus=None,
-            cache=None,
-            clock=None,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
         )
+    assert result is client.return_value
+    client.assert_called_once_with(
+        loop, dependencies[0], msgbus, cache, clock, dependencies[1], config, "GATEIO"
+    )
+
+
+@pytest.mark.parametrize("mode", ["CLASSIC", "UTA"])
+def test_gate_and_bitget_build_in_the_same_installed_v1_node(mode):
+    script = """
+import asyncio
+from nautilus_trader.adapters.gateio import GateioDataClientConfig, GateioExecClientConfig, GateioLiveDataClientFactory, GateioLiveExecClientFactory
+from nautilus_trader.adapters.bitget import BitgetAccountMode, BitgetProductType, BitgetDataClientConfig, BitgetExecClientConfig, BitgetLiveDataClientFactory, BitgetLiveExecClientFactory
+from nautilus_trader.config import TradingNodeConfig, LoggingConfig
+from nautilus_trader.live.node import TradingNode
+from nautilus_trader.model.identifiers import TraderId
+loop = asyncio.new_event_loop()
+config = TradingNodeConfig(
+    trader_id=TraderId('COEXIST-001'), logging=LoggingConfig(log_level='ERROR'),
+    data_clients={'GATEIO': GateioDataClientConfig(), 'BITGET': BitgetDataClientConfig(account_mode=MODE, product_type=BitgetProductType.SPOT)},
+    exec_clients={'GATEIO': GateioExecClientConfig(api_key='offline', api_secret='offline'), 'BITGET': BitgetExecClientConfig(account_mode=MODE, product_type=BitgetProductType.SPOT, api_key='offline', api_secret='offline', api_passphrase='offline')},
+)
+node = TradingNode(config=config, loop=loop)
+try:
+    node.add_data_client_factory('GATEIO', GateioLiveDataClientFactory)
+    node.add_exec_client_factory('GATEIO', GateioLiveExecClientFactory)
+    node.add_data_client_factory('BITGET', BitgetLiveDataClientFactory)
+    node.add_exec_client_factory('BITGET', BitgetLiveExecClientFactory)
+    node.build()
+    assert node.is_built() and not node.is_running()
+    for engine in (node.kernel.data_engine, node.kernel.exec_engine):
+        assert {str(x) for x in engine.registered_clients} == {'GATEIO', 'BITGET'}
+finally:
+    node.dispose()
+""".replace("MODE", f"BitgetAccountMode.{mode}")
+    result = subprocess.run(  # noqa: S603 (fixed local test script)
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
