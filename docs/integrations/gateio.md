@@ -23,6 +23,12 @@ Gate and Bitget use the same compiled native runtime and public v1 factories.
 | Fills | Actual trade ID, base quantity, price, maker/taker, fee, and fee currency |
 | Recovery | Restore subscriptions, reconcile REST orders/trades/balances, deduplicate fills |
 
+Best-price updates pad bid/ask prices and sizes to matching precisions, using
+instrument precision as a minimum while preserving finer exchange values.
+Malformed independent trade/quote updates are logged and discarded without
+resetting healthy book subscriptions. Concurrent subscriptions for different
+instruments are serialized, with acknowledgements still matched by request ID.
+
 The book checks `U/u` against the snapshot sequence, ignores old updates, clears
 the managed book on gaps, and obtains a new snapshot. Buffered WS intervals are
 preserved while retrying a lagging REST snapshot. A sequence-advancing update
@@ -112,7 +118,7 @@ this spot-only v1 profile:
 | 3. Post-only | GTC limit orders map to `poc`; other execution semantics are denied locally |
 | 4. Market amount units | Market orders, quote-sized orders and reduce-only orders are explicitly unsupported; no silent base/quote reinterpretation |
 | 5. Client IDs | Canonical UUIDs use a reversible 22-byte encoding; supported short ASCII IDs round-trip; other IDs are rejected without truncation |
-| 6. Grouped open orders | Per-symbol `/spot/orders?status=open` returns a flat array; pagination deduplicates IDs and rejects repeated pages |
+| 6. Grouped open orders | Per-symbol flat arrays normally; a valid pair rejected with HTTP 400 `INVALID_PARAM_VALUE` falls back to paginated `/spot/open_orders` groups, filtered by symbol and validated before use |
 | 7. Candles | Unsupported in this PMM spot profile; no candle channel is falsely advertised |
 | 8. Derivative prices/funding | Unsupported; public spot quotes use `spot.book_ticker` |
 | 9. Balance models/times | Partial spot notifications trigger authoritative REST snapshots; those snapshots use local observation time, not a fabricated exchange event time; derivative balances are unsupported |
@@ -150,6 +156,13 @@ Identical REST/WS acceptance acknowledgements cannot overwrite a confirmed
 order's local pending-cancel state or emit another acceptance; the first venue
 acknowledgement and genuine price/quantity changes remain observable.
 
+Gate testnet can return public metadata and finished orders for `LIGHT_USDT`
+while rejecting its per-pair open-order query. The account-wide fallback still
+requires a successful, complete query; errors never imply an empty account.
+Only finished-order queries send `from`/`to` filters. HTTP exceptions include
+method, endpoint and allowlisted query parameters, without authentication
+headers, request bodies or arbitrary server error text.
+
 Subscriptions carry unique request IDs and require matching acknowledgements;
 a late acknowledgement from an earlier attempt cannot confirm a newer batch.
 
@@ -167,6 +180,62 @@ does not assert that a quiet or imbalanced real testnet market satisfies those
 guards, or that unsupported account/execution modes are production-ready.
 
 ## Build and test
+
+### Cross-adapter review and regression boundaries
+
+The Gate implementation is checked against these concrete contracts, rather
+than assuming that an exchange's wire format matches another adapter:
+
+| Contract | Reference implementation | Gate behavior and regression coverage |
+| --- | --- | --- |
+| Instrument rules and routing | Bitget providers and execution configuration | Explicit spot instruments; an unloaded instrument or another venue cannot reach POST |
+| Quote precision | Bitget `parse_ws_quote_tick`, OKX `parse_quote_msg` | Match both price and size precision; preserve values with 0-16 decimal places and isolate native conversion from a reduced Decimal context |
+| Independent bad public messages | Bitget public parsing/dispatch | Reject malformed trade/quote updates without resetting unrelated books |
+| Snapshot/delta continuity | Binance spot snapshot buffering, OKX full images | Preserve Gate U/u rules, full-image replacement, bounded buffering and late-snapshot fencing |
+| Multi-instrument subscriptions | Bitget `topic_key`, OKX subscription state | Per-instrument lifecycle locks, serialized acknowledged requests and unique request IDs; canceled BTC requests cannot acknowledge LIGHT |
+| Failed subscription cleanup | Bitget subscription registration and replay | Roll back rejected/canceled book targets; duplicate requests do not reset books or start duplicate REST tasks |
+| Reconnect and queue invalidation | OKX reconnect/dispatch state | Clear all managed books before REST waits; invalidate on queue failure; fence a message held before recovery |
+| Startup and shutdown races | Native client task lifecycle and Bitget reconnect handling | Reject concurrent opens, close a late-opening transport after shutdown, and restore confirmed topics on an explicit connection reopen |
+| HTTP signing and rate limiting | Binance HTTP client | Sign after waiting for quota; cancel/read/write priority shares one budget; unknown writes are not retried |
+| Open-order/history separation | Binance account endpoints, Bitget report queries | Send time filters only for finished orders; validate and paginate the account-wide LIGHT testnet fallback |
+| Order ownership | Binance strategy cancellation filtering | Cancel only this account/strategy/instrument/side, including submitted orders; cached account/venue/order identities must agree |
+| Query/response identity | Bitget paired reconciliation | Validate the requested instrument/order and order-specific fills before emitting facts; reject null/malformed execution IDs |
+| Partial fills and fees | Bitget execution/mass-status handling | Pair cumulative fills with real executions, preserve fee currency/sign, deduplicate REST/WS replay and avoid inferred executions |
+| Balances and freshness | Bitget account handling | Coalesced full snapshots do not block ordered reports; reject stale-account submissions while permitting queries/cancels |
+
+`test_audit_boundaries.py` holds negative cases for these boundaries.
+`test_multi_instrument_node.py` runs BTC_USDT and LIGHT_USDT together through
+native data/execution engines, including mixed precisions, both public and
+private subscriptions, partial and duplicate fills, reconnect, cancellation,
+fee currencies and exact final balances. PMM's separate suite covers its
+50-level/default-guard behavior. These are distinct from read-only real Gate
+observations and from funded execution tests.
+
+Supported execution remains regular cash spot GTC post-only. The visible
+100-level book is not the full venue book, and unavailable history must leave
+reconciliation incomplete. These changes do not expand supported account modes,
+alter PMM guards, or constitute deployment acceptance of a newly published wheel.
+
+### Verification on 2026-11-05
+
+The final Python source passed 193 Gate cases, 730 native core regressions,
+37 fee-model/Bitget cases, 212 PMM cases, 227 Backtest cases plus 170 subtests,
+20 market-data cases and 93 user-data cases, with no failures or skips.
+Gate and one-hour LIGHT replays exactly matched the existing execution,
+balance and order-lifecycle baselines, with no residual orders or locked funds.
+
+Both BTC_USDT and LIGHT_USDT received real public books, quotes and trades
+during a five-minute observation without WebSocket failures. A separate
+five-minute spot-testnet session completed 46 private reconciliations without
+order commands or WebSocket failures. Funded order placement was not repeated
+in this verification; execution/fill/reconnect coverage used authenticated
+local protocol servers and the native engines.
+
+Tests used the released `1.231.0+phos.598c6be.33` native wheel on CPython 3.14
+with this branch's Gate Python modules installed over it. Source hashes were
+checked across every test environment; native binaries and consumer dependency
+pins were unchanged. The released wheel does not contain these Python fixes.
+A new wheel build and deployment verification are still required.
 
 Normal NT wheel builds include `nautilus_trader/adapters/gateio`. PMM deployment
 needs a wheel built from this branch; an upstream PyPI wheel alone does

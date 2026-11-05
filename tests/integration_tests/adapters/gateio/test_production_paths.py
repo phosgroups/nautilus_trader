@@ -206,7 +206,9 @@ def test_brief_private_disconnect_during_quota_wait_defers_instead_of_denying():
 
 def test_cancel_without_venue_id_waits_for_the_inflight_submit_response():
     async def run():
-        client = client_for(lambda *args, **kwargs: helpers["canceled_order"]())
+        client = client_for(lambda *args, **kwargs: dict(
+            helpers["canceled_order"](), text="t-ntSwait-for-account",
+        ))
         order = submission(client).order
         finished = asyncio.Event()
         client._inflight_submissions[order.client_order_id] = finished

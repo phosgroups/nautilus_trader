@@ -151,6 +151,7 @@ class GateioDataClient(LiveMarketDataClient):
             )
         self.http, self.config = client, config
         self.books, self.resyncs = {}, {}
+        self._subscription_locks = {}
         self.public_subscriptions = {"spot.trades": set(), "spot.book_ticker": set()}
         self.ws = GateioWebSocket(
             loop,
@@ -160,6 +161,7 @@ class GateioDataClient(LiveMarketDataClient):
             self._reconnect,
             config.proxy_url,
             error_handler=self._log.error,
+            invalidate=self._invalidate_books,
         )
 
     async def _connect(self):
@@ -221,6 +223,10 @@ class GateioDataClient(LiveMarketDataClient):
     def _reset(self, instrument_id):
         self.books[instrument_id] = GateBook(self.config.book_depth, self.config.max_book_buffer)
         self._emit(instrument_id, True, [], 0, self._clock.timestamp_ns())
+
+    def _invalidate_books(self):
+        for instrument_id in list(self.books):
+            self._reset(instrument_id)
 
     def _schedule_resync(self, instrument_id):
         task = self.resyncs.get(instrument_id)
@@ -285,6 +291,9 @@ class GateioDataClient(LiveMarketDataClient):
         if message["channel"] != "spot.order_book_update":
             return
         row = message["result"]
+        if not isinstance(row, dict) or not isinstance(row.get("s"), str):
+            self._log.warning("Discarding Gate book update without a valid symbol")
+            return
         instrument_id = next((i for i in self.books if i.symbol.value == row["s"]), None)
         if instrument_id is None:
             return
@@ -295,14 +304,17 @@ class GateioDataClient(LiveMarketDataClient):
                 self._emit(instrument_id, *result, book.sequence, int(row["t"]) * 1_000_000)
             elif book.sequence is None:
                 self._schedule_resync(instrument_id)
-        except (BookGap, ValueError, KeyError):
+        except (ArithmeticError, BookGap, ValueError, KeyError, TypeError) as error:
             self._reset(instrument_id)
-            if not row.get("full"):
+            if isinstance(error, BookGap) and not row.get("full"):
                 self.books[instrument_id].buffer.append(row)
             self._schedule_resync(instrument_id)
 
     def _public_tick(self, channel, row):
-        symbol = row["currency_pair"] if channel == "spot.trades" else row["s"]
+        if not isinstance(row, dict):
+            self._log.warning(f"Discarding invalid Gate {channel} update: expected an object")
+            return
+        symbol = row.get("currency_pair") if channel == "spot.trades" else row.get("s")
         instrument_id = next(
             (i for i in self.public_subscriptions[channel] if i.symbol.value == symbol), None
         )
@@ -310,11 +322,27 @@ class GateioDataClient(LiveMarketDataClient):
             return
         instrument = self._instrument_provider.find(instrument_id)
         parser = public_trade_tick if channel == "spot.trades" else public_quote_tick
-        tick = parser(row, instrument, self._clock.timestamp_ns())
+        try:
+            tick = parser(row, instrument, self._clock.timestamp_ns())
+        except (ArithmeticError, KeyError, TypeError, ValueError) as error:
+            # A malformed independent trade/quote must not reset healthy L2
+            # subscriptions. Book gaps and private execution errors still recover.
+            self._log.warning(
+                f"Discarding invalid Gate {channel} update for {instrument_id}: "
+                f"{type(error).__name__}"
+            )
+            return
         if tick is not None:
             self._handle_data(tick)
 
     async def _public_subscription(self, channel, instrument_id, subscribe):
+        async with self._subscription_lock(channel, instrument_id):
+            await self._change_public_subscription(channel, instrument_id, subscribe)
+
+    def _subscription_lock(self, channel, instrument_id):
+        return self._subscription_locks.setdefault((channel, instrument_id), asyncio.Lock())
+
+    async def _change_public_subscription(self, channel, instrument_id, subscribe):
         if self._instrument_provider.find(instrument_id) is None:
             raise ValueError("Gate subscription instrument was not loaded")
         selected = self.public_subscriptions[channel]
@@ -347,26 +375,48 @@ class GateioDataClient(LiveMarketDataClient):
         await self._public_subscription("spot.book_ticker", command.instrument_id, False)
 
     async def _reconnect(self):
-        for instrument_id in list(self.books):
-            task = self.resyncs.get(instrument_id)
+        instruments, tasks = list(self.books), []
+        # Clear every managed book before any network wait. A failed snapshot
+        # for one pair must not leave another pair's old book looking current.
+        for instrument_id in instruments:
+            task = self.resyncs.pop(instrument_id, None)
             if task and not task.done():
                 task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                tasks.append(task)
             self._reset(instrument_id)
-            await self._resync(instrument_id)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for instrument_id in instruments:
+            if instrument_id in self.books:
+                await self._resync(instrument_id)
 
     async def _subscribe_order_book_deltas(self, command):
+        async with self._subscription_lock("spot.order_book_update", command.instrument_id):
+            await self._subscribe_book(command)
+
+    async def _subscribe_book(self, command):
         if command.book_type != BookType.L2_MBP:
             raise ValueError("Gate PMM requires L2_MBP")
         if self._instrument_provider.find(command.instrument_id) is None:
             raise ValueError("Gate subscription instrument was not loaded")
+        if command.instrument_id in self.books:
+            return
         self._reset(command.instrument_id)
-        await self.ws.subscribe(
-            "spot.order_book_update", [command.instrument_id.symbol.value, "100ms"]
-        )
+        try:
+            await self.ws.subscribe(
+                "spot.order_book_update", [command.instrument_id.symbol.value, "100ms"]
+            )
+        except BaseException:
+            self.books.pop(command.instrument_id, None)
+            raise
         self._schedule_resync(command.instrument_id)
 
     async def _unsubscribe_order_book_deltas(self, command):
+        async with self._subscription_lock("spot.order_book_update", command.instrument_id):
+            await self._unsubscribe_book(command)
+
+    async def _unsubscribe_book(self, command):
+        if command.instrument_id not in self.books:
+            return
         await self.ws.unsubscribe(
             "spot.order_book_update", [command.instrument_id.symbol.value, "100ms"]
         )

@@ -1,6 +1,8 @@
 """Convert exchange facts to NT v1 reports without synthesizing fills from order totals."""
 
 from decimal import Decimal
+from decimal import localcontext
+from functools import wraps
 
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import FillReport
@@ -21,6 +23,24 @@ from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 
 
+def _exact_decimals(function):
+    @wraps(function)
+    def convert(*args, **kwargs):
+        # Native Price/Quantity/Money parsing also uses Decimal arithmetic.
+        # Isolate conversion of exchange facts from a caller's smaller context.
+        with localcontext() as context:
+            context.prec = max(context.prec, 64)
+            return function(*args, **kwargs)
+    return convert
+
+
+def _exchange_id(value):
+    if isinstance(value, bool) or not isinstance(value, (str, int)) or not str(value):
+        raise ValueError("Gate execution identifiers must be nonempty strings or integers")
+    return str(value)
+
+
+@_exact_decimals
 def event_ns(row, prefix, fallback):
     if row.get(prefix + "_ms") is not None:
         return int(Decimal(str(row[prefix + "_ms"])) * 1_000_000)
@@ -29,6 +49,7 @@ def event_ns(row, prefix, fallback):
     return fallback
 
 
+@_exact_decimals
 def public_trade_tick(row, instrument, now):
     """Gate spot.trades reports the taker's side and a potentially fractional ms time."""
     if row["currency_pair"] != instrument.raw_symbol.value:
@@ -42,12 +63,24 @@ def public_trade_tick(row, instrument, now):
         Price.from_str(f"{price:f}"),
         Quantity.from_str(f"{size:f}"),
         side,
-        TradeId(str(row["id"])),
+        TradeId(_exchange_id(row["id"])),
         event_ns(row, "create_time", now),
         now,
     )
 
 
+def _decimal_precision(value):
+    # Decimal.normalize() applies the process-wide context and can round a
+    # valid exchange value before we even choose its display precision.
+    _, digits, exponent = value.as_tuple()
+    for digit in reversed(digits):
+        if digit:
+            break
+        exponent += 1
+    return max(0, -exponent)
+
+
+@_exact_decimals
 def public_quote_tick(row, instrument, now):
     """Return no quote while either side of Gate's best-price channel is empty."""
     if row["s"] != instrument.raw_symbol.value:
@@ -60,17 +93,31 @@ def public_quote_tick(row, instrument, now):
         return None
     if bid >= ask:
         raise ValueError("Crossed Gate public quote")
+    # Gate omits trailing zeroes independently on each side. NT requires
+    # matching price AND size precisions. Pad to the instrument precision,
+    # retaining any genuinely finer exchange values instead of rounding facts.
+    price_precision = max(
+        instrument.price_precision,
+        _decimal_precision(bid),
+        _decimal_precision(ask),
+    )
+    size_precision = max(
+        instrument.size_precision,
+        _decimal_precision(bid_size),
+        _decimal_precision(ask_size),
+    )
     return QuoteTick(
         instrument.id,
-        Price.from_str(f"{bid:f}"),
-        Price.from_str(f"{ask:f}"),
-        Quantity.from_str(f"{bid_size:f}"),
-        Quantity.from_str(f"{ask_size:f}"),
+        Price.from_str(f"{bid:.{price_precision}f}"),
+        Price.from_str(f"{ask:.{price_precision}f}"),
+        Quantity.from_str(f"{bid_size:.{size_precision}f}"),
+        Quantity.from_str(f"{ask_size:.{size_precision}f}"),
         int(Decimal(str(row["t"])) * 1_000_000),
         now,
     )
 
 
+@_exact_decimals
 def order_report(row, instrument, account_id, client_order_id, now):  # noqa: C901 (explicit venue states)
     amount, left = Decimal(row["amount"]), Decimal(row.get("left", row["amount"]))
     if not amount.is_finite() or not left.is_finite() or amount <= 0 or not 0 <= left <= amount:
@@ -119,7 +166,7 @@ def order_report(row, instrument, account_id, client_order_id, now):  # noqa: C9
     return OrderStatusReport(
         account_id=account_id,
         instrument_id=instrument.id,
-        venue_order_id=VenueOrderId(str(row["id"])),
+        venue_order_id=VenueOrderId(_exchange_id(row["id"])),
         client_order_id=client_order_id,
         order_side=side,
         order_type=OrderType.LIMIT,
@@ -142,6 +189,7 @@ def order_report(row, instrument, account_id, client_order_id, now):  # noqa: C9
     )
 
 
+@_exact_decimals
 def fill_report(row, instrument, account_id, client_order_id, now):
     validate_assets(row, instrument)
     amount, price = Decimal(row["amount"]), Decimal(row["price"])
@@ -166,9 +214,9 @@ def fill_report(row, instrument, account_id, client_order_id, now):
     return FillReport(
         account_id=account_id,
         instrument_id=instrument.id,
-        venue_order_id=VenueOrderId(str(row["order_id"])),
+        venue_order_id=VenueOrderId(_exchange_id(row["order_id"])),
         client_order_id=client_order_id,
-        trade_id=TradeId(str(row["id"])),
+        trade_id=TradeId(_exchange_id(row["id"])),
         order_side={"buy": OrderSide.BUY, "sell": OrderSide.SELL}[row["side"]],
         last_qty=Quantity.from_str(f"{amount:f}"),
         last_px=Price.from_str(f"{price:f}"),
