@@ -2,7 +2,8 @@ name: phos-publish
 
 # phos publishes nautilus-trader v1 (root Poetry/Cython package) to CodeArtifact (ADR-0015 / ADR-0022, CR-0025;
 # Linux-only per CR-0028).
-# Trigger: push main -> build Linux -> publish (release environment gate).
+# Trigger: push main or manual dispatch on main -> build Linux -> publish
+# (release environment gate).
 # NOTE: This repo is a fork, so GitHub does not allow referencing private actions
 # (phosgroups/phos-actions). Build/publish logic is inlined here.
 # Version = pyproject.toml version + VERSION_SUFFIX (repo variable, e.g. +phos)
@@ -15,6 +16,7 @@ name: phos-publish
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: phos-publish-${{ github.ref }}
@@ -32,6 +34,7 @@ env:
 
 jobs:
   build-linux:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     env:
       BUILD_MODE: release
