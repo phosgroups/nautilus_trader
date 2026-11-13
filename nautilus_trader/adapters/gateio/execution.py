@@ -101,6 +101,97 @@ def _check_order_response(row, instrument_id, venue_order_id=None, client_order_
         raise ValueError("Gate response does not match the requested client order")
 
 
+def _order_not_found(error):
+    return error.status == 404 and error.label in {"ORDER_NOT_FOUND", "CLIENT_ID_NOT_FOUND"}
+
+
+def _cached_query_venue_id(client, command, venue_id):
+    cache = getattr(client, "_cache", None)
+    cached = cache.order(command.client_order_id) if cache and command.client_order_id else None
+    if cached is None:
+        return None
+    if cached.instrument_id != command.instrument_id or cached.account_id not in (
+        None,
+        client.account_id,
+    ):
+        raise ValueError("Gate query conflicts with the cached account/instrument")
+    if venue_id is not None and cached.venue_order_id not in (None, venue_id):
+        raise ValueError("Gate query conflicts with the cached venue order identity")
+    return cached.venue_order_id
+
+
+async def _find_finished_order(client, command, venue_id):
+    # Custom IDs do not reliably identify finished spot orders. An empty
+    # history response is still unknown (history can lag), not canceled.
+    since = (
+        client._clock.timestamp_ns() // 1_000_000_000
+        - client.config.reconciliation_lookback_mins * 60
+    )
+    rows = await client.http.pages(
+        "/spot/orders",
+        {
+            "currency_pair": command.instrument_id.symbol.value,
+            "status": "finished",
+            "from": since,
+        },
+    )
+    matches = [
+        item
+        for item in rows
+        if (
+            str(item["id"]) == str(venue_id)
+            if venue_id is not None
+            else item.get("text") == order_text(command.client_order_id)
+        )
+    ]
+    if len({str(item["id"]) for item in matches}) > 1:
+        raise ValueError("Gate history has ambiguous client order identity")
+    return matches[0] if matches else None
+
+
+async def _fetch_order(client, command):
+    """Resolve a lookup miss using identity and history, never a synthetic terminal event."""
+    cached_id = _cached_query_venue_id(client, command, command.venue_order_id)
+    venue_id = command.venue_order_id or cached_id
+    if venue_id is None and command.client_order_id in getattr(client, "_waiting_submissions", {}):
+        # This POST has not crossed the transport boundary. REST queries cannot
+        # resolve it and would starve queued submissions of their rate budget.
+        return None
+    if venue_id is None and command.client_order_id is None:
+        raise ValueError("Gate order query requires a client or venue order ID")
+    target = str(venue_id) if venue_id is not None else order_text(command.client_order_id)
+    row = None
+    try:
+        row = await client.http.request(
+            "GET",
+            "/spot/orders/" + target,
+            {"currency_pair": command.instrument_id.symbol.value},
+            private=True,
+        )
+    except GateioHttpError as error:
+        if not _order_not_found(error):
+            raise
+        # Acceptance can arrive while the custom-ID request is in flight.
+        known_id = _cached_query_venue_id(client, command, venue_id)
+        if known_id is not None and str(known_id) != target:
+            venue_id = known_id
+            try:
+                row = await client.http.request(
+                    "GET",
+                    "/spot/orders/" + str(venue_id),
+                    {"currency_pair": command.instrument_id.symbol.value},
+                    private=True,
+                )
+            except GateioHttpError as retry_error:
+                if not _order_not_found(retry_error):
+                    raise
+        if row is None:
+            row = await _find_finished_order(client, command, venue_id)
+    if row is not None:
+        _check_order_response(row, command.instrument_id, venue_id, command.client_order_id)
+    return row
+
+
 class GateioExecutionClient(LiveExecutionClient):
     def __init__(self, loop, client, msgbus, cache, clock, instrument_provider, config, name=None):
         super().__init__(
@@ -937,7 +1028,10 @@ class GateioExecutionClient(LiveExecutionClient):
                 private=True,
             )
             _check_order_response(
-                row, command.instrument_id, venue_id, command.client_order_id,
+                row,
+                command.instrument_id,
+                venue_id,
+                command.client_order_id,
             )
             async with self._report_lock:
                 await self._publish_order(row)
@@ -949,17 +1043,14 @@ class GateioExecutionClient(LiveExecutionClient):
                 current = self._cache.order(command.client_order_id)
                 if current is not None and current.is_closed:
                     return
-                if error.status == 404 and error.label == "ORDER_NOT_FOUND":
+                if _order_not_found(error):
                     try:
-                        row = await self.http.request(
-                            "GET",
-                            "/spot/orders/" + target,
-                            {"currency_pair": command.instrument_id.symbol.value},
-                            private=True,
-                        )
-                        _check_order_response(
-                            row, command.instrument_id, venue_id, command.client_order_id,
-                        )
+                        row = await _fetch_order(self, command)
+                        if row is None:
+                            self._log.warning(
+                                "Gate cancel target remains unknown; await reconciliation"
+                            )
+                            return
                         async with self._report_lock:
                             report = await self._publish_order(row)
                         self._request_account_refresh()
@@ -972,6 +1063,7 @@ class GateioExecutionClient(LiveExecutionClient):
                             return
                     except Exception:
                         self._log.warning("Gate cancel target could not be reconciled")
+                        return
                 # A missing or still-open target is not cancellation proof.
                 self.generate_order_cancel_rejected(
                     strategy_id=command.strategy_id,
@@ -1037,45 +1129,9 @@ class GateioExecutionClient(LiveExecutionClient):
         await self._update_account()
 
     async def generate_order_status_report(self, command):
-        target = (
-            str(command.venue_order_id)
-            if command.venue_order_id
-            else order_text(command.client_order_id)
-        )
-        try:
-            row = await self.http.request(
-                "GET",
-                "/spot/orders/" + target,
-                {"currency_pair": command.instrument_id.symbol.value},
-                private=True,
-            )
-        except GateioHttpError as error:
-            if error.status == 404 and error.label == "ORDER_NOT_FOUND":
-                if command.venue_order_id is not None:
-                    return None
-                # Gate custom text lookup covers open orders only. A timed-out
-                # submit may already have filled or closed; inspect history
-                # before treating a custom-ID 404 as absence.
-                since = (
-                    self._clock.timestamp_ns() // 1_000_000_000
-                    - self.config.reconciliation_lookback_mins * 60
-                )
-                rows = await self.http.pages(
-                    "/spot/orders",
-                    {
-                        "currency_pair": command.instrument_id.symbol.value,
-                        "status": "finished",
-                        "from": since,
-                    },
-                )
-                row = next((r for r in rows if r.get("text") == target), None)
-                if row is None:
-                    return None
-            else:
-                raise
-        _check_order_response(
-            row, command.instrument_id, command.venue_order_id, command.client_order_id,
-        )
+        row = await _fetch_order(self, command)
+        if row is None:
+            return None
         report = order_report(
             row,
             self._instrument(row["currency_pair"]),
