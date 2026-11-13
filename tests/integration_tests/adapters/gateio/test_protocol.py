@@ -34,6 +34,7 @@ from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientOrderId
+from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Currency
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
@@ -424,16 +425,26 @@ def test_lagging_rest_snapshot_keeps_the_ws_interval_for_the_next_attempt():
     asyncio.run(run())
 
 
-def test_timed_out_submission_can_be_queried_after_it_has_already_closed():
+@pytest.mark.parametrize("label", ["ORDER_NOT_FOUND", "CLIENT_ID_NOT_FOUND"])
+@pytest.mark.parametrize("cached_venue_id", [False, True])
+def test_timed_out_submission_can_be_queried_after_it_has_already_closed(label, cached_venue_id):
     async def run():
         instrument = parse_instrument(PAIR, 0)
         cid = ClientOrderId("timed-out-order")
         closed = order()
         closed.update(status="closed", left="0", text=order_text(cid), finish_as="filled")
+        if cached_venue_id:
+            closed.pop("text")  # The known exchange identity remains authoritative.
+        cached = SimpleNamespace(
+            instrument_id=instrument.id,
+            account_id=AccountId("GATEIO-master"),
+            venue_order_id=VenueOrderId("123") if cached_venue_id else None,
+        )
         fill_check = AsyncMock()
         client = SimpleNamespace(
+            _cache=SimpleNamespace(order=lambda _: cached),
             http=SimpleNamespace(
-                request=AsyncMock(side_effect=GateioHttpError(404, "ORDER_NOT_FOUND")),
+                request=AsyncMock(side_effect=GateioHttpError(404, label)),
                 pages=AsyncMock(return_value=[closed]),
             ),
             config=SimpleNamespace(reconciliation_lookback_mins=60),
@@ -463,11 +474,17 @@ def test_timed_out_submission_can_be_queried_after_it_has_already_closed():
     "status",
     [OrderStatus.CANCELED, OrderStatus.FILLED, OrderStatus.ACCEPTED, None],
 )
-def test_cancel_not_found_requires_a_confirmed_terminal_state(status):
+@pytest.mark.parametrize("label", ["ORDER_NOT_FOUND", "CLIENT_ID_NOT_FOUND"])
+def test_cancel_not_found_requires_a_confirmed_terminal_state(status, label):
     async def run():
         instrument = parse_instrument(PAIR, 0)
         cid = ClientOrderId("cancel-race")
-        cached = SimpleNamespace(is_closed=False, venue_order_id="123")
+        cached = SimpleNamespace(
+            is_closed=False,
+            venue_order_id="123",
+            instrument_id=instrument.id,
+            account_id=AccountId("GATEIO-master"),
+        )
         query_result = order()
         client = SimpleNamespace(
             _cache=SimpleNamespace(order=lambda _: cached),
@@ -476,18 +493,19 @@ def test_cancel_not_found_requires_a_confirmed_terminal_state(status):
             http=SimpleNamespace(
                 request=AsyncMock(
                     side_effect=[
-                        GateioHttpError(404, "ORDER_NOT_FOUND"),
-                        query_result
-                        if status is not None
-                        else GateioHttpError(404, "ORDER_NOT_FOUND"),
+                        GateioHttpError(404, label),
+                        query_result if status is not None else GateioHttpError(404, label),
                     ]
-                )
+                ),
+                pages=AsyncMock(return_value=[]),
             ),
             _report_lock=asyncio.Lock(),
             _publish_order=AsyncMock(return_value=SimpleNamespace(order_status=status)),
             _request_account_refresh=Mock(),
             _clock=TestClock(),
             _log=SimpleNamespace(warning=Mock()),
+            account_id=AccountId("GATEIO-master"),
+            config=SimpleNamespace(reconciliation_lookback_mins=60),
             generate_order_cancel_rejected=Mock(),
         )
         command = SimpleNamespace(
@@ -502,7 +520,7 @@ def test_cancel_not_found_requires_a_confirmed_terminal_state(status):
             call.args[1] == "/spot/orders/123" for call in client.http.request.call_args_list
         )
         assert client.generate_order_cancel_rejected.call_count == (
-            0 if status in {OrderStatus.CANCELED, OrderStatus.FILLED} else 1
+            1 if status == OrderStatus.ACCEPTED else 0
         )
         if status is not None:
             client._publish_order.assert_awaited_once_with(query_result)

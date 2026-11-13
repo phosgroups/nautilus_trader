@@ -15,5 +15,11 @@ Sequence gaps, reconnects and unknown command outcomes are handled explicitly.
 HTTP reads/writes share the configured client throttle. Partial fills,
 cancel/fill races and omitted zero balances are covered by protocol tests.
 
+Order queries prefer the exchange order ID from the command or Cache. Both
+`ORDER_NOT_FOUND` and `CLIENT_ID_NOT_FOUND` trigger identity/history reconciliation;
+neither is treated as proof of cancellation. Empty or delayed history leaves the
+outcome unresolved until a real order report arrives. Queries for submissions
+still queued locally do not consume the REST budget needed to send those orders.
+
 Gate support is spot only. See `docs/integrations/gateio.md` for configuration,
 test coverage and current limitations.
