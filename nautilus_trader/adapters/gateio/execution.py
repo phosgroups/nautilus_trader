@@ -981,6 +981,7 @@ class GateioExecutionClient(LiveExecutionClient):
                     client_order_id=order.client_order_id,
                     reason=str(error),
                     ts_event=self._clock.timestamp_ns(),
+                    due_post_only=error.label == "POC_FILL_IMMEDIATELY",
                 )
             else:
                 self._log.warning("Gate submission outcome unknown; query before any replacement")

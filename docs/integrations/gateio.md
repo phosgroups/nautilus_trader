@@ -53,6 +53,12 @@ so NT retains the exchange trade IDs, prices and fee currencies. WS `event/finis
 and REST `status` are both supported. Immediate post-only cancellation is
 reported as rejection.
 
+An HTTP submission rejection with Gate label `POC_FILL_IMMEDIATELY` emits
+`OrderRejected` with `due_post_only=True`, preserving the original error reason.
+Other HTTP rejection labels keep `due_post_only=False`, even for post-only
+orders. Strategies can use this flag to distinguish a post-only price conflict
+from other rejections; their retry and fault policies remain strategy-owned.
+
 This profile does not support margin, perpetuals, market orders, in-place
 amendments, GT/points fee deductions, or unified-asset routing. The account
 should be dedicated to this PMM; external orders are not claimed or canceled.
