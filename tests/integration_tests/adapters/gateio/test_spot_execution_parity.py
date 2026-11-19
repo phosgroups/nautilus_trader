@@ -125,3 +125,29 @@ def test_amendment_reconciles_an_uncertain_patch_without_resending(outcome):
             client.generate_order_modify_rejected.assert_called_once()
 
     asyncio.run(run())
+
+
+def test_order_list_validates_all_children_before_first_post():
+    async def run():
+        instrument = parse_instrument(PAIR, 0)
+        factory = TestComponentStubs.order_factory()
+        good = factory.limit(
+            instrument.id, OrderSide.BUY, Quantity.from_int(1), Price.from_int(100),
+            client_order_id=ClientOrderId("first"),
+        )
+        invalid = factory.market(
+            instrument.id, OrderSide.BUY, Quantity.from_int(1),
+            quote_quantity=False, client_order_id=ClientOrderId("second"),
+        )
+        command = SimpleNamespace(order_list=factory.create_list([good, invalid]), strategy_id=good.strategy_id)
+        client = SimpleNamespace(
+            _instrument_provider=SimpleNamespace(find=lambda iid: instrument),
+            _clock=SimpleNamespace(timestamp_ns=lambda: 0), _submit_order=AsyncMock(), generate_order_denied=Mock(),
+        )
+        await GateioExecutionClient._submit_order_list(client, command)
+        client._submit_order.assert_not_awaited()
+        assert [call.kwargs["client_order_id"] for call in client.generate_order_denied.call_args_list] == [
+            good.client_order_id, invalid.client_order_id,
+        ]
+
+    asyncio.run(run())

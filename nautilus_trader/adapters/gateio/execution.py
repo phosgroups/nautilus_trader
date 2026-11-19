@@ -18,9 +18,11 @@ from nautilus_trader.adapters.gateio.parsing import order_report
 from nautilus_trader.adapters.gateio.websocket import GateioWebSocket
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import CancelOrder
+from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.model.enums import AccountType
+from nautilus_trader.model.enums import ContingencyType
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
@@ -1055,6 +1057,42 @@ class GateioExecutionClient(LiveExecutionClient):
             self._waiting_submissions.pop(order.client_order_id, None)
             self._inflight_submissions.pop(order.client_order_id, None)
             finished.set()
+
+    async def _submit_order_list(self, command):
+        orders = [order for order in command.order_list.orders if not order.is_closed]
+        try:
+            for order in orders:
+                if order.contingency_type != ContingencyType.NO_CONTINGENCY:
+                    raise ValueError("Gate spot supports lists of independent orders only")
+                if order.strategy_id != command.strategy_id or self._instrument_provider.find(order.instrument_id) is None:
+                    raise ValueError("Gate order list contains another strategy or an unconfigured instrument")
+                submit_payload(order)
+        except ValueError as error:
+            for order in orders:
+                self.generate_order_denied(
+                    strategy_id=order.strategy_id, instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id, reason=str(error),
+                    ts_event=self._clock.timestamp_ns(),
+                )
+            return
+
+        # Each child participates in the same readiness, throttling, cancellation
+        # and ambiguous-submit reconciliation as an independently submitted order.
+        submissions = [
+            SubmitOrder(
+                trader_id=command.trader_id,
+                strategy_id=order.strategy_id,
+                order=order,
+                command_id=UUID4(),
+                ts_init=self._clock.timestamp_ns(),
+                position_id=command.position_id,
+                client_id=command.client_id,
+                params=command.params,
+                correlation_id=command.correlation_id,
+            )
+            for order in orders
+        ]
+        await asyncio.gather(*(self._submit_order(child) for child in submissions))
 
     async def _cancel_order(self, command):  # noqa: C901 (local, in-flight and exchange outcomes)
         waiting = self._waiting_submissions.get(command.client_order_id)
