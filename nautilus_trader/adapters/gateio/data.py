@@ -4,6 +4,8 @@ import asyncio
 from decimal import Decimal
 
 from nautilus_trader.adapters.gateio.config import GATEIO
+from nautilus_trader.adapters.gateio.history import spot_bars
+from nautilus_trader.adapters.gateio.history import spot_trades
 from nautilus_trader.adapters.gateio.parsing import public_quote_tick
 from nautilus_trader.adapters.gateio.parsing import public_trade_tick
 from nautilus_trader.adapters.gateio.websocket import GateioWebSocket
@@ -425,6 +427,25 @@ class GateioDataClient(LiveMarketDataClient):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self.books.pop(command.instrument_id, None)
+
+    async def _history_instrument(self, instrument_id):
+        instrument = self._instrument_provider.find(instrument_id)
+        if instrument is None:
+            await self._instrument_provider.load_async(instrument_id)
+            instrument = self._instrument_provider.find(instrument_id)
+        if instrument is None:
+            raise ValueError(f"Unknown Gate instrument: {instrument_id}")
+        return instrument
+
+    async def _request_bars(self, request):
+        instrument = await self._history_instrument(request.bar_type.instrument_id)
+        bars = await spot_bars(self.http, instrument, request, self._clock.timestamp_ns())
+        self._handle_bars(request.bar_type, bars, request.id, request.start, request.end, request.params)
+
+    async def _request_trade_ticks(self, request):
+        instrument = await self._history_instrument(request.instrument_id)
+        trades = await spot_trades(self.http, instrument, request, self._clock.timestamp_ns())
+        self._handle_trade_ticks(instrument.id, trades, request.id, request.start, request.end, request.params)
 
     async def _request_instrument(self, request):
         instrument = self._instrument_provider.find(request.instrument_id)
