@@ -123,16 +123,15 @@ def _cached_query_venue_id(client, command, venue_id):
 async def _find_finished_order(client, command, venue_id):
     # Custom IDs do not reliably identify finished spot orders. An empty
     # history response is still unknown (history can lag), not canceled.
-    since = (
-        client._clock.timestamp_ns() // 1_000_000_000
-        - client.config.reconciliation_lookback_mins * 60
-    )
+    now = client._clock.timestamp_ns() // 1_000_000_000
+    since = max(0, now - client.config.reconciliation_lookback_mins * 60)
     rows = await client.http.pages(
         "/spot/orders",
         {
             "currency_pair": command.instrument_id.symbol.value,
             "status": "finished",
             "from": since,
+            "to": now,
         },
     )
     matches = [
@@ -659,6 +658,31 @@ class GateioExecutionClient(LiveExecutionClient):
         if task is None or task.done():
             self._execution_recovery_task = self.create_task(self._recover_executions())
 
+    async def _trade_history(self, symbol, start, end, order_id=None):
+        if start > end:
+            raise ValueError("Gate trade history start exceeds end")
+        params = {"currency_pair": symbol}
+        if order_id is not None:
+            params["order_id"] = str(order_id)
+        trades = {}
+        while True:
+            # With only one bound Gate returns seven days. With both it allows 30.
+            until = min(end, start + 30 * 86400)
+            batch = await self.http.pages("/spot/my_trades", {**params, "from": start, "to": until})
+            for row in batch:
+                trades[(row["currency_pair"], str(row["id"]))] = row
+            if until == end:
+                return list(trades.values())
+            start = until  # Overlap the boundary second to retain fractional timestamps.
+
+    async def _order_trades(self, row):
+        now = self._clock.timestamp_ns() // 1_000_000_000
+        end = event_ns(row, "update_time", now * 1_000_000_000) // 1_000_000_000
+        fallback = max(0, end - self.config.reconciliation_lookback_mins * 60)
+        start = event_ns(row, "create_time", fallback * 1_000_000_000) // 1_000_000_000
+        # Gate accepts whole seconds. Include fills in the final fractional second.
+        return await self._trade_history(row["currency_pair"], start, max(start, end) + 1, row["id"])
+
     async def _cancel_execution_recovery(self):
         self._execution_generation += 1
         task, self._execution_recovery_task = self._execution_recovery_task, None
@@ -705,9 +729,7 @@ class GateioExecutionClient(LiveExecutionClient):
             await self._publish_order(row)
             if key not in self._pending_orders and key not in self._pending_fills:
                 return
-        fills = await self.http.pages(
-            "/spot/my_trades", {"currency_pair": key[0], "order_id": key[1]}
-        )
+        fills = await self._order_trades(row)
         if generation != self._execution_generation:
             return
         # Validate every execution before publishing any of the batch.
@@ -770,7 +792,7 @@ class GateioExecutionClient(LiveExecutionClient):
         since = max(0, now - minutes * 60)
         fills, reports = [], []
         for instrument in self._instrument_provider.get_all().values():
-            paired_orders, paired_fills = await self._collect_instrument_reconciliation(instrument, since)
+            paired_orders, paired_fills = await self._collect_instrument_reconciliation(instrument, since, now)
             reports.extend(paired_orders)
             fills.extend(paired_fills)
         balances = None
@@ -779,12 +801,13 @@ class GateioExecutionClient(LiveExecutionClient):
             balances = await self.http.request("GET", "/spot/accounts", private=True)
         return reports, fills, balances
 
-    async def _reconciliation_orders(self, instrument, since, needed):
+    async def _reconciliation_orders(self, instrument, since, until, needed):
         symbol, orders = instrument.raw_symbol.value, {}
         for status in ("open", "finished"):
             params = {"currency_pair": symbol, "status": status}
             if status == "finished":
                 params["from"] = since
+                params["to"] = until
             rows = (
                 await self.http.open_orders(symbol)
                 if status == "open"
@@ -806,14 +829,14 @@ class GateioExecutionClient(LiveExecutionClient):
             orders[oid] = row
         return orders
 
-    async def _collect_instrument_reconciliation(self, instrument, since):
+    async def _collect_instrument_reconciliation(self, instrument, since, until):
         symbol, by_order = instrument.raw_symbol.value, {}
-        for fill in await self.http.pages("/spot/my_trades", {"currency_pair": symbol, "from": since}):
+        for fill in await self._trade_history(symbol, since, until):
             self._validate_execution(fill, instrument)
             by_order.setdefault(str(fill["order_id"]), {})[str(fill["id"])] = fill
         # Pair recent fills and cached active orders even when their creation
         # time lies outside Gate's finished-order filter.
-        orders = await self._reconciliation_orders(instrument, since, by_order)
+        orders = await self._reconciliation_orders(instrument, since, until, by_order)
         fills, reports = {}, []
         for oid, row in orders.items():
             report = order_report(
@@ -823,9 +846,7 @@ class GateioExecutionClient(LiveExecutionClient):
             known = sum((Decimal(r["amount"]) for r in trades.values()), Decimal(0))
             if known != report.filled_qty.as_decimal():
                 # Reuse bulk history; query individual partial lifecycles only.
-                for fill in await self.http.pages(
-                    "/spot/my_trades", {"currency_pair": symbol, "order_id": oid}
-                ):
+                for fill in await self._order_trades(row):
                     self._validate_execution(fill, instrument, oid)
                     trades[str(fill["id"])] = fill
                 known = sum((Decimal(r["amount"]) for r in trades.values()), Decimal(0))
@@ -1196,16 +1217,16 @@ class GateioExecutionClient(LiveExecutionClient):
         if command.venue_order_id is not None and command.instrument_id is None:
             raise ValueError("Gate order-specific fill query requires an instrument")
         reports = []
+        end = (
+            int(command.end.timestamp()) if command.end is not None
+            else self._clock.timestamp_ns() // 1_000_000_000
+        )
+        # Preserve Gate's default seven-day interval for requests without a start.
+        start = int(command.start.timestamp()) if command.start is not None else max(0, end - 7 * 86400)
         for instrument in self._symbols(command):
-            params = {
-                "currency_pair": instrument.raw_symbol.value,
-                "order_id": str(command.venue_order_id) if command.venue_order_id else None,
-            }
-            if command.start is not None:
-                params["from"] = int(command.start.timestamp())
-            if command.end is not None:
-                params["to"] = int(command.end.timestamp())
-            for row in await self.http.pages("/spot/my_trades", params):
+            for row in await self._trade_history(
+                instrument.raw_symbol.value, start, end, command.venue_order_id,
+            ):
                 reports.append(
                     self._validate_execution(row, instrument, command.venue_order_id)
                 )

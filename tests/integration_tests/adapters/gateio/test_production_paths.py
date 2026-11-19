@@ -287,6 +287,38 @@ def test_recent_fill_of_an_old_order_gets_a_status_even_outside_creation_window(
     asyncio.run(bounded(run()))
 
 
+@pytest.mark.parametrize("order_age_days", [15, 45])
+def test_reconciliation_recovers_fills_beyond_the_default_week(order_age_days):
+    async def run():
+        day = 86400
+        now = 100 * day
+        created = now - order_age_days * day
+        closed = now - 15 * day
+        row = dict(partial(), status="cancelled", create_time_ms=created * 1000,
+                   update_time_ms=closed * 1000)
+        execution = fill(create_time_ms=created * 1000)
+        client = client_for(lambda *args, **kwargs: [])
+        client._clock.set_time(now * 1_000_000_000)
+
+        async def pages(path, params):
+            if path == "/spot/orders":
+                return [row] if params["status"] == "finished" else []
+            start, end = params["from"], params["to"]
+            assert end - start <= 30 * day
+            return [execution] if start <= created <= end else []
+
+        client.http.pages = AsyncMock(side_effect=pages)
+        try:
+            mass = await client.generate_mass_status(30 * 24 * 60)
+            assert mass is not None
+            assert len(mass.order_reports) == 1
+            assert sum(len(trades) for trades in mass.fill_reports.values()) == 1
+        finally:
+            await cleanup(client)
+
+    asyncio.run(bounded(run()))
+
+
 def test_incomplete_mass_status_is_not_returned_and_reconciliation_flag_is_reset():
     async def run():
         client = client_for(lambda *args, **kwargs: balances())
