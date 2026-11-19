@@ -173,11 +173,10 @@ impl BitgetRawHttpClient {
         product: BitgetProductType,
         symbol: &str,
         interval: &str,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
-        limit: Option<u32>,
+        mut params: Vec<(&'static str, String)>,
+        history: bool,
     ) -> Result<Vec<shared::BitgetCandle>> {
-        let mut params = product_params(product);
+        params.extend(product_params(product));
         params.push(("symbol", symbol.to_string()));
         let granularity = if product == BitgetProductType::Spot {
             match interval {
@@ -199,17 +198,11 @@ impl BitgetRawHttpClient {
             interval
         };
         params.push(("granularity", granularity.to_string()));
-        add_window(
-            &mut params,
-            start.as_ref(),
-            end.as_ref(),
-            limit.unwrap_or(100).clamp(1, 1000),
-            None,
-        );
-        let path = if product.is_derivative() {
-            "/api/v2/mix/market/candles"
-        } else {
-            "/api/v2/spot/market/candles"
+        let path = match (product, history) {
+            (BitgetProductType::Spot, false) => "/api/v2/spot/market/candles",
+            (BitgetProductType::Spot, true) => "/api/v2/spot/market/history-candles",
+            (_, false) => "/api/v2/mix/market/candles",
+            (_, true) => "/api/v2/mix/market/history-candles",
         };
         self.classic_get(path, params, false).await
     }

@@ -44,7 +44,10 @@ use rust_decimal::{
 };
 
 use crate::{
-    common::{enums::BitgetProductType, symbol::BitgetSymbol},
+    common::{
+        enums::{BitgetAccountMode, BitgetProductType},
+        symbol::BitgetSymbol,
+    },
     http::models::{
         BitgetCandle, BitgetDecimalValue, BitgetFill, BitgetFillFee, BitgetFillFeeDetail,
         BitgetFundingRate, BitgetMarketTrade, BitgetMixAccount, BitgetMixContract,
@@ -1528,24 +1531,43 @@ pub fn bar_spec_to_bitget_interval_for_product(
         return bar_spec_to_bitget_interval(aggregation, step);
     }
 
+    bitget_short_interval(aggregation, step)
+}
+
+/// Encodes a recent or historical REST candle interval for the selected account protocol.
+pub fn bar_spec_to_bitget_rest_interval(
+    account_mode: BitgetAccountMode,
+    product_type: BitgetProductType,
+    aggregation: BarAggregation,
+    step: u64,
+) -> anyhow::Result<&'static str> {
+    match account_mode {
+        BitgetAccountMode::Classic => {
+            bar_spec_to_bitget_interval_for_product(product_type, aggregation, step)
+        }
+        BitgetAccountMode::Uta => bitget_short_interval(aggregation, step),
+    }
+}
+
+fn bitget_short_interval(aggregation: BarAggregation, step: u64) -> anyhow::Result<&'static str> {
     match aggregation {
         BarAggregation::Minute => match step {
             1 => Ok("1m"),
             5 => Ok("5m"),
             15 => Ok("15m"),
             30 => Ok("30m"),
-            _ => anyhow::bail!("Bitget futures only supports minute intervals 1, 5, 15, 30"),
+            _ => anyhow::bail!("Bitget only supports minute intervals 1, 5, 15, 30"),
         },
         BarAggregation::Hour => match step {
             1 => Ok("1H"),
             4 => Ok("4H"),
             6 => Ok("6H"),
             12 => Ok("12H"),
-            _ => anyhow::bail!("Bitget futures only supports hour intervals 1, 4, 6, 12"),
+            _ => anyhow::bail!("Bitget only supports hour intervals 1, 4, 6, 12"),
         },
         BarAggregation::Day if step == 1 => Ok("1D"),
         BarAggregation::Week if step == 1 => Ok("1W"),
-        _ => anyhow::bail!("Bitget futures does not support {aggregation:?} bars with step {step}"),
+        _ => anyhow::bail!("Bitget does not support {aggregation:?} bars with step {step}"),
     }
 }
 
@@ -2184,6 +2206,43 @@ mod tests {
         assert_eq!(bar.ts_event, UnixNanos::from(1_700_000_060_000_000_000));
         assert_eq!(bar.close.precision, 2);
         assert_eq!(bar.volume.precision, 6);
+    }
+
+    #[rstest]
+    #[case(BarAggregation::Minute, 1, "1m", "1min")]
+    #[case(BarAggregation::Hour, 6, "6H", "6h")]
+    #[case(BarAggregation::Day, 1, "1D", "1day")]
+    #[case(BarAggregation::Week, 1, "1W", "1week")]
+    fn rest_candle_interval_uses_account_protocol(
+        #[case] aggregation: BarAggregation,
+        #[case] step: u64,
+        #[case] short: &str,
+        #[case] classic_spot: &str,
+    ) {
+        for (mode, product, expected) in [
+            (BitgetAccountMode::Uta, BitgetProductType::Spot, short),
+            (
+                BitgetAccountMode::Uta,
+                BitgetProductType::UsdtFutures,
+                short,
+            ),
+            (
+                BitgetAccountMode::Classic,
+                BitgetProductType::Spot,
+                classic_spot,
+            ),
+            (
+                BitgetAccountMode::Classic,
+                BitgetProductType::UsdtFutures,
+                short,
+            ),
+        ] {
+            assert_eq!(
+                bar_spec_to_bitget_rest_interval(mode, product, aggregation, step).unwrap(),
+                expected,
+                "{mode:?} {product:?}",
+            );
+        }
     }
 
     #[rstest]
