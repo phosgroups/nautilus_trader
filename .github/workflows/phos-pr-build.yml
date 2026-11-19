@@ -46,39 +46,15 @@ jobs:
       CARGO_PROFILE_RELEASE_LTO: "thin"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Free disk space (Linux)
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: false
-
-      - name: Free additional disk space (Linux)
-        run: |
-          echo "=== Disk usage before extra cleanup ==="
-          df -h /
-          for path in \
-            /usr/share/swift \
-            /usr/local/lib/swift \
-            /usr/local/share/powershell \
-            /usr/local/share/boost \
-            /usr/local/share/chromium \
-            /opt/google/chrome \
-            /opt/microsoft \
-            /usr/local/julia*; do
-            sudo rm -rf $path || true
-          done
-          echo "=== Disk usage after extra cleanup ==="
-          df -h /
+        run: >-
+          bash scripts/ci/free-disk-space.sh --android --dotnet --haskell
+          --large-packages-keep-llvm --docker-images --extra
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -131,7 +107,7 @@ jobs:
         run: bash scripts/ci/set-cargo-build-jobs.sh
 
       - name: Install native build tools
-        run: sudo apt-get update && sudo apt-get install -y clang lld patchelf
+        run: bash scripts/ci/ensure-native-build-tools.bash
 
       - name: Install Cap'n Proto
         uses: ./.github/actions/install-capnp
@@ -195,7 +171,7 @@ jobs:
         run: sccache --show-stats
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheel-linux
           path: dist/*.whl
