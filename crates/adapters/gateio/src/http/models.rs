@@ -2,7 +2,7 @@ use std::fmt;
 
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{
-    Deserialize, Deserializer, Serialize,
+    Deserialize, Deserializer, Serialize, Serializer,
     de::{self, Visitor},
 };
 
@@ -594,6 +594,50 @@ pub struct GateioPosition {
     pub create_time: Option<i64>,
 }
 
+// Gate can send both timestamp fields in one order. Read the pair together
+// and expose a single millisecond value to all order consumers.
+macro_rules! order_timestamp {
+    ($seconds:ident, $millis:ident) => {
+        mod $millis {
+            use super::*;
+
+            #[derive(Deserialize, Serialize)]
+            struct Fields {
+                #[serde(
+                    default,
+                    deserialize_with = "optional_timestamp_millis",
+                    skip_serializing
+                )]
+                $seconds: Option<i64>,
+                #[serde(default, deserialize_with = "optional_timestamp_millis")]
+                $millis: Option<i64>,
+            }
+
+            pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+                deserializer: D,
+            ) -> Result<Option<i64>, D::Error> {
+                let fields = Fields::deserialize(deserializer)?;
+                Ok(fields.$millis.or(fields.$seconds))
+            }
+
+            pub(super) fn serialize<S: Serializer>(
+                millis: &Option<i64>,
+                serializer: S,
+            ) -> Result<S::Ok, S::Error> {
+                Fields {
+                    $seconds: None,
+                    $millis: *millis,
+                }
+                .serialize(serializer)
+            }
+        }
+    };
+}
+
+order_timestamp!(create_time, create_time_ms);
+order_timestamp!(update_time, update_time_ms);
+order_timestamp!(finish_time, finish_time_ms);
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct GateioOrder {
     #[serde(default, deserialize_with = "string_or_number")]
@@ -624,23 +668,11 @@ pub struct GateioOrder {
     pub time_in_force: Option<String>,
     #[serde(default)]
     pub finish_as: Option<String>,
-    #[serde(
-        default,
-        alias = "create_time",
-        deserialize_with = "optional_timestamp_millis"
-    )]
+    #[serde(flatten, with = "create_time_ms")]
     pub create_time_ms: Option<i64>,
-    #[serde(
-        default,
-        alias = "update_time",
-        deserialize_with = "optional_timestamp_millis"
-    )]
+    #[serde(flatten, with = "update_time_ms")]
     pub update_time_ms: Option<i64>,
-    #[serde(
-        default,
-        alias = "finish_time",
-        deserialize_with = "optional_timestamp_millis"
-    )]
+    #[serde(flatten, with = "finish_time_ms")]
     pub finish_time_ms: Option<i64>,
     #[serde(default, deserialize_with = "optional_string_or_number")]
     pub update_id: Option<String>,
@@ -814,6 +846,56 @@ mod tests {
             .size,
             "-3"
         );
+    }
+
+    #[test]
+    fn order_timestamps_prefer_milliseconds_when_both_fields_are_present() {
+        // REST returns numeric milliseconds, while spot.orders sends strings.
+        for (created, updated) in [
+            (
+                serde_json::json!(1694655225315_i64),
+                serde_json::json!(1694655226942_i64),
+            ),
+            (
+                serde_json::json!("1694655225315"),
+                serde_json::json!("1694655226942"),
+            ),
+        ] {
+            let order: GateioOrder = serde_json::from_value(serde_json::json!({
+                "create_time": "1694655225",
+                "create_time_ms": created,
+                "update_time": "1694655226",
+                "update_time_ms": updated,
+            }))
+            .unwrap();
+
+            assert_eq!(order.create_time_ms, Some(1_694_655_225_315));
+            assert_eq!(order.update_time_ms, Some(1_694_655_226_942));
+        }
+    }
+
+    #[test]
+    fn order_timestamps_resolve_each_field_independently() {
+        let order: GateioOrder = serde_json::from_value(serde_json::json!({
+            "create_time": 1694655225.125,
+            "update_time": "1694655226.5",
+            "update_time_ms": null,
+            "finish_time": 1694655227,
+            "finish_time_ms": 1694655227899_i64,
+        }))
+        .unwrap();
+
+        assert_eq!(order.create_time_ms, Some(1_694_655_225_125));
+        assert_eq!(order.update_time_ms, Some(1_694_655_226_500));
+        assert_eq!(order.finish_time_ms, Some(1_694_655_227_899));
+
+        let encoded = serde_json::to_value(&order).unwrap();
+        assert_eq!(encoded["create_time_ms"], 1_694_655_225_125_i64);
+        assert_eq!(encoded["update_time_ms"], 1_694_655_226_500_i64);
+        assert_eq!(encoded["finish_time_ms"], 1_694_655_227_899_i64);
+        assert!(encoded.get("create_time").is_none());
+        assert!(encoded.get("update_time").is_none());
+        assert!(encoded.get("finish_time").is_none());
     }
 
     #[test]
