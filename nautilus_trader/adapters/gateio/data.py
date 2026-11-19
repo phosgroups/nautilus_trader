@@ -594,13 +594,16 @@ class GateioDataClient(LiveMarketDataClient):
 
     async def _request_instrument(self, request):
         instrument = self._instrument_provider.find(request.instrument_id)
+        if instrument is None:
+            await self._instrument_provider.load_async(request.instrument_id, request.params)
+            instrument = self._instrument_provider.find(request.instrument_id)
         if instrument is not None:
-            self._handle_instrument(
-                instrument, request.id, request.start, request.end, request.params
-            )
+            self._handle_instrument(instrument, request.id, request.start, request.end, request.params)
 
     async def _request_instruments(self, request):
+        await self._instrument_provider.load_all_async(request.params)
         self._handle_instruments(
+            request.venue,
             list(self._instrument_provider.get_all().values()),
             request.id,
             request.start,
