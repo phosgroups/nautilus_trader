@@ -49,7 +49,7 @@ const PAGINATION_LIMIT: u32 = 1000;
 const SPOT_OPEN_ORDER_LIMIT: u32 = 100;
 const SPOT_CANDLE_MAX_LIMIT: u32 = 1000;
 const FUTURES_CANDLE_MAX_LIMIT: u32 = 2000;
-const MAX_SPOT_TRADE_RANGE_SECS: i64 = 30 * 24 * 60 * 60;
+pub(crate) const MAX_SPOT_TRADE_RANGE_SECS: i64 = 30 * 24 * 60 * 60;
 const MAX_PAGINATION_PAGES: u32 = 10_000;
 
 #[derive(Clone)]
@@ -667,6 +667,17 @@ impl GateioRawHttpClient {
         product_type: GateioProductType,
         symbol: Option<&str>,
     ) -> Result<Vec<GateioUserTrade>, GateioHttpError> {
+        self.user_trades_for_order(product_type, symbol, None, None)
+            .await
+    }
+
+    pub(crate) async fn user_trades_for_order(
+        &self,
+        product_type: GateioProductType,
+        symbol: Option<&str>,
+        order_id: Option<&str>,
+        seconds: Option<(i64, i64)>,
+    ) -> Result<Vec<GateioUserTrade>, GateioHttpError> {
         let mut result = Vec::new();
         let mut tracker = PaginationTracker::default();
         for page in 1..=MAX_PAGINATION_PAGES {
@@ -697,6 +708,18 @@ impl GateioRawHttpClient {
             };
             if let Some(symbol) = symbol {
                 params.push((symbol_key.to_string(), symbol.to_string()));
+            }
+            if let Some(order_id) = order_id {
+                let key = if product_type == GateioProductType::Spot {
+                    "order_id"
+                } else {
+                    "order"
+                };
+                params.push((key.to_string(), order_id.to_string()));
+            }
+            if let Some((from, to)) = seconds {
+                params.push(("from".to_string(), from.to_string()));
+                params.push(("to".to_string(), to.to_string()));
             }
             let rows: Vec<GateioUserTrade> = self
                 .send(Method::GET, endpoint, &params, None, true)
@@ -835,19 +858,16 @@ impl GateioRawHttpClient {
         } else {
             format!("{FUTURES_ORDERS}/{order_id}")
         };
-        let key = if product_type == GateioProductType::Spot {
-            "currency_pair"
+        let params = if product_type == GateioProductType::Spot {
+            vec![
+                ("currency_pair".to_string(), symbol.to_string()),
+                ("account".to_string(), "spot".to_string()),
+            ]
         } else {
-            "contract"
+            Vec::new()
         };
-        self.send(
-            Method::DELETE,
-            &endpoint,
-            &[(key.to_string(), symbol.to_string())],
-            None,
-            true,
-        )
-        .await
+        self.send(Method::DELETE, &endpoint, &params, None, true)
+            .await
     }
 
     pub async fn cancel_all(
@@ -920,6 +940,16 @@ fn bounded_limit(value: u32, maximum: u32, resource: &str) -> Result<u32, Gateio
         )));
     }
     Ok(value.min(maximum))
+}
+
+fn historical_candle_is_closed(row: &GateioCandle, interval_ms: i64, as_of: UnixNanos) -> bool {
+    // Futures REST candles have no close flag. Use the time captured before the request.
+    row.closed.unwrap_or_else(|| {
+        row.timestamp_ms
+            .checked_add(interval_ms)
+            .and_then(|end| u64::try_from(end).ok())
+            .is_some_and(|end| end <= as_of.as_millis())
+    })
 }
 
 fn pagination_offset(page: u32, page_limit: u32) -> Result<u32, GateioHttpError> {
@@ -1020,6 +1050,34 @@ fn should_retry(method: &Method, error: &GateioHttpError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_excludes_open_candles_at_the_window_boundary() {
+        let row = GateioCandle {
+            timestamp_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let close = UnixNanos::from(1_700_000_060_000_000_000);
+        let before = UnixNanos::from(close.as_u64() - 1);
+        assert!(!historical_candle_is_closed(&row, 60_000, before));
+        assert!(historical_candle_is_closed(&row, 60_000, close));
+        assert!(!historical_candle_is_closed(
+            &GateioCandle {
+                closed: Some(false),
+                ..row.clone()
+            },
+            60_000,
+            close
+        ));
+        assert!(historical_candle_is_closed(
+            &GateioCandle {
+                closed: Some(true),
+                ..row
+            },
+            60_000,
+            before
+        ));
+    }
 
     #[test]
     fn cancel_all_params_map_spot_order_side() {
@@ -1331,7 +1389,9 @@ impl GateioHttpClient {
                 end,
             )
             .await?;
+        let interval_ms = bar_type.spec().timedelta().num_milliseconds();
         rows.iter()
+            .filter(|row| historical_candle_is_closed(row, interval_ms, ts))
             .map(|row| parse_candle(row, instrument, bar_type, ts))
             .collect()
     }

@@ -123,6 +123,9 @@ def order_report(row, instrument, account_id, client_order_id, now):  # noqa: C9
     if not amount.is_finite() or not left.is_finite() or amount <= 0 or not 0 <= left <= amount:
         raise ValueError("Invalid Gate order quantities")
     validate_assets(row, instrument)
+    iceberg = Decimal(str(row["iceberg"])) if row.get("iceberg") is not None else Decimal(0)
+    if not iceberg.is_finite() or not 0 <= iceberg <= amount:
+        raise ValueError("Invalid Gate iceberg display quantity")
     price = Decimal(row["price"])
     if not price.is_finite() or price <= 0:
         raise ValueError("Invalid Gate limit order price")
@@ -179,6 +182,7 @@ def order_report(row, instrument, account_id, client_order_id, now):  # noqa: C9
         order_status=status,
         quantity=Quantity.from_str(f"{amount:f}"),
         filled_qty=Quantity.from_str(f"{amount - left:f}"),
+        display_qty=Quantity.from_str(f"{iceberg:f}") if iceberg else None,
         price=Price.from_str(f"{price:f}"),
         avg_px=Decimal(str(row["avg_deal_price"])) if row.get("avg_deal_price") else None,
         post_only=row.get("time_in_force") == "poc",
@@ -235,5 +239,6 @@ def validate_assets(row, instrument):
         or int(row.get("trade_mode", 0)) != 0
         or row.get("stock", instrument.base_currency.code) != instrument.base_currency.code
         or row.get("money", instrument.quote_currency.code) != instrument.quote_currency.code
+        or row.get("trade_quote", instrument.quote_currency.code) != instrument.quote_currency.code
     ):
         raise ValueError("Gate PMM supports regular spot assets, not unified-asset routing")

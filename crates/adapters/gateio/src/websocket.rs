@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -18,6 +18,7 @@ use chrono::Utc;
 use nautilus_common::live::get_runtime;
 use nautilus_network::{
     RECONNECTED,
+    mode::ConnectionMode,
     websocket::{TransportBackend, WebSocketClient, WebSocketConfig, channel_message_handler},
 };
 use serde::{Deserialize, Deserializer, Serialize, de};
@@ -195,6 +196,8 @@ struct Inner {
     event_tx: broadcast::Sender<GateioWsMessage>,
     subscription_lock: tokio::sync::Mutex<()>,
     next_request_id: AtomicI64,
+    transport_state: std::sync::RwLock<Option<(Arc<AtomicU8>, Arc<AtomicU64>)>>,
+    ready_epoch: AtomicU64,
     active: AtomicBool,
     stopping: AtomicBool,
 }
@@ -258,6 +261,8 @@ impl GateioWebSocketClient {
                 event_tx: broadcast::channel(4096).0,
                 subscription_lock: tokio::sync::Mutex::new(()),
                 next_request_id: AtomicI64::new(1),
+                transport_state: std::sync::RwLock::new(None),
+                ready_epoch: AtomicU64::new(0),
                 active: AtomicBool::new(false),
                 stopping: AtomicBool::new(false),
             }),
@@ -274,6 +279,13 @@ impl GateioWebSocketClient {
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.inner.active.load(Ordering::Acquire)
+            && self.inner.transport_state.read().is_ok_and(|state| {
+                state.as_ref().is_some_and(|(mode, epoch)| {
+                    ConnectionMode::from_atomic(mode).is_active()
+                        && epoch.load(Ordering::Acquire)
+                            == self.inner.ready_epoch.load(Ordering::Acquire)
+                })
+            })
     }
 
     /// Creates an event receiver for the current logical client.
@@ -315,6 +327,16 @@ impl GateioWebSocketClient {
             return Ok(());
         }
 
+        if self
+            .inner
+            .command_task
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            anyhow::bail!("Gate.io WebSocket is restoring subscriptions");
+        }
         self.shutdown_command_loop(false).await;
         self.inner.stopping.store(false, Ordering::Release);
         let (message_handler, mut raw_rx) = channel_message_handler();
@@ -350,15 +372,24 @@ impl GateioWebSocketClient {
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         let event_tx = self.inner.event_tx.clone();
         let inner = Arc::clone(&self.inner);
+        *inner
+            .transport_state
+            .write()
+            .expect("Gate.io transport state lock poisoned") = Some((
+            client.connection_mode_atomic(),
+            client.connection_epoch_atomic(),
+        ));
+        let initial_epoch = client.connection_epoch();
+        inner.ready_epoch.store(initial_epoch, Ordering::Release);
+        inner.active.store(true, Ordering::Release);
         let command_task = get_runtime().spawn(async move {
             let mut pending_acks = BTreeMap::new();
             let mut restore_pending = HashSet::new();
             let mut restore_started = None;
+            let mut restore_epoch = initial_epoch;
             let mut heartbeat = tokio::time::interval(inner.heartbeat_interval);
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             heartbeat.tick().await;
-            inner.active.store(true, Ordering::Release);
-
             loop {
                 tokio::select! {
                     command = command_rx.recv() => {
@@ -453,6 +484,8 @@ impl GateioWebSocketClient {
                         let payload = match message {
                             Message::Text(text) => {
                                 if text.as_str() == RECONNECTED {
+                                    inner.active.store(false, Ordering::Release);
+                                    restore_epoch = client.connection_epoch();
                                     let subscriptions = inner
                                         .subscriptions
                                         .read()
@@ -489,15 +522,18 @@ impl GateioWebSocketClient {
                                                 request_id,
                                                 Err(error.to_string()),
                                             );
-                                            restore_pending.remove(&request_id);
                                             log::warn!(
                                                 "Failed to restore Gate.io WebSocket subscription {}: {error}",
                                                 subscription.channel
                                             );
+                                            retry_subscription_restore(&client, &mut pending_acks, &mut restore_pending, &mut restore_started);
+                                            break;
                                         }
                                     }
-                                    if restore_pending.is_empty() {
+                                    if restore_pending.is_empty() && restore_started.is_some() {
                                         restore_started = None;
+                                        inner.ready_epoch.store(restore_epoch, Ordering::Release);
+                                        inner.active.store(true, Ordering::Release);
                                         let _ = event_tx.send(GateioWsMessage::reconnected());
                                     }
                                     continue;
@@ -524,14 +560,11 @@ impl GateioWebSocketClient {
                                             "Gate.io WebSocket restored subscription was not accepted: channel={}, id={request_id}",
                                             message.channel
                                         );
-                                        fail_pending_acks(
-                                            &mut pending_acks,
-                                            "Gate.io restored subscription was rejected",
-                                        );
-                                        restore_pending.clear();
-                                        restore_started = None;
+                                        retry_subscription_restore(&client, &mut pending_acks, &mut restore_pending, &mut restore_started);
                                     } else if restore_pending.is_empty() {
                                         restore_started = None;
+                                        inner.ready_epoch.store(restore_epoch, Ordering::Release);
+                                        inner.active.store(true, Ordering::Release);
                                         let _ = event_tx.send(GateioWsMessage::reconnected());
                                     }
                                 }
@@ -549,12 +582,7 @@ impl GateioWebSocketClient {
                             "Gate.io WebSocket subscription restoration timed out with {} pending ACKs",
                             restore_pending.len()
                         );
-                        fail_pending_acks(
-                            &mut pending_acks,
-                            "Gate.io WebSocket subscription restoration timed out",
-                        );
-                        restore_pending.clear();
-                        restore_started = None;
+                        retry_subscription_restore(&client, &mut pending_acks, &mut restore_pending, &mut restore_started);
                     }
                 }
             }
@@ -570,7 +598,6 @@ impl GateioWebSocketClient {
             let mut task = self.inner.command_task.write().await;
             *task = Some(command_task);
         }
-        self.inner.active.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -790,6 +817,22 @@ fn resolve_one_subscription_ack(
     let _ = waiter.sender.send(result.map_err(anyhow::Error::msg));
 }
 
+fn retry_subscription_restore(
+    client: &WebSocketClient,
+    pending: &mut BTreeMap<i64, PendingAck>,
+    restore_pending: &mut HashSet<i64>,
+    restore_started: &mut Option<tokio::time::Instant>,
+) {
+    fail_pending_acks(
+        pending,
+        "Gate.io subscriptions must be restored on a new connection",
+    );
+    restore_pending.clear();
+    *restore_started = None;
+    // The transport applies backoff and sends RECONNECTED for the next session.
+    ConnectionMode::request_reconnect(&client.connection_mode_atomic());
+}
+
 fn fail_pending_acks(pending: &mut BTreeMap<i64, PendingAck>, message: impl Into<String>) {
     let message = message.into();
     for (_, waiter) in std::mem::take(pending) {
@@ -843,6 +886,8 @@ async fn send_subscription(
 
 #[cfg(test)]
 mod tests {
+    mod restore;
+
     use super::*;
     use crate::config::GateioDataClientConfig;
 

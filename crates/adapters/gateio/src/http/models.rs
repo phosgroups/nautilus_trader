@@ -2,7 +2,7 @@ use std::fmt;
 
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{
-    Deserialize, Deserializer, Serialize,
+    Deserialize, Deserializer, Serialize, Serializer,
     de::{self, Visitor},
 };
 
@@ -402,7 +402,11 @@ impl GateioTrade {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct GateioCandle {
     pub timestamp_ms: i64,
+    /// Quote turnover for spot, contract volume for perpetuals.
     pub volume: String,
+    /// Spot base quantity (REST array index 6 or WebSocket field `a`).
+    pub base_volume: Option<String>,
+    pub closed: Option<bool>,
     pub close: String,
     pub high: String,
     pub low: String,
@@ -419,15 +423,13 @@ impl<'de> Deserialize<'de> for GateioCandle {
             serde_json::Value::Array(row) => row,
             serde_json::Value::Object(object) => vec![
                 object.get("t").cloned().unwrap_or(serde_json::Value::Null),
-                object
-                    .get("v")
-                    .cloned()
-                    .or_else(|| object.get("sum").cloned())
-                    .unwrap_or(serde_json::Value::Null),
+                object.get("v").cloned().unwrap_or(serde_json::Value::Null),
                 object.get("c").cloned().unwrap_or(serde_json::Value::Null),
                 object.get("h").cloned().unwrap_or(serde_json::Value::Null),
                 object.get("l").cloned().unwrap_or(serde_json::Value::Null),
                 object.get("o").cloned().unwrap_or(serde_json::Value::Null),
+                object.get("a").cloned().unwrap_or(serde_json::Value::Null),
+                object.get("w").cloned().unwrap_or(serde_json::Value::Null),
             ],
             _ => {
                 return Err(de::Error::custom(
@@ -456,7 +458,18 @@ impl<'de> Deserialize<'de> for GateioCandle {
                     .to_i64()
                     .ok_or_else(|| de::Error::custom("invalid candle timestamp"))?
             },
+            closed: match row.get(7) {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::Bool(closed)) => Some(*closed),
+                Some(serde_json::Value::String(s)) => Some(s.parse().map_err(de::Error::custom)?),
+                _ => return Err(de::Error::custom("invalid candle close flag")),
+            },
             volume: get(1)?,
+            base_volume: row.get(6).and_then(|value| match value {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }),
             close: get(2)?,
             high: get(3)?,
             low: get(4)?,
@@ -594,12 +607,58 @@ pub struct GateioPosition {
     pub create_time: Option<i64>,
 }
 
+// Gate can send both timestamp fields in one order. Read the pair together
+// and expose a single millisecond value to all order consumers.
+macro_rules! order_timestamp {
+    ($seconds:ident, $millis:ident) => {
+        mod $millis {
+            use super::*;
+
+            #[derive(Deserialize, Serialize)]
+            struct Fields {
+                #[serde(
+                    default,
+                    deserialize_with = "optional_timestamp_millis",
+                    skip_serializing
+                )]
+                $seconds: Option<i64>,
+                #[serde(default, deserialize_with = "optional_timestamp_millis")]
+                $millis: Option<i64>,
+            }
+
+            pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+                deserializer: D,
+            ) -> Result<Option<i64>, D::Error> {
+                let fields = Fields::deserialize(deserializer)?;
+                Ok(fields.$millis.or(fields.$seconds))
+            }
+
+            pub(super) fn serialize<S: Serializer>(
+                millis: &Option<i64>,
+                serializer: S,
+            ) -> Result<S::Ok, S::Error> {
+                Fields {
+                    $seconds: None,
+                    $millis: *millis,
+                }
+                .serialize(serializer)
+            }
+        }
+    };
+}
+
+order_timestamp!(create_time, create_time_ms);
+order_timestamp!(update_time, update_time_ms);
+order_timestamp!(finish_time, finish_time_ms);
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct GateioOrder {
     #[serde(default, deserialize_with = "string_or_number")]
     pub id: String,
     #[serde(default)]
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     #[serde(default)]
     pub currency_pair: Option<String>,
     #[serde(default)]
@@ -624,23 +683,11 @@ pub struct GateioOrder {
     pub time_in_force: Option<String>,
     #[serde(default)]
     pub finish_as: Option<String>,
-    #[serde(
-        default,
-        alias = "create_time",
-        deserialize_with = "optional_timestamp_millis"
-    )]
+    #[serde(flatten, with = "create_time_ms")]
     pub create_time_ms: Option<i64>,
-    #[serde(
-        default,
-        alias = "update_time",
-        deserialize_with = "optional_timestamp_millis"
-    )]
+    #[serde(flatten, with = "update_time_ms")]
     pub update_time_ms: Option<i64>,
-    #[serde(
-        default,
-        alias = "finish_time",
-        deserialize_with = "optional_timestamp_millis"
-    )]
+    #[serde(flatten, with = "finish_time_ms")]
     pub finish_time_ms: Option<i64>,
     #[serde(default, deserialize_with = "optional_string_or_number")]
     pub update_id: Option<String>,
@@ -817,6 +864,56 @@ mod tests {
     }
 
     #[test]
+    fn order_timestamps_prefer_milliseconds_when_both_fields_are_present() {
+        // REST returns numeric milliseconds, while spot.orders sends strings.
+        for (created, updated) in [
+            (
+                serde_json::json!(1694655225315_i64),
+                serde_json::json!(1694655226942_i64),
+            ),
+            (
+                serde_json::json!("1694655225315"),
+                serde_json::json!("1694655226942"),
+            ),
+        ] {
+            let order: GateioOrder = serde_json::from_value(serde_json::json!({
+                "create_time": "1694655225",
+                "create_time_ms": created,
+                "update_time": "1694655226",
+                "update_time_ms": updated,
+            }))
+            .unwrap();
+
+            assert_eq!(order.create_time_ms, Some(1_694_655_225_315));
+            assert_eq!(order.update_time_ms, Some(1_694_655_226_942));
+        }
+    }
+
+    #[test]
+    fn order_timestamps_resolve_each_field_independently() {
+        let order: GateioOrder = serde_json::from_value(serde_json::json!({
+            "create_time": 1694655225.125,
+            "update_time": "1694655226.5",
+            "update_time_ms": null,
+            "finish_time": 1694655227,
+            "finish_time_ms": 1694655227899_i64,
+        }))
+        .unwrap();
+
+        assert_eq!(order.create_time_ms, Some(1_694_655_225_125));
+        assert_eq!(order.update_time_ms, Some(1_694_655_226_500));
+        assert_eq!(order.finish_time_ms, Some(1_694_655_227_899));
+
+        let encoded = serde_json::to_value(&order).unwrap();
+        assert_eq!(encoded["create_time_ms"], 1_694_655_225_125_i64);
+        assert_eq!(encoded["update_time_ms"], 1_694_655_226_500_i64);
+        assert_eq!(encoded["finish_time_ms"], 1_694_655_227_899_i64);
+        assert!(encoded.get("create_time").is_none());
+        assert!(encoded.get("update_time").is_none());
+        assert!(encoded.get("finish_time").is_none());
+    }
+
+    #[test]
     fn deserializes_spot_balance_freeze_alias() {
         let update = serde_json::from_value::<GateioBalanceUpdate>(serde_json::json!({
             "timestamp": "1700000000",
@@ -907,15 +1004,18 @@ mod tests {
     #[test]
     fn deserializes_array_and_object_candles() {
         let array = serde_json::from_value::<GateioCandle>(serde_json::json!([
-            1700000000, "100", "50001", "50002", "49999", "50000"
+            1700000000, "100", "50001", "50002", "49999", "50000", "0.002", "true"
         ]))
         .unwrap();
         assert_eq!(array.timestamp_ms, 1_700_000_000_000);
         assert_eq!(array.close, "50001");
+        assert_eq!(array.base_volume.as_deref(), Some("0.002"));
+        assert_eq!(array.closed, Some(true));
 
         let object = serde_json::from_value::<GateioCandle>(serde_json::json!({
             "t": 1700000000000i64,
-            "sum": "10",
+            "v": "10",
+            "sum": "987.65",
             "c": 50001,
             "h": "50002",
             "l": "49999",

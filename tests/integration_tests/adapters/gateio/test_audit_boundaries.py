@@ -300,6 +300,27 @@ def test_order_specific_fill_query_rejects_other_order_history():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("trade_quote", ["USDT", "USDC"])
+def test_fill_history_validates_actual_quote_currency(trade_quote):
+    async def run():
+        client = client_for(lambda *args, **kwargs: helpers["balances"]())
+        client.http.pages.return_value = [helpers["fill"](money="USDT", trade_quote=trade_quote)]
+        command = SimpleNamespace(instrument_id=InstrumentId.from_str("BTC_USDT.GATEIO"),
+                                  venue_order_id=None, start=None, end=None)
+        try:
+            if trade_quote == "USDT":
+                reports = await client.generate_fill_reports(command)
+                assert len(reports) == 1
+                assert reports[0].instrument_id == command.instrument_id
+            else:
+                with pytest.raises(ValueError, match="assets"):
+                    await client.generate_fill_reports(command)
+        finally:
+            await cleanup(client)
+
+    asyncio.run(run())
+
+
 def test_cancel_all_excludes_other_accounts_and_includes_owned_submitted_orders():
     async def run():
         client = SimpleNamespace(account_id=AccountId("GATEIO-master"),
