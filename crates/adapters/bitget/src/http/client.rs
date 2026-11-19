@@ -16,7 +16,7 @@
 //! Provides the HTTP client integration for the Bitget REST API.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt::Debug,
     sync::{
         Arc,
@@ -26,7 +26,7 @@ use std::{
 
 use ahash::AHashMap;
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 #[cfg(feature = "python")]
 use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{AtomicMap, UnixNanos, consts::NAUTILUS_USER_AGENT};
@@ -51,19 +51,20 @@ use crate::common::{
         BITGET_ACCESS_KEY_HEADER, BITGET_ACCESS_PASSPHRASE_HEADER, BITGET_ACCESS_SIGN_HEADER,
         BITGET_ACCESS_TIMESTAMP_HEADER, BITGET_LOCALE_HEADER, BITGET_MARKET_CANDLES_ENDPOINT,
         BITGET_MARKET_FILLS_ENDPOINT, BITGET_MARKET_FUNDING_HISTORY_ENDPOINT,
-        BITGET_MARKET_INSTRUMENTS_ENDPOINT, BITGET_MARKET_ORDERBOOK_ENDPOINT,
-        BITGET_MIX_ACCOUNT_LIST_ENDPOINT, BITGET_MIX_ALL_POSITIONS_ENDPOINT,
-        BITGET_MIX_CANCEL_ORDER_ENDPOINT, BITGET_MIX_CANCEL_PLAN_ORDER_ENDPOINT,
-        BITGET_MIX_MODIFY_ORDER_ENDPOINT, BITGET_MIX_MODIFY_PLAN_ORDER_ENDPOINT,
-        BITGET_MIX_ORDER_DETAIL_ENDPOINT, BITGET_MIX_ORDER_FILLS_ENDPOINT,
-        BITGET_MIX_ORDERS_HISTORY_ENDPOINT, BITGET_MIX_ORDERS_PENDING_ENDPOINT,
-        BITGET_MIX_PLACE_ORDER_ENDPOINT, BITGET_MIX_PLACE_PLAN_ORDER_ENDPOINT,
-        BITGET_MIX_SINGLE_POSITION_ENDPOINT, BITGET_PAPTRADING_HEADER, BITGET_REST_QUOTA,
-        BITGET_SPOT_ACCOUNT_ASSETS_ENDPOINT, BITGET_SPOT_BATCH_CANCEL_ORDER_ENDPOINT,
-        BITGET_SPOT_CANCEL_ORDER_ENDPOINT, BITGET_SPOT_CANCEL_SYMBOL_ORDER_ENDPOINT,
-        BITGET_SPOT_FILLS_ENDPOINT, BITGET_SPOT_HISTORY_ORDERS_ENDPOINT,
-        BITGET_SPOT_ORDER_INFO_ENDPOINT, BITGET_SPOT_PLACE_ORDER_ENDPOINT,
-        BITGET_SPOT_PLACE_PLAN_ORDER_ENDPOINT, BITGET_SPOT_UNFILLED_ORDERS_ENDPOINT,
+        BITGET_MARKET_HISTORY_CANDLES_ENDPOINT, BITGET_MARKET_INSTRUMENTS_ENDPOINT,
+        BITGET_MARKET_ORDERBOOK_ENDPOINT, BITGET_MIX_ACCOUNT_LIST_ENDPOINT,
+        BITGET_MIX_ALL_POSITIONS_ENDPOINT, BITGET_MIX_CANCEL_ORDER_ENDPOINT,
+        BITGET_MIX_CANCEL_PLAN_ORDER_ENDPOINT, BITGET_MIX_MODIFY_ORDER_ENDPOINT,
+        BITGET_MIX_MODIFY_PLAN_ORDER_ENDPOINT, BITGET_MIX_ORDER_DETAIL_ENDPOINT,
+        BITGET_MIX_ORDER_FILLS_ENDPOINT, BITGET_MIX_ORDERS_HISTORY_ENDPOINT,
+        BITGET_MIX_ORDERS_PENDING_ENDPOINT, BITGET_MIX_PLACE_ORDER_ENDPOINT,
+        BITGET_MIX_PLACE_PLAN_ORDER_ENDPOINT, BITGET_MIX_SINGLE_POSITION_ENDPOINT,
+        BITGET_PAPTRADING_HEADER, BITGET_REST_QUOTA, BITGET_SPOT_ACCOUNT_ASSETS_ENDPOINT,
+        BITGET_SPOT_BATCH_CANCEL_ORDER_ENDPOINT, BITGET_SPOT_CANCEL_ORDER_ENDPOINT,
+        BITGET_SPOT_CANCEL_SYMBOL_ORDER_ENDPOINT, BITGET_SPOT_FILLS_ENDPOINT,
+        BITGET_SPOT_HISTORY_ORDERS_ENDPOINT, BITGET_SPOT_ORDER_INFO_ENDPOINT,
+        BITGET_SPOT_PLACE_ORDER_ENDPOINT, BITGET_SPOT_PLACE_PLAN_ORDER_ENDPOINT,
+        BITGET_SPOT_UNFILLED_ORDERS_ENDPOINT,
     },
     credential::Credential,
     enums::{BitgetAccountMode, BitgetEnvironment, BitgetProductType},
@@ -72,7 +73,7 @@ use crate::common::{
         BitgetModifyOrderRequest, BitgetSubmitOrderRequest,
     },
     parse::{
-        bar_spec_to_bitget_interval_for_product, bitget_symbol_status_action, parse_candle_bar,
+        bar_spec_to_bitget_rest_interval, bitget_symbol_status_action, parse_candle_bar,
         parse_funding_rate, parse_market_trade, parse_mix_account_state, parse_orderbook_snapshot,
         parse_spot_account_state, parse_spot_instrument, parse_usdt_perp_instrument,
     },
@@ -605,35 +606,73 @@ impl BitgetRawHttpClient {
         end: Option<DateTime<Utc>>,
         limit: Option<u32>,
     ) -> Result<Vec<super::models::BitgetCandle>, BitgetHttpError> {
-        if self.account_mode == BitgetAccountMode::Classic {
-            return self
-                .classic_candles(product_type, raw_symbol, interval, start, end, limit)
-                .await;
-        }
-
-        let mut params = vec![
-            ("category", product_type.as_api_str().to_string()),
-            ("symbol", raw_symbol.to_string()),
-            ("interval", interval.to_string()),
-        ];
-
+        let mut params = Vec::new();
         if let Some(start) = start {
             params.push(("startTime", start.timestamp_millis().to_string()));
         }
         if let Some(end) = end {
             params.push(("endTime", end.timestamp_millis().to_string()));
         }
+        let limit = match self.account_mode {
+            BitgetAccountMode::Classic => Some(limit.unwrap_or(100).clamp(1, 1_000)),
+            BitgetAccountMode::Uta => limit.map(|value| value.min(1_000)),
+        };
         if let Some(limit) = limit {
-            params.push(("limit", limit.min(1_000).to_string()));
+            params.push(("limit", limit.to_string()));
         }
 
-        let query = query_string(params)?;
+        self.request_candle_page(product_type, raw_symbol, interval, params, false)
+            .await
+    }
 
-        self.get_public::<Vec<super::models::BitgetCandle>>(
-            BITGET_MARKET_CANDLES_ENDPOINT,
-            Some(&query),
-        )
-        .await
+    /// Requests one page of archived candles before the specified end time.
+    async fn request_history_candles(
+        &self,
+        product_type: BitgetProductType,
+        raw_symbol: &str,
+        interval: &str,
+        end: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<super::models::BitgetCandle>, BitgetHttpError> {
+        let max_limit = match self.account_mode {
+            BitgetAccountMode::Uta => 100,
+            BitgetAccountMode::Classic => 200,
+        };
+        let params = vec![
+            ("endTime", end.timestamp_millis().to_string()),
+            ("limit", limit.clamp(1, max_limit).to_string()),
+        ];
+
+        self.request_candle_page(product_type, raw_symbol, interval, params, true)
+            .await
+    }
+
+    async fn request_candle_page(
+        &self,
+        product_type: BitgetProductType,
+        raw_symbol: &str,
+        interval: &str,
+        mut params: Vec<(&'static str, String)>,
+        history: bool,
+    ) -> Result<Vec<super::models::BitgetCandle>, BitgetHttpError> {
+        if self.account_mode == BitgetAccountMode::Classic {
+            return self
+                .classic_candles(product_type, raw_symbol, interval, params, history)
+                .await;
+        }
+
+        params.extend([
+            ("category", product_type.as_api_str().to_string()),
+            ("symbol", raw_symbol.to_string()),
+            ("interval", interval.to_string()),
+        ]);
+        let path = if history {
+            BITGET_MARKET_HISTORY_CANDLES_ENDPOINT
+        } else {
+            BITGET_MARKET_CANDLES_ENDPOINT
+        };
+
+        self.get_public(path, Some(&query_string(params)?)).await
     }
 
     /// Requests Bitget USDT-FUTURES historical funding rates.
@@ -1717,7 +1756,9 @@ impl BitgetHttpClient {
         Ok(trades)
     }
 
-    /// Requests candle history and converts it to Nautilus bars.
+    /// Requests bars in ascending order, with inclusive bounds on candle open times.
+    /// A positive limit selects the most recent bars in the window. Without a start
+    /// or limit, the venue's default page size applies.
     ///
     /// # Errors
     ///
@@ -1733,30 +1774,98 @@ impl BitgetHttpClient {
         timestamp_on_close: bool,
     ) -> anyhow::Result<Vec<Bar>> {
         let instrument_id = instrument.id();
-        let raw_symbol = extract_raw_symbol(instrument_id.symbol.as_str()).to_string();
-        let interval = bar_spec_to_bitget_interval_for_product(
+        let raw_symbol = extract_raw_symbol(instrument_id.symbol.as_str());
+        let interval = bar_spec_to_bitget_rest_interval(
+            self.raw.account_mode(),
             product_type,
             bar_type.spec().aggregation,
             bar_type.spec().step.get() as u64,
         )?;
-        let raw_bars = self
-            .raw
-            .request_candles(product_type, &raw_symbol, interval, start, end, limit)
-            .await?;
-
-        let mut bars = Vec::with_capacity(raw_bars.len());
-        for candle in &raw_bars {
-            bars.push(parse_candle_bar(
-                candle,
-                instrument,
-                bar_type,
-                timestamp_on_close,
-                None,
-            )?);
+        let now = Utc::now();
+        let end_time = end.unwrap_or(now).min(now);
+        if start.is_some_and(|start| start > end_time) {
+            return Ok(Vec::new());
         }
-        bars.sort_by_key(|bar| bar.ts_event);
+        let duration = bar_type.spec().timedelta();
+        let event_offset = if timestamp_on_close {
+            duration
+        } else {
+            TimeDelta::zero()
+        };
+        let limit = limit.filter(|&n| n > 0);
+        let single_page = start.is_none() && limit.is_none();
+        let mut bars = BTreeMap::new();
+        let mut before: Option<DateTime<Utc>> = None;
+        // Recent minute candles have the shortest retention (one month). Older
+        // windows can use the archive for every supported interval.
+        let recent_since = now - TimeDelta::days(28);
+        let mut archive = false;
 
-        Ok(bars)
+        loop {
+            let upper = before.map_or(end_time, |t| t - TimeDelta::milliseconds(1));
+            let remaining = limit.map(|n| n - bars.len() as u32);
+            let page_limit = start.map_or(remaining, |start| {
+                let slots = (upper - start).num_milliseconds() / duration.num_milliseconds() + 1;
+                Some(remaining.unwrap_or(1_000).min(slots.clamp(1, 1_000) as u32))
+            });
+            archive |= upper < recent_since;
+            let rows = if archive {
+                // History excludes the candle containing endTime, even when endTime
+                // is a millisecond past its open. Subsequent pages end at a known open.
+                self.raw
+                    .request_history_candles(
+                        product_type,
+                        raw_symbol,
+                        interval,
+                        before.unwrap_or(end_time + duration),
+                        page_limit.unwrap_or(100),
+                    )
+                    .await?
+            } else {
+                let until = if end.is_some() || before.is_some() {
+                    Some(upper)
+                } else {
+                    None
+                };
+                self.raw
+                    .request_candles(product_type, raw_symbol, interval, None, until, page_limit)
+                    .await?
+            };
+
+            let mut oldest = None;
+            for candle in &rows {
+                let bar = parse_candle_bar(candle, instrument, bar_type, timestamp_on_close, None)?;
+                let open = bar.ts_event.to_datetime_utc() - event_offset;
+                if open <= upper {
+                    oldest = Some(oldest.map_or(open, |t: DateTime<Utc>| t.min(open)));
+                    if start.is_none_or(|start| open >= start) {
+                        bars.entry(open).or_insert(bar);
+                    }
+                }
+            }
+            if single_page && (end.is_none() || !bars.is_empty()) {
+                break;
+            }
+            if limit.is_some_and(|n| bars.len() >= n as usize) {
+                break;
+            }
+            if let Some(open) = oldest {
+                if start.is_some_and(|start| open - duration < start) {
+                    break;
+                }
+                before = Some(open);
+            } else if archive {
+                break;
+            } else {
+                // A recent endpoint can exhaust its retained rows before the
+                // requested lower bound. Resume at the same cursor in the archive.
+                archive = true;
+            }
+        }
+        let skip = bars
+            .len()
+            .saturating_sub(limit.unwrap_or(u32::MAX) as usize);
+        Ok(bars.into_values().skip(skip).collect())
     }
 
     /// Requests historical funding rates and converts them to Nautilus funding updates.

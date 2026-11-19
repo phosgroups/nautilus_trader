@@ -81,6 +81,9 @@ pub const BITGET_MARKET_FILLS_ENDPOINT: &str = "/api/v3/market/fills";
 /// Bitget UTA candles endpoint.
 pub const BITGET_MARKET_CANDLES_ENDPOINT: &str = "/api/v3/market/candles";
 
+/// Bitget UTA historical candles endpoint.
+pub const BITGET_MARKET_HISTORY_CANDLES_ENDPOINT: &str = "/api/v3/market/history-candles";
+
 /// Bitget UTA historical funding rate endpoint.
 pub const BITGET_MARKET_FUNDING_HISTORY_ENDPOINT: &str = "/api/v3/market/history-fund-rate";
 
