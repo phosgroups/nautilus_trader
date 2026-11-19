@@ -239,5 +239,6 @@ def validate_assets(row, instrument):
         or int(row.get("trade_mode", 0)) != 0
         or row.get("stock", instrument.base_currency.code) != instrument.base_currency.code
         or row.get("money", instrument.quote_currency.code) != instrument.quote_currency.code
+        or row.get("trade_quote", instrument.quote_currency.code) != instrument.quote_currency.code
     ):
         raise ValueError("Gate PMM supports regular spot assets, not unified-asset routing")
