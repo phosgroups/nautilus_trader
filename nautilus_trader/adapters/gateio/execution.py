@@ -533,20 +533,40 @@ class GateioExecutionClient(LiveExecutionClient):
             report.order_status == OrderStatus.ACCEPTED
             and cached is not None
             and not cached.is_closed
-            and cached.status == OrderStatus.PENDING_CANCEL
+            and cached.status in {OrderStatus.PENDING_CANCEL, OrderStatus.PENDING_UPDATE}
             and cached.ts_accepted > 0
             and cached.venue_order_id == report.venue_order_id
             and cached.quantity == report.quantity
             and getattr(cached, "price", None) == report.price
         )
 
-    async def _publish_order(self, row):
+    async def _publish_order(self, row, *, amendment=False):
         instrument = self._instrument(row["currency_pair"])
         report = order_report(
             row, instrument, self.account_id, self._resolve(row), self._clock.timestamp_ns()
         )
         cached = self._cached_order(row)
-        if self._duplicate_pending_acceptance(cached, report):
+        if (
+            cached is not None
+            and cached.status in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
+            and cached.order_type == OrderType.LIMIT
+            and cached.venue_order_id == report.venue_order_id
+            and report.order_status in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
+            and report.ts_last < cached.ts_last
+            and (report.price != cached.price or report.quantity != cached.quantity)
+            and report.filled_qty <= cached.filled_qty
+        ):
+            return report
+        if self._duplicate_pending_acceptance(cached, report) and not amendment:
+            return report
+        if (cached is not None and cached.status == OrderStatus.PENDING_UPDATE
+                and report.order_status == OrderStatus.ACCEPTED and cached.filled_qty.as_decimal() == 0):
+            self.generate_order_updated(
+                strategy_id=cached.strategy_id, instrument_id=report.instrument_id,
+                client_order_id=cached.client_order_id, venue_order_id=report.venue_order_id,
+                quantity=report.quantity, price=report.price, trigger_price=None,
+                ts_event=report.ts_last,
+            )
             return report
         if cached is not None and (
             cached.filled_qty.as_decimal() > report.filled_qty.as_decimal()
@@ -1159,14 +1179,66 @@ class GateioExecutionClient(LiveExecutionClient):
             await self._cancel_order(cancel)
 
     async def _modify_order(self, command):
-        self.generate_order_modify_rejected(
-            strategy_id=command.strategy_id,
-            instrument_id=command.instrument_id,
-            client_order_id=command.client_order_id,
-            venue_order_id=command.venue_order_id,
-            reason="Gate PMM uses cancel-confirm-create, not in-place modification",
-            ts_event=self._clock.timestamp_ns(),
-        )
+        venue_id = command.venue_order_id
+
+        def reject(reason):
+            self.generate_order_modify_rejected(
+                strategy_id=command.strategy_id,
+                instrument_id=command.instrument_id,
+                client_order_id=command.client_order_id,
+                venue_order_id=venue_id,
+                reason=reason,
+                ts_event=self._clock.timestamp_ns(),
+            )
+
+        order = self._cache.order(command.client_order_id)
+        if order is None or order.is_closed or order.order_type != OrderType.LIMIT:
+            reject("Gate amendments require an active spot limit order")
+            return
+        if (order.strategy_id != command.strategy_id or order.instrument_id != command.instrument_id
+                or order.account_id != self.account_id or (venue_id and order.venue_order_id != venue_id)):
+            reject("Gate amendment target differs from the cached order")
+            return
+        venue_id = venue_id or order.venue_order_id
+        if venue_id is None or command.trigger_price is not None:
+            reject("Gate spot amendments require a venue order ID and do not support trigger prices")
+            return
+        body = {"currency_pair": command.instrument_id.symbol.value, "account": "spot"}
+        if command.quantity is not None:
+            if command.quantity <= order.filled_qty:
+                reject("Gate amended quantity must exceed the already filled quantity")
+                return
+            body["amount"] = str(command.quantity.as_decimal())
+        if command.price is not None:
+            body["price"] = str(command.price.as_decimal())
+        if command.price is None and command.quantity is None:
+            reject("Gate amendment requires quantity or price")
+            return
+
+        try:
+            row = await self.http.request("PATCH", "/spot/orders/" + str(venue_id), body=body, private=True)
+            _check_order_response(row, command.instrument_id, venue_id)
+            async with self._report_lock:
+                await self._publish_order(row, amendment=True)
+            self._request_account_refresh()
+            return
+        except GateioHttpError as error:
+            if error.definite_rejection:
+                current = self._cache.order(command.client_order_id)
+                if current is not None and not current.is_closed:
+                    reject(str(error))
+                return
+        except Exception:
+            pass  # A transport failure or malformed ACK may follow a successful amendment.
+
+        # Never repeat a PATCH after an uncertain outcome. Reconcile exchange facts.
+        try:
+            row = await _fetch_order(self, command)
+            if row is not None:
+                async with self._report_lock:
+                    await self._publish_order(row)
+        except Exception as error:
+            self._log.warning(f"Gate amendment awaits reconciliation: {type(error).__name__}")
 
     async def _query_account(self, command):
         if self._account_paused or self._account_stopping:

@@ -9,7 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 
-def cold_scenario(periodic=False, duplicate_ack=False, market_buy=False):  # noqa: C901 (native lifecycle scenarios)
+def cold_scenario(periodic=False, duplicate_ack=False, market_buy=False, amend=False):  # noqa: C901 (native lifecycle scenarios)
     from nautilus_trader.adapters.gateio import GateioDataClientConfig
     from nautilus_trader.adapters.gateio import GateioExecClientConfig
     from nautilus_trader.adapters.gateio import GateioLiveDataClientFactory
@@ -36,7 +36,7 @@ def cold_scenario(periodic=False, duplicate_ack=False, market_buy=False):  # noq
     async def run():  # noqa: C901 (startup, periodic recovery and dual acknowledgement)
         server = server_type()
         await server.start()
-        if duplicate_ack:
+        if duplicate_ack or amend:
             server.push_acceptance = True
             server.cancel_delay = 0.15
         else:
@@ -99,9 +99,17 @@ def cold_scenario(periodic=False, duplicate_ack=False, market_buy=False):  # noq
             def on_order_accepted(self, event):
                 if not getattr(self, "_cancel_requested", False):
                     self._cancel_requested = True
+                    accepted = self.cache.order(event.client_order_id)
+                    if amend:
+                        self.modify_order(accepted, price=self.cache.instrument(instrument_id).make_price("99500"))
+                    else:
+                        self.cancel_order(accepted)
+
+            def on_order_updated(self, event):
+                if amend:
                     self.cancel_order(self.cache.order(event.client_order_id))
 
-        observer_class = CancelOnAccepted if duplicate_ack else Strategy
+        observer_class = CancelOnAccepted if duplicate_ack or amend else Strategy
         observer = observer_class(
             StrategyConfig(
                 strategy_id="COLD-OBSERVER",
@@ -117,11 +125,15 @@ def cold_scenario(periodic=False, duplicate_ack=False, market_buy=False):  # noq
         node.kernel.msgbus.subscribe(f"events.order.{observer.id}", events.append)
         task = asyncio.create_task(node.run_async())
         try:
-            if duplicate_ack:
+            if duplicate_ack or amend:
                 async with asyncio.timeout(15):
                     while not any(type(e).__name__ == "OrderCanceled" for e in events):
                         await asyncio.sleep(0.01)
                 assert sum(type(e).__name__ == "OrderAccepted" for e in events) == 1
+                if amend:
+                    updated = [e for e in events if type(e).__name__ == "OrderUpdated"]
+                    assert len(updated) == 1
+                    assert updated[0].price.as_decimal() == Decimal("99500")
                 assert server.post_count == 1
                 assert not node.kernel.cache.orders_open(instrument_id=instrument_id)
                 return
@@ -210,6 +222,14 @@ def test_ws_then_rest_acceptance_during_cancel_does_not_clear_pending_state():
 
 def test_cold_market_buy_recovers_quote_dust_and_real_base_fill():
     script = f"import runpy; runpy.run_path({__file__!r})['cold_scenario'](market_buy=True)"
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=45, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_live_amendment_updates_the_existing_order_once():
+    script = f"import runpy; runpy.run_path({__file__!r})['cold_scenario'](amend=True)"
     result = subprocess.run(
         [sys.executable, "-c", script], capture_output=True, text=True, timeout=45, check=False,
     )

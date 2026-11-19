@@ -1,10 +1,16 @@
 """Spot v1 order command and execution report parity."""
 
+import asyncio
 from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from unittest.mock import Mock
 
 import pytest
 
+from nautilus_trader.adapters.gateio.execution import GateioExecutionClient
 from nautilus_trader.adapters.gateio.execution import submit_payload
+from nautilus_trader.adapters.gateio.http import GateioHttpError
 from nautilus_trader.adapters.gateio.parsing import order_report
 from nautilus_trader.adapters.gateio.providers import parse_instrument
 from nautilus_trader.model.enums import OrderSide
@@ -14,6 +20,8 @@ from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.identifiers import AccountId
 
 from nautilus_trader.model.identifiers import ClientOrderId
+from nautilus_trader.model.identifiers import VenueOrderId
+from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
@@ -78,3 +86,42 @@ def test_market_report_units(fields, quantity, filled, quote, status):
     assert report.order_type == OrderType.MARKET
     assert report.is_quote_quantity is quote
     assert report.price is None
+
+
+@pytest.mark.parametrize("outcome", ["rejected", "timeout"])
+def test_amendment_reconciles_an_uncertain_patch_without_resending(outcome):
+    async def run():
+        instrument = parse_instrument(PAIR, 0)
+        request = SimpleNamespace(
+            venue_order_id=VenueOrderId("123"), client_order_id=ClientOrderId("co1"),
+            instrument_id=instrument.id, strategy_id="S-001", quantity=None,
+            price=Price.from_str("110000"), trigger_price=None,
+        )
+        cached = SimpleNamespace(
+            venue_order_id=request.venue_order_id, instrument_id=instrument.id, is_closed=False,
+            order_type=OrderType.LIMIT, strategy_id=request.strategy_id, account_id=AccountId("GATEIO-test"),
+        )
+        error = GateioHttpError(400, "INVALID_PARAM_VALUE") if outcome == "rejected" else TimeoutError()
+        updated = dict(order(), price="110000")
+        transport = AsyncMock(side_effect=[error, updated])
+        client = SimpleNamespace(
+            _cache=SimpleNamespace(order=lambda cid: cached), account_id=cached.account_id,
+            _clock=SimpleNamespace(timestamp_ns=lambda: 0), _publish_order=AsyncMock(),
+            _report_lock=asyncio.Lock(), generate_order_modify_rejected=Mock(),
+            http=SimpleNamespace(request=transport),
+        )
+        await GateioExecutionClient._modify_order(client, request)
+        assert transport.await_args_list[0].args == ("PATCH", "/spot/orders/123")
+        assert transport.await_args_list[0].kwargs["body"] == {
+            "price": "110000", "currency_pair": "BTC_USDT", "account": "spot",
+        }
+        if outcome == "timeout":
+            assert transport.await_count == 2
+            assert transport.await_args_list[1].args[0] == "GET"
+            client._publish_order.assert_awaited_once_with(updated)
+            client.generate_order_modify_rejected.assert_not_called()
+        else:
+            assert transport.await_count == 1
+            client.generate_order_modify_rejected.assert_called_once()
+
+    asyncio.run(run())
