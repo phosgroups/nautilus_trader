@@ -276,6 +276,106 @@ impl GateioExecutionClient {
         let client_text = self.client_order_ids.register(order.client_order_id)?;
         build_submit_request(self.config.product_type, order, Some(client_text))
     }
+
+    fn query_order_report(
+        &self,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
+    ) -> impl Future<Output = anyhow::Result<OrderStatusReport>> + use<> {
+        let http = self.http_client.clone();
+        let ids = Arc::clone(&self.client_order_ids);
+        let product = self.config.product_type;
+        let account_id = self.core.account_id;
+        let clock = self.clock;
+        let cache = self.core.cache();
+        let cached_venue_id = client_order_id.and_then(|id| cache.venue_order_id(&id).copied());
+        let submitted_at = client_order_id.and_then(|id| cache.order(&id)?.ts_submitted());
+        // Gate accepts signed requests with up to 60 seconds of client/server clock skew.
+        let earliest_create = submitted_at.map(|ts| ts.to_datetime_utc() - Duration::seconds(60));
+        async move {
+            let symbol = raw_symbol(instrument_id);
+            let venue_id = venue_order_id
+                .or(cached_venue_id)
+                .or_else(|| client_order_id.and_then(|id| ids.venue_order_id_for_client(id)));
+            let target = match venue_id {
+                Some(id) => id.to_string(),
+                None => gateio_client_order_text(
+                    client_order_id.context("Missing Gate.io order identifier")?,
+                )?,
+            };
+            let matches_client_order = |row: &GateioOrder| {
+                let matches_market = match product {
+                    GateioProductType::Spot => {
+                        row.currency_pair.as_deref() == Some(symbol.as_str())
+                            && row.account.as_deref() == Some("spot")
+                    }
+                    GateioProductType::UsdtPerpetual => {
+                        row.contract.as_deref() == Some(symbol.as_str())
+                    }
+                };
+                let predates_submission = row
+                    .create_time_ms
+                    .zip(earliest_create)
+                    .is_some_and(|(created, earliest)| created / 1000 < earliest.timestamp());
+                matches_market && row.text == target && !predates_submission
+            };
+            let order = match http.order(product, &target, &symbol).await {
+                Ok(order) => {
+                    if venue_id.is_none() {
+                        anyhow::ensure!(
+                            matches_client_order(&order),
+                            "Gate.io response does not match {target} for {symbol}"
+                        );
+                    }
+                    order
+                }
+                Err(error) if venue_id.is_none() && error.is_order_not_found() => {
+                    // A finished spot order or expired futures custom ID can miss the direct lookup.
+                    let now = clock.get_time_ns().to_datetime_utc();
+                    let start = earliest_create.unwrap_or(now - Duration::hours(1));
+                    let rows = http
+                        .orders_in_time_range(product, Some(&symbol), Some(start), None)
+                        .await?;
+                    let mut matches = rows.into_iter().filter(matches_client_order);
+                    let order = matches.next().with_context(|| {
+                        format!("Gate.io order {target} unresolved in recent history")
+                    })?;
+                    anyhow::ensure!(
+                        matches.all(|row| row.id == order.id),
+                        "Multiple Gate.io orders match {target} for {symbol}"
+                    );
+                    order
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let actual_id = VenueOrderId::new_checked(&order.id)?;
+            if let Some(expected_id) = venue_id {
+                anyhow::ensure!(
+                    actual_id == expected_id
+                        && order.contract.as_deref().or(order.currency_pair.as_deref())
+                            == Some(symbol.as_str()),
+                    "Gate.io returned a different order for {target} on {symbol}"
+                );
+            }
+            let instrument = http
+                .instrument(instrument_id, product, clock.get_time_ns())
+                .await?;
+            let report = report_from_order(
+                &order,
+                &instrument,
+                account_id,
+                clock.get_time_ns(),
+                Some(&ids),
+            )?;
+            if venue_id.is_none()
+                && let Some(id) = client_order_id
+            {
+                ids.remember_venue_order(&order.text, &order.id, id);
+            }
+            Ok(report)
+        }
+    }
 }
 
 fn build_submit_request(
@@ -1745,22 +1845,23 @@ impl ExecutionClient for GateioExecutionClient {
         self.spawn_order_task("submit_order", async move {
             match http.submit_order(&request).await {
                 Ok(ack) => {
-                    if !ack.id.is_empty() {
+                    if let Ok(venue_id) = VenueOrderId::new_checked(&ack.id) {
                         if let Some(text) = request.text.as_deref() {
                             client_order_ids.remember_venue_order(text, &ack.id, client_order_id);
                         }
-                        emitter.emit_order_accepted(
-                            &order,
-                            VenueOrderId::from(ack.id.as_str()),
-                            clock.get_time_ns(),
-                        );
+                        emitter.emit_order_accepted(&order, venue_id, clock.get_time_ns());
+                    } else {
+                        log::warn!("Gate.io submit returned no valid venue order ID for {client_order_id}, awaiting reconciliation");
                     }
                 }
-                Err(error) => emitter.emit_order_rejected(
+                Err(error) if error.is_definitive_submit_rejection() => emitter.emit_order_rejected(
                     &order,
                     &format!("Gate.io submit failed: {error}"),
                     clock.get_time_ns(),
                     false,
+                ),
+                Err(error) => log::warn!(
+                    "Gate.io submit outcome unknown for {client_order_id}, awaiting reconciliation: {error}"
                 ),
             }
             Ok(())
@@ -1925,37 +2026,14 @@ impl ExecutionClient for GateioExecutionClient {
 
     fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
         self.ensure_product(cmd.instrument_id)?;
-        let Some(venue_order_id) = cmd.venue_order_id else {
-            anyhow::bail!("Gate.io query order requires a venue order ID");
-        };
-        let http = self.http_client.clone();
+        let query = self.query_order_report(
+            cmd.instrument_id,
+            Some(cmd.client_order_id),
+            cmd.venue_order_id,
+        );
         let emitter = self.emitter.clone();
-        let instrument_id = cmd.instrument_id;
-        let account_id = self.core.account_id;
-        let clock = self.clock;
-        let client_order_ids = Arc::clone(&self.client_order_ids);
         self.spawn_order_task("query_order", async move {
-            let result = http
-                .order(
-                    GateioProductType::from_symbol(instrument_id.symbol.as_str()),
-                    &venue_order_id.to_string(),
-                    &raw_symbol(instrument_id),
-                )
-                .await?;
-            let instrument = http
-                .instrument(
-                    instrument_id,
-                    GateioProductType::from_symbol(instrument_id.symbol.as_str()),
-                    clock.get_time_ns(),
-                )
-                .await?;
-            emitter.send_order_status_report(report_from_order(
-                &result,
-                &instrument,
-                account_id,
-                clock.get_time_ns(),
-                Some(&client_order_ids),
-            )?);
+            emitter.send_order_status_report(query.await?);
             Ok(())
         });
         Ok(())
@@ -1969,32 +2047,12 @@ impl ExecutionClient for GateioExecutionClient {
             return Ok(None);
         };
         self.ensure_product(instrument_id)?;
-        let Some(venue_order_id) = cmd.venue_order_id else {
+        if cmd.venue_order_id.is_none() && cmd.client_order_id.is_none() {
             return Ok(None);
-        };
-        let result = self
-            .http_client
-            .order(
-                self.config.product_type,
-                &venue_order_id.to_string(),
-                &raw_symbol(instrument_id),
-            )
-            .await?;
-        let instrument = self
-            .http_client
-            .instrument(
-                instrument_id,
-                self.config.product_type,
-                self.clock.get_time_ns(),
-            )
-            .await?;
-        Ok(Some(report_from_order(
-            &result,
-            &instrument,
-            self.core.account_id,
-            self.clock.get_time_ns(),
-            Some(&self.client_order_ids),
-        )?))
+        }
+        self.query_order_report(instrument_id, cmd.client_order_id, cmd.venue_order_id)
+            .await
+            .map(Some)
     }
 
     async fn generate_order_status_reports(
@@ -2307,6 +2365,7 @@ mod tests {
         let order = GateioOrder {
             id: "venue-order-1".to_string(),
             text: "t-CLIENT-1".to_string(),
+            account: None,
             currency_pair: None,
             contract: Some("BTC_USDT".to_string()),
             side: None,
@@ -2806,4 +2865,6 @@ mod tests {
             user_trade_dedup_key(&trade, "ETH_USDT")
         );
     }
+
+    mod submit_recovery;
 }

@@ -644,6 +644,8 @@ pub struct GateioOrder {
     pub id: String,
     #[serde(default)]
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     #[serde(default)]
     pub currency_pair: Option<String>,
     #[serde(default)]
