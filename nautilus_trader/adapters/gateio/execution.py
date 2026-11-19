@@ -70,25 +70,32 @@ def original_order_id(text):
 
 
 def submit_payload(order):
-    if order.order_type != OrderType.LIMIT or order.is_quote_quantity or order.is_reduce_only:
-        raise ValueError("Gate spot limit orders require base quantity and cannot be reduce-only")
+    is_market = order.order_type == OrderType.MARKET
+    if order.order_type not in (OrderType.LIMIT, OrderType.MARKET) or order.is_reduce_only:
+        raise ValueError("Gate spot requires a limit or market order without reduce-only")
+    if order.is_quote_quantity != (is_market and order.side == OrderSide.BUY):
+        raise ValueError("Gate spot market buys require quote quantity; other orders require base quantity")
     tif = {
         TimeInForce.GTC: "gtc",
         TimeInForce.IOC: "ioc",
         TimeInForce.FOK: "fok",
     }.get(order.time_in_force)
-    if tif is None or (order.is_post_only and tif != "gtc"):
-        raise ValueError("Unsupported Gate spot limit order time-in-force and post-only combination")
+    if tif is None or (order.is_post_only and (is_market or tif != "gtc")):
+        raise ValueError("Unsupported Gate spot order time-in-force and post-only combination")
     payload = {
         "currency_pair": order.instrument_id.symbol.value,
         "account": "spot",
-        "type": "limit",
+        "type": "market" if is_market else "limit",
         "side": "buy" if order.side == OrderSide.BUY else "sell",
         "amount": str(order.quantity.as_decimal()),
-        "price": str(order.price.as_decimal()),
         "time_in_force": "poc" if order.is_post_only else tif,
         "text": order_text(order.client_order_id),
     }
+    if is_market:
+        # A Nautilus market order defaults to GTC. Gate executes it immediately.
+        payload["time_in_force"] = "fok" if tif == "fok" else "ioc"
+        return payload
+    payload["price"] = str(order.price.as_decimal())
     if order.display_qty is not None:
         if not 0 < order.display_qty <= order.quantity:
             raise ValueError("Gate iceberg display quantity must be positive and at most the order quantity")
@@ -486,7 +493,13 @@ class GateioExecutionClient(LiveExecutionClient):
                 order_key = (row["currency_pair"], str(row["order_id"]))
                 self._pending_fills.setdefault(order_key, {})[str(row["id"])] = row
                 cached = self._cached_order(row)
-                if cached is not None and order_key not in self._pending_orders:
+                # A market buy may still carry its quote budget. Its status converts
+                # the order to base units before the engine can apply real fills.
+                market_buy = (
+                    cached is not None and cached.order_type == OrderType.MARKET
+                    and cached.side == OrderSide.BUY
+                )
+                if cached is not None and not market_buy and order_key not in self._pending_orders:
                     self._send_fill_report(parsed)
                     self._remember_fill(key)
                     self._pending_fills[order_key].pop(str(row["id"]), None)
@@ -524,7 +537,7 @@ class GateioExecutionClient(LiveExecutionClient):
             and cached.ts_accepted > 0
             and cached.venue_order_id == report.venue_order_id
             and cached.quantity == report.quantity
-            and cached.price == report.price
+            and getattr(cached, "price", None) == report.price
         )
 
     async def _publish_order(self, row):

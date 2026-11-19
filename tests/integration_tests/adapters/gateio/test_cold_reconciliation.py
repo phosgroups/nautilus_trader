@@ -9,7 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 
-def cold_scenario(periodic=False, duplicate_ack=False):  # noqa: C901 (native lifecycle scenarios)
+def cold_scenario(periodic=False, duplicate_ack=False, market_buy=False):  # noqa: C901 (native lifecycle scenarios)
     from nautilus_trader.adapters.gateio import GateioDataClientConfig
     from nautilus_trader.adapters.gateio import GateioExecClientConfig
     from nautilus_trader.adapters.gateio import GateioLiveDataClientFactory
@@ -54,6 +54,13 @@ def cold_scenario(periodic=False, duplicate_ack=False):  # noqa: C901 (native li
             }
             if not periodic:
                 await server.partial_fill("123")
+                if market_buy:
+                    # Gate can report a completed market buy with residual quote dust.
+                    server.orders["123"].update(
+                        type="market", amount="4", left="0.004", price="0", time_in_force="ioc",
+                        filled_amount="0.00004", filled_total="3.996", avg_deal_price="99900",
+                        status="closed", finish_as="filled",
+                    )
         options = {
             "instrument_provider": InstrumentProviderConfig(load_ids=frozenset({instrument_id})),
             "base_url_http": server.url,
@@ -150,6 +157,11 @@ def cold_scenario(periodic=False, duplicate_ack=False):  # noqa: C901 (native li
             assert fill.last_px.as_decimal() == Decimal(99900)
             assert fill.commission.as_decimal() == Decimal("0.00000001")
             assert str(fill.commission.currency) == "BTC"
+            if market_buy:
+                recovered = node.kernel.cache.order(fill.client_order_id)
+                assert not recovered.is_quote_quantity
+                assert recovered.is_closed
+                assert recovered.quantity.as_decimal() == recovered.filled_qty.as_decimal() == Decimal("0.00004")
             assert server.post_count == 0
             assert server.cancel_ids == []
         finally:
@@ -192,5 +204,13 @@ def test_ws_then_rest_acceptance_during_cancel_does_not_clear_pending_state():
     script = f"import runpy; runpy.run_path({__file__!r})['cold_scenario'](duplicate_ack=True)"
     result = subprocess.run(  # noqa: S603 (fixed local protocol scenario)
         [sys.executable, "-c", script], capture_output=True, text=True, timeout=45, check=False
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_cold_market_buy_recovers_quote_dust_and_real_base_fill():
+    script = f"import runpy; runpy.run_path({__file__!r})['cold_scenario'](market_buy=True)"
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=45, check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
