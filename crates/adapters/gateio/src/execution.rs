@@ -1972,12 +1972,15 @@ impl ExecutionClient for GateioExecutionClient {
     }
 
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
+        for order_init in &cmd.order_inits {
+            self.ensure_product(order_init.instrument_id)?;
+        }
         for order_init in cmd.order_inits {
             self.submit_order(SubmitOrder {
                 trader_id: cmd.trader_id,
                 client_id: cmd.client_id,
                 strategy_id: cmd.strategy_id,
-                instrument_id: cmd.instrument_id,
+                instrument_id: order_init.instrument_id,
                 client_order_id: order_init.client_order_id,
                 order_init,
                 exec_algorithm_id: cmd.exec_algorithm_id,

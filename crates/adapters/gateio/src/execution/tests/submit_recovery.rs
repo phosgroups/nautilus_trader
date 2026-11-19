@@ -586,3 +586,62 @@ async fn status_only_query_waits_for_real_executions(#[case] trade_qty: &'static
         assert_eq!(fills[0].commission.to_string(), "0.04000000 USDT");
     }
 }
+
+#[tokio::test]
+async fn submit_list_uses_each_childs_instrument() {
+    use nautilus_model::{identifiers::OrderListId, orders::OrderList};
+    let pairs = Arc::new(Mutex::new(Vec::new()));
+    let captured = pairs.clone();
+    let app = Router::new().route(
+        ORDERS,
+        post(move |Json(req): Json<Value>| async move {
+            captured.lock().unwrap().push((
+                req["text"].as_str().unwrap().to_owned(),
+                req["currency_pair"].as_str().unwrap().to_owned(),
+            ));
+            Json(json!({"id": if req["text"] == "t-B" { "701" } else { "702" }}))
+        }),
+    );
+    let list_id = OrderListId::from("L-001");
+    let mut orders = Vec::new();
+    let mut cache = Cache::default();
+    for (id, symbol) in [("B", "BTC_USDT.GATEIO"), ("E", "ETH_USDT.GATEIO")] {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .order_list_id(list_id)
+            .client_order_id(ClientOrderId::from(id))
+            .quantity(Quantity::from("1"))
+            .instrument_id(InstrumentId::from(symbol))
+            .price(Price::from("10"))
+            .build();
+        cache.add_order(order.clone(), None, None, false).unwrap();
+        orders.push(order);
+    }
+    let (client, _events) = client_for_orders(app, Rc::new(RefCell::new(cache)), &orders[0]).await;
+    let list = SubmitOrderList::new(
+        orders[0].trader_id(),
+        None,
+        orders[0].strategy_id(),
+        OrderList::from_orders(&orders, UnixNanos::default()),
+        orders.iter().map(|o| o.init_event().clone()).collect(),
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+    let mut wrong_product = list.clone();
+    wrong_product.order_inits[1].instrument_id = InstrumentId::from("ETH_USDT-PERP.GATEIO");
+    assert!(client.submit_order_list(wrong_product).is_err());
+    client.submit_order_list(list).unwrap();
+    finish_order_tasks(&client).await;
+    let mut pairs = pairs.lock().unwrap();
+    pairs.sort();
+    assert_eq!(
+        *pairs,
+        [
+            ("t-B".into(), "BTC_USDT".into()),
+            ("t-E".into(), "ETH_USDT".into())
+        ]
+    );
+}
