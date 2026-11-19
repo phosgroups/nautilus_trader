@@ -46,7 +46,7 @@ jobs:
       CARGO_PROFILE_RELEASE_LTO: "thin"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Free disk space (Linux)
         run: >-
@@ -54,7 +54,7 @@ jobs:
           --large-packages-keep-llvm --docker-images --extra
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -171,7 +171,7 @@ jobs:
         run: sccache --show-stats
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheel-linux
           path: dist/*.whl
