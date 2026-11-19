@@ -783,13 +783,20 @@ pub fn parse_candle(
     bar_type: BarType,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Bar> {
+    let volume = match product_for_instrument(instrument.id()) {
+        GateioProductType::Spot => candle
+            .base_volume
+            .as_deref()
+            .context("Gate.io spot candle missing base volume")?,
+        GateioProductType::UsdtPerpetual => &candle.volume,
+    };
     Bar::new_checked(
         bar_type,
         price(&candle.open, instrument.price_precision(), "candle.open")?,
         price(&candle.high, instrument.price_precision(), "candle.high")?,
         price(&candle.low, instrument.price_precision(), "candle.low")?,
         price(&candle.close, instrument.price_precision(), "candle.close")?,
-        quantity(&candle.volume, instrument.size_precision(), "candle.volume")?,
+        quantity(volume, instrument.size_precision(), "candle.volume")?,
         timestamp_or_init(Some(candle.timestamp_ms), ts_init)?,
         ts_init,
     )
@@ -847,6 +854,28 @@ mod tests {
             UnixNanos::from(1_000_000_000),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn candle_volume_uses_base_quantity_for_spot_and_contracts_for_futures() {
+        let spot = spot_instrument();
+        let futures = futures_instrument();
+        let array = serde_json::json!([
+            1700000000, "10000", "5000", "5001", "4999", "5000", "2", "true"
+        ]);
+        let object = serde_json::json!({"t": 1700000000, "v": "10", "a": "2", "sum": "10000", "c": "5000", "h":"5001", "l":"4999", "o":"5000"});
+        for (row, instrument, expected) in [
+            (array, &spot, "2"),
+            (object.clone(), &spot, "2"),
+            (object, &futures, "10"),
+        ] {
+            let candle = serde_json::from_value(row).unwrap();
+            let bar_type = format!("{}-1-MINUTE-LAST-EXTERNAL", instrument.id())
+                .parse()
+                .unwrap();
+            let bar = parse_candle(&candle, instrument, bar_type, UnixNanos::default()).unwrap();
+            assert_eq!(bar.volume, Quantity::from(expected));
+        }
     }
 
     #[test]

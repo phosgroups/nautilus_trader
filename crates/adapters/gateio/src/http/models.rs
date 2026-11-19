@@ -402,7 +402,10 @@ impl GateioTrade {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct GateioCandle {
     pub timestamp_ms: i64,
+    /// Quote turnover for spot, contract volume for perpetuals.
     pub volume: String,
+    /// Spot base quantity (REST array index 6 or WebSocket field `a`).
+    pub base_volume: Option<String>,
     pub close: String,
     pub high: String,
     pub low: String,
@@ -419,15 +422,12 @@ impl<'de> Deserialize<'de> for GateioCandle {
             serde_json::Value::Array(row) => row,
             serde_json::Value::Object(object) => vec![
                 object.get("t").cloned().unwrap_or(serde_json::Value::Null),
-                object
-                    .get("v")
-                    .cloned()
-                    .or_else(|| object.get("sum").cloned())
-                    .unwrap_or(serde_json::Value::Null),
+                object.get("v").cloned().unwrap_or(serde_json::Value::Null),
                 object.get("c").cloned().unwrap_or(serde_json::Value::Null),
                 object.get("h").cloned().unwrap_or(serde_json::Value::Null),
                 object.get("l").cloned().unwrap_or(serde_json::Value::Null),
                 object.get("o").cloned().unwrap_or(serde_json::Value::Null),
+                object.get("a").cloned().unwrap_or(serde_json::Value::Null),
             ],
             _ => {
                 return Err(de::Error::custom(
@@ -457,6 +457,11 @@ impl<'de> Deserialize<'de> for GateioCandle {
                     .ok_or_else(|| de::Error::custom("invalid candle timestamp"))?
             },
             volume: get(1)?,
+            base_volume: row.get(6).and_then(|value| match value {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }),
             close: get(2)?,
             high: get(3)?,
             low: get(4)?,
@@ -991,15 +996,17 @@ mod tests {
     #[test]
     fn deserializes_array_and_object_candles() {
         let array = serde_json::from_value::<GateioCandle>(serde_json::json!([
-            1700000000, "100", "50001", "50002", "49999", "50000"
+            1700000000, "100", "50001", "50002", "49999", "50000", "0.002", "true"
         ]))
         .unwrap();
         assert_eq!(array.timestamp_ms, 1_700_000_000_000);
         assert_eq!(array.close, "50001");
+        assert_eq!(array.base_volume.as_deref(), Some("0.002"));
 
         let object = serde_json::from_value::<GateioCandle>(serde_json::json!({
             "t": 1700000000000i64,
-            "sum": "10",
+            "v": "10",
+            "sum": "987.65",
             "c": 50001,
             "h": "50002",
             "l": "49999",
