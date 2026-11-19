@@ -62,32 +62,18 @@ async fn finish_order_tasks(client: &GateioExecutionClient) {
     }
 }
 
-async fn submit(status: StatusCode, body: &'static str, query_routes: Router) -> SubmittedOrder {
-    let posted_texts = Arc::new(Mutex::new(Vec::new()));
-    let captured = Arc::clone(&posted_texts);
-    let app = query_routes.route(
-        ORDERS,
-        post(move |Json(request): Json<Value>| async move {
-            captured.lock().unwrap().push(request["text"].clone());
-            (status, body)
-        }),
-    );
+async fn client_for_orders(
+    app: Router,
+    cache: Rc<RefCell<Cache>>,
+    order: &OrderAny,
+) -> (
+    GateioExecutionClient,
+    mpsc::UnboundedReceiver<ExecutionEvent>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url_http = Some(format!("http://{}", listener.local_addr().unwrap()));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    let instrument = spot_instrument();
-    let order = OrderTestBuilder::new(OrderType::Limit)
-        .instrument_id(instrument.id())
-        .client_order_id(ClientOrderId::from("ABC-123"))
-        .quantity(Quantity::from("1"))
-        .price(Price::from("50000"))
-        .build();
-    let cache = Rc::new(RefCell::new(Cache::default()));
-    cache
-        .borrow_mut()
-        .add_order(order.clone(), None, None, false)
-        .unwrap();
     let config = GateioExecClientConfig {
         api_key: Some("test-key".into()),
         api_secret: Some("test-secret".into()),
@@ -105,9 +91,36 @@ async fn submit(status: StatusCode, body: &'static str, query_routes: Router) ->
         cache,
     );
     let mut client = GateioExecutionClient::new(core, config).unwrap();
-    let (sender, mut events) = mpsc::unbounded_channel();
+    let (sender, events) = mpsc::unbounded_channel();
     client.emitter.set_sender(sender);
-    client.http_client.cache_instruments(&[instrument]);
+    client.http_client.cache_instruments(&[spot_instrument()]);
+
+    (client, events)
+}
+
+async fn submit(status: StatusCode, body: &'static str, query_routes: Router) -> SubmittedOrder {
+    let posted_texts = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&posted_texts);
+    let app = query_routes.route(
+        ORDERS,
+        post(move |Json(request): Json<Value>| async move {
+            captured.lock().unwrap().push(request["text"].clone());
+            (status, body)
+        }),
+    );
+    let instrument = spot_instrument();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("ABC-123"))
+        .quantity(Quantity::from("1"))
+        .price(Price::from("50000"))
+        .build();
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    let (client, mut events) = client_for_orders(app, cache, &order).await;
 
     let cmd = SubmitOrder::from_order(
         &order,
@@ -275,6 +288,245 @@ async fn insufficient_balance_emits_order_rejected() {
     };
     assert_eq!(rejected.client_order_id, result.order.client_order_id());
     assert!(rejected.reason.as_str().contains("BALANCE_NOT_ENOUGH"));
+}
+
+#[rstest::rstest]
+#[case(StatusCode::OK, false, false)]
+#[case(StatusCode::OK, true, false)]
+#[case(StatusCode::BAD_GATEWAY, true, false)]
+#[case(StatusCode::BAD_REQUEST, false, true)]
+#[tokio::test]
+async fn cancel_all_during_submit(
+    #[case] status: StatusCode,
+    #[case] finish_post_first: bool,
+    #[case] project_submitted: bool,
+) {
+    use axum::{extract::Path, routing::delete};
+    use tokio::sync::Notify;
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let post_entered = entered.clone();
+    let post_release = release.clone();
+    let deletes = Arc::new(Mutex::new(Vec::new()));
+    let seen = deletes.clone();
+    let app = Router::new()
+        .route(
+            ORDERS,
+            post(move || async move {
+                post_entered.notify_one();
+                post_release.notified().await;
+                let body = if status == StatusCode::OK {
+                    open_order()
+                } else {
+                    json!({"label": "BALANCE_NOT_ENOUGH"})
+                };
+                (status, Json(body))
+            }),
+        )
+        .route(
+            "/api/v4/spot/orders/{id}",
+            delete(move |Path(id): Path<String>| async move {
+                seen.lock().unwrap().push(id);
+                let mut row = open_order();
+                row["status"] = json!("cancelled");
+                Json(row)
+            }),
+        );
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(spot_instrument().id())
+        .client_order_id(ClientOrderId::from("ABC-123"))
+        .quantity(Quantity::from("1"))
+        .price(Price::from("50000"))
+        .build();
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    let (client, mut events) = client_for_orders(app, cache.clone(), &order).await;
+    let ts = UnixNanos::default();
+    client
+        .submit_order(SubmitOrder::from_order(
+            &order,
+            order.trader_id(),
+            None,
+            None,
+            UUID4::new(),
+            ts,
+        ))
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    if project_submitted {
+        let ExecutionEvent::Order(submitted) = events.try_recv().unwrap() else {
+            panic!("expected order submitted");
+        };
+        cache.borrow_mut().update_order(&submitted).unwrap();
+    }
+    if finish_post_first {
+        release.notify_one();
+        finish_order_tasks(&client).await;
+    }
+    client
+        .cancel_all_orders(CancelAllOrders::new(
+            order.trader_id(),
+            None,
+            order.strategy_id(),
+            order.instrument_id(),
+            OrderSide::NoOrderSide,
+            UUID4::new(),
+            ts,
+            None,
+            None,
+        ))
+        .unwrap();
+    if !finish_post_first {
+        release.notify_one();
+    }
+    finish_order_tasks(&client).await;
+    let expected: &[&str] = match status {
+        StatusCode::OK => &["701"],
+        StatusCode::BAD_GATEWAY => &[ORDER_TEXT],
+        _ => &[],
+    };
+    assert_eq!(deletes.lock().unwrap().as_slice(), expected);
+}
+
+#[tokio::test]
+async fn cancel_all_targets_only_owned_orders_and_wallet() {
+    use axum::{extract::Path, routing::delete};
+    use nautilus_model::{
+        events::{OrderAccepted, OrderSubmitted},
+        identifiers::StrategyId,
+    };
+
+    let instrument_id = spot_instrument().id();
+    let account_id = AccountId::from("GATEIO-001");
+    let strategy_id = StrategyId::from("GRID-001");
+    let mut cache = Cache::default();
+    for (venue_id, strategy, account, symbol, side) in [
+        (
+            "701",
+            strategy_id,
+            account_id,
+            instrument_id,
+            OrderSide::Buy,
+        ),
+        (
+            "702",
+            StrategyId::from("GRID-002"),
+            account_id,
+            instrument_id,
+            OrderSide::Buy,
+        ),
+        (
+            "703",
+            strategy_id,
+            AccountId::from("GATEIO-002"),
+            instrument_id,
+            OrderSide::Buy,
+        ),
+        (
+            "704",
+            strategy_id,
+            account_id,
+            InstrumentId::from("ETH_USDT.GATEIO"),
+            OrderSide::Buy,
+        ),
+        (
+            "705",
+            strategy_id,
+            account_id,
+            instrument_id,
+            OrderSide::Sell,
+        ),
+    ] {
+        let id = ClientOrderId::from(venue_id);
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(id)
+            .quantity(Quantity::from("1"))
+            .strategy_id(strategy)
+            .instrument_id(symbol)
+            .price(Price::from("50000"))
+            .side(side)
+            .build();
+        cache.add_order(order.clone(), None, None, false).unwrap();
+        let ts = UnixNanos::default();
+        cache
+            .update_order(&OrderEventAny::Submitted(OrderSubmitted::new(
+                order.trader_id(),
+                strategy,
+                symbol,
+                id,
+                account,
+                UUID4::new(),
+                ts,
+                ts,
+            )))
+            .unwrap();
+        cache
+            .update_order(&OrderEventAny::Accepted(OrderAccepted::new(
+                order.trader_id(),
+                strategy,
+                symbol,
+                id,
+                VenueOrderId::from(venue_id),
+                account,
+                UUID4::new(),
+                ts,
+                ts,
+                false,
+            )))
+            .unwrap();
+    }
+    let order = cache.try_order_owned(&ClientOrderId::from("701")).unwrap();
+    let canceled = Arc::new(Mutex::new(Vec::new()));
+    let captured = canceled.clone();
+    let app = Router::new().route("/api/v4/spot/orders/{id}", delete(move |Path(id): Path<String>, Query(params): Query<HashMap<String, String>>| async move {
+        assert_eq!(params["account"], "spot");
+        assert_eq!(params["currency_pair"], "BTC_USDT");
+        captured.lock().unwrap().push(id.clone());
+        let mut row = open_order();
+        row["status"] = json!("cancelled");
+        row["left"] = json!("0.6");
+        row["filled_amount"] = json!("0.4");
+        row["text"] = json!(format!("t-{id}"));
+        row["id"] = json!(id);
+        Json(row)
+    })).route("/api/v4/spot/my_trades", get(|Query(params): Query<HashMap<String, String>>| async move {
+        assert_eq!(params["order_id"], "701");
+        Json(json!([{"order_id":"701", "currency_pair":"BTC_USDT","id":"87","price":"49000","amount":"0.4","fee":"0.04","fee_currency":"USDT","side":"buy","role":"maker"}]))
+    }));
+    let (client, mut events) = client_for_orders(app, Rc::new(RefCell::new(cache)), &order).await;
+    client
+        .cancel_all_orders(CancelAllOrders::new(
+            order.trader_id(),
+            None,
+            strategy_id,
+            instrument_id,
+            OrderSide::Buy,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    finish_order_tasks(&client).await;
+    assert_eq!(*canceled.lock().unwrap(), ["701"]);
+    let ExecutionEvent::Report(ExecutionReport::OrderWithFills(report, fills)) =
+        events.try_recv().unwrap()
+    else {
+        panic!("expected the canceled order and its partial fill");
+    };
+    assert_eq!(report.order_status, OrderStatus::Canceled);
+    assert_eq!(report.venue_order_id.as_str(), "701");
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].trade_id.as_str(), "87");
+    assert_eq!(fills[0].last_qty, Quantity::from("0.4"));
+    assert_eq!(fills[0].commission.to_string(), "0.04000000 USDT");
+    assert!(events.try_recv().is_err());
 }
 
 #[rstest::rstest]

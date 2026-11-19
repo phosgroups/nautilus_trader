@@ -112,9 +112,17 @@ struct DedupCache {
 
 #[derive(Debug, Default)]
 struct ClientOrderIdMap {
+    submitting: dashmap::DashMap<ClientOrderId, tokio::sync::watch::Receiver<SubmitOutcome>>,
     by_text: Mutex<HashMap<String, ClientOrderId>>,
     by_venue_order_id: Mutex<HashMap<String, ClientOrderId>>,
     by_client_order_id: Mutex<HashMap<String, String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitOutcome {
+    Pending,
+    Rejected,
+    Sent,
 }
 
 /// Gate.io Spot execution client type alias.
@@ -1776,6 +1784,7 @@ impl ExecutionClient for GateioExecutionClient {
     fn stop(&mut self) -> anyhow::Result<()> {
         self.http_client.cancel_all_requests();
         self.abort_pending_tasks();
+        self.client_order_ids.submitting.clear();
         self.ws_client.stop();
         self.abort_ws_task();
         self.core.set_stopped();
@@ -1875,6 +1884,7 @@ impl ExecutionClient for GateioExecutionClient {
     async fn disconnect(&mut self) -> anyhow::Result<()> {
         self.http_client.cancel_all_requests();
         self.abort_pending_tasks();
+        self.client_order_ids.submitting.clear();
         self.ws_client.disconnect().await?;
         self.abort_ws_task();
         self.core.set_disconnected();
@@ -1910,6 +1920,25 @@ impl ExecutionClient for GateioExecutionClient {
         let clock = self.clock;
         let client_order_ids = Arc::clone(&self.client_order_ids);
         let client_order_id = order.client_order_id();
+        // A cancel addressed by custom text must not overtake its POST.
+        // Emission only queues an event. Retain completed submissions until
+        // the engine has projected the outcome into its main-thread cache.
+        {
+            let cache = self.core.cache();
+            client_order_ids
+                .submitting
+                .retain(|id, state| match *state.borrow() {
+                    SubmitOutcome::Pending => true,
+                    SubmitOutcome::Rejected => {
+                        cache.order(id).is_some_and(|order| !order.is_closed())
+                    }
+                    SubmitOutcome::Sent => {
+                        cache.order(id).is_some_and(|order| order.is_active_local())
+                    }
+                });
+        }
+        let (submitted, waiting) = tokio::sync::watch::channel(SubmitOutcome::Pending);
+        client_order_ids.submitting.insert(client_order_id, waiting);
         self.spawn_order_task("submit_order", async move {
             match http.submit_order(&request).await {
                 Ok(ack) => {
@@ -1922,16 +1951,21 @@ impl ExecutionClient for GateioExecutionClient {
                         log::warn!("Gate.io submit returned no valid venue order ID for {client_order_id}, awaiting reconciliation");
                     }
                 }
-                Err(error) if error.is_definitive_submit_rejection() => emitter.emit_order_rejected(
-                    &order,
-                    &format!("Gate.io submit failed: {error}"),
-                    clock.get_time_ns(),
-                    false,
-                ),
+                Err(error) if error.is_definitive_submit_rejection() => {
+                    submitted.send_replace(SubmitOutcome::Rejected);
+                    emitter.emit_order_rejected(
+                        &order,
+                        &format!("Gate.io submit failed: {error}"),
+                        clock.get_time_ns(),
+                        false,
+                    );
+                    return Ok(());
+                }
                 Err(error) => log::warn!(
                     "Gate.io submit outcome unknown for {client_order_id}, awaiting reconciliation: {error}"
                 ),
             }
+            submitted.send_replace(SubmitOutcome::Sent);
             Ok(())
         });
         Ok(())
@@ -2020,28 +2054,47 @@ impl ExecutionClient for GateioExecutionClient {
             self.client_order_ids
                 .venue_order_id_for_client(cmd.client_order_id)
         });
-        let Some(venue_order_id) = venue_order_id else {
-            anyhow::bail!("Gate.io cancel requires a venue order ID");
-        };
+        let client_order_ids = Arc::clone(&self.client_order_ids);
+        let waiting = client_order_ids
+            .submitting
+            .get(&cmd.client_order_id)
+            .map(|entry| entry.clone());
         let http = self.http_client.clone();
         let emitter = self.emitter.clone();
         let order = self.order_from_cache(cmd.client_order_id)?;
         let clock = self.clock;
         let account_id = self.core.account_id;
-        let ids = Arc::clone(&self.client_order_ids);
         self.spawn_order_task("cancel_order", async move {
+            if venue_order_id.is_none()
+                && let Some(mut waiting) = waiting
+            {
+                match waiting
+                    .wait_for(|state| *state != SubmitOutcome::Pending)
+                    .await
+                {
+                    Ok(state) if *state == SubmitOutcome::Sent => {}
+                    _ => return Ok(()),
+                }
+            }
+            let venue_order_id = venue_order_id
+                .or_else(|| client_order_ids.venue_order_id_for_client(cmd.client_order_id));
+            let target = match venue_order_id {
+                Some(id) => id.to_string(),
+                None => gateio_client_order_text(cmd.client_order_id)?,
+            };
             match http
                 .cancel_order(
                     GateioProductType::from_symbol(cmd.instrument_id.symbol.as_str()),
-                    &venue_order_id.to_string(),
+                    &target,
                     &raw_symbol(cmd.instrument_id),
                 )
                 .await
             {
                 Ok(ack) => {
+                    let id = VenueOrderId::new_checked(&ack.id)?;
                     anyhow::ensure!(
-                        ack.id == venue_order_id.as_str(),
-                        "Gate.io cancel acknowledgment has the wrong order ID"
+                        venue_order_id.map_or(ack.text == target, |expected| id == expected),
+                        "Gate.io cancel response did not match {target}"
                     );
                     let product = GateioProductType::from_symbol(cmd.instrument_id.symbol.as_str());
                     let instrument = http
@@ -2052,13 +2105,13 @@ impl ExecutionClient for GateioExecutionClient {
                         &instrument,
                         account_id,
                         clock.get_time_ns(),
-                        Some(&ids),
+                        Some(&client_order_ids),
                     )?;
                     fills::publish_rest(&http, &emitter, report).await?;
                 }
                 Err(error) => emitter.emit_order_cancel_rejected(
                     &order,
-                    Some(venue_order_id),
+                    venue_order_id,
                     &format!("Gate.io cancel failed: {error}"),
                     clock.get_time_ns(),
                 ),
@@ -2070,19 +2123,45 @@ impl ExecutionClient for GateioExecutionClient {
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
         self.ensure_product(cmd.instrument_id)?;
-        let http = self.http_client.clone();
-        let symbol = raw_symbol(cmd.instrument_id);
-        let order_side = cmd.order_side;
-        self.spawn_order_task("cancel_all_orders", async move {
-            http.cancel_all(
-                GateioProductType::from_symbol(cmd.instrument_id.symbol.as_str()),
-                Some(&symbol),
-                order_side,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| anyhow::anyhow!("Gate.io cancel all failed: {error}"))
+        // Gate's bulk endpoint cannot filter by strategy. Cancel only orders in our cache.
+        let cache = self.core.cache();
+        let instrument = Some(&cmd.instrument_id);
+        let strategy = Some(&cmd.strategy_id);
+        let account = Some(&self.core.account_id);
+        let side = Some(cmd.order_side);
+        let open = cache.orders_open_refs(None, instrument, strategy, account, side);
+        let inflight = cache.orders_inflight_refs(None, instrument, strategy, account, side);
+        // Submitted events may still be queued, leaving both status and account
+        // unset in the cache. Only include local orders dispatched by this client.
+        let local = cache.orders_active_local_refs(None, instrument, strategy, None, side);
+        let dispatched = local.into_iter().filter(|order| {
+            self.client_order_ids
+                .submitting
+                .contains_key(&order.client_order_id())
+                && order
+                    .account_id()
+                    .is_none_or(|id| id == self.core.account_id)
         });
+        let mut seen = HashSet::new();
+        for order in open.into_iter().chain(inflight).chain(dispatched) {
+            if !seen.insert(order.client_order_id()) {
+                continue;
+            }
+            let mut cancel = CancelOrder::new(
+                cmd.trader_id,
+                cmd.client_id,
+                cmd.strategy_id,
+                cmd.instrument_id,
+                order.client_order_id(),
+                order.venue_order_id(),
+                UUID4::new(),
+                cmd.ts_init,
+                cmd.params.clone(),
+                cmd.correlation_id,
+            );
+            cancel.causation_id = Some(cmd.command_id);
+            self.cancel_order(cancel)?;
+        }
         Ok(())
     }
 

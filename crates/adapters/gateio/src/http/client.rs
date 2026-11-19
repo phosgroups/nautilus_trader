@@ -858,19 +858,16 @@ impl GateioRawHttpClient {
         } else {
             format!("{FUTURES_ORDERS}/{order_id}")
         };
-        let key = if product_type == GateioProductType::Spot {
-            "currency_pair"
+        let params = if product_type == GateioProductType::Spot {
+            vec![
+                ("currency_pair".to_string(), symbol.to_string()),
+                ("account".to_string(), "spot".to_string()),
+            ]
         } else {
-            "contract"
+            Vec::new()
         };
-        self.send(
-            Method::DELETE,
-            &endpoint,
-            &[(key.to_string(), symbol.to_string())],
-            None,
-            true,
-        )
-        .await
+        self.send(Method::DELETE, &endpoint, &params, None, true)
+            .await
     }
 
     pub async fn cancel_all(
