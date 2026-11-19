@@ -1,5 +1,7 @@
 //! Gate.io execution clients.
 
+mod fills;
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
@@ -75,8 +77,6 @@ pub struct GateioExecutionClient {
     reconnect_reconciliation_lookback_mins: Option<u64>,
     reconnect_reconciliation_in_flight: Arc<AtomicBool>,
     client_order_ids: Arc<ClientOrderIdMap>,
-    seen_orders: Arc<Mutex<DedupCache>>,
-    seen_trades: Arc<Mutex<DedupCache>>,
     seen_balances: Arc<Mutex<DedupCache>>,
     seen_positions: Arc<Mutex<DedupCache>>,
     is_connected: AtomicBool,
@@ -84,6 +84,7 @@ pub struct GateioExecutionClient {
 
 #[derive(Clone)]
 struct GateioExecutionWsDispatchContext {
+    executions: Arc<Mutex<fills::OrderExecutions>>,
     product_type: GateioProductType,
     account_id: AccountId,
     clock: &'static AtomicTime,
@@ -96,7 +97,6 @@ struct GateioExecutionWsDispatchContext {
     latest_account_event: Arc<AtomicU64>,
     client_order_ids: Arc<ClientOrderIdMap>,
     seen_orders: Arc<Mutex<DedupCache>>,
-    seen_trades: Arc<Mutex<DedupCache>>,
     seen_balances: Arc<Mutex<DedupCache>>,
     seen_positions: Arc<Mutex<DedupCache>>,
     pending_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -159,8 +159,6 @@ impl GateioExecutionClient {
             reconnect_reconciliation_lookback_mins,
             reconnect_reconciliation_in_flight: Arc::new(AtomicBool::new(false)),
             client_order_ids: Arc::new(ClientOrderIdMap::default()),
-            seen_orders: Arc::new(Mutex::new(DedupCache::default())),
-            seen_trades: Arc::new(Mutex::new(DedupCache::default())),
             seen_balances: Arc::new(Mutex::new(DedupCache::default())),
             seen_positions: Arc::new(Mutex::new(DedupCache::default())),
             is_connected: AtomicBool::new(false),
@@ -206,8 +204,8 @@ impl GateioExecutionClient {
             account_refresh_lock: Arc::clone(&self.account_refresh_lock),
             latest_account_event: Arc::clone(&self.latest_account_event),
             client_order_ids: Arc::clone(&self.client_order_ids),
-            seen_orders: Arc::clone(&self.seen_orders),
-            seen_trades: Arc::clone(&self.seen_trades),
+            seen_orders: Arc::new(Mutex::new(DedupCache::default())),
+            executions: Arc::new(Mutex::new(fills::OrderExecutions::default())),
             seen_balances: Arc::clone(&self.seen_balances),
             seen_positions: Arc::clone(&self.seen_positions),
             pending_tasks: Arc::clone(&self.pending_tasks),
@@ -275,6 +273,135 @@ impl GateioExecutionClient {
     fn submit_request(&self, order: &OrderInitializedView) -> anyhow::Result<GateioOrderRequest> {
         let client_text = self.client_order_ids.register(order.client_order_id)?;
         build_submit_request(self.config.product_type, order, Some(client_text))
+    }
+
+    // The status-only reconciliation API can only return bare status reports.
+    // Let the engine apply the bundle before exposing a filled snapshot to that API.
+    async fn ensure_applied_fills(&self, report: &OrderStatusReport) -> anyhow::Result<()> {
+        let already_applied = {
+            let cache = self.core.cache();
+            let cached = report
+                .client_order_id
+                .and_then(|id| cache.order(&id))
+                .or_else(|| {
+                    cache
+                        .client_order_id(&report.venue_order_id)
+                        .and_then(|id| cache.order(id))
+                });
+            if let Some(order) = &cached {
+                anyhow::ensure!(
+                    order.filled_qty() <= report.filled_qty
+                        && !(order.is_closed() && !report.order_status.is_closed()),
+                    "Gate.io order snapshot for {} predates the cached execution state",
+                    report.venue_order_id
+                );
+            }
+            report.filled_qty.is_zero()
+                || cached.is_some_and(|order| {
+                    order.venue_order_id() == Some(report.venue_order_id)
+                        && order.filled_qty() == report.filled_qty
+                })
+        };
+        if already_applied {
+            return Ok(());
+        }
+        fills::publish_rest(&self.http_client, &self.emitter, report.clone()).await?;
+        anyhow::bail!(
+            "Gate.io order {} awaits application of real executions",
+            report.venue_order_id
+        )
+    }
+
+    async fn fetch_order_reports(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let instrument_id = cmd.instrument_id;
+        if let Some(instrument_id) = instrument_id {
+            self.ensure_product(instrument_id)?;
+        }
+
+        let symbol = instrument_id.map(raw_symbol);
+        let mut orders = self
+            .http_client
+            .open_orders(self.config.product_type, symbol.as_deref())
+            .await?;
+
+        if !cmd.open_only {
+            let start = cmd
+                .start
+                .map(|value| unix_nanos_to_datetime(value, "order start"))
+                .transpose()?;
+            let end = cmd
+                .end
+                .map(|value| unix_nanos_to_datetime(value, "order end"))
+                .transpose()?;
+            let finished = if start.is_some() || end.is_some() {
+                self.http_client
+                    .orders_in_time_range(self.config.product_type, symbol.as_deref(), start, end)
+                    .await?
+            } else {
+                self.http_client
+                    .orders(self.config.product_type, "finished", symbol.as_deref())
+                    .await?
+            };
+            orders.extend(finished);
+        }
+
+        let mut instruments = HashMap::new();
+        if let Some(instrument_id) = instrument_id {
+            instruments.insert(
+                raw_symbol(instrument_id),
+                self.http_client
+                    .instrument(
+                        instrument_id,
+                        self.config.product_type,
+                        self.clock.get_time_ns(),
+                    )
+                    .await?,
+            );
+        }
+
+        let mut seen = HashSet::new();
+        let mut reports = Vec::with_capacity(orders.len());
+        for order in orders {
+            if !seen.insert(order.id.clone()) {
+                continue;
+            }
+            let raw = order
+                .contract
+                .as_deref()
+                .or(order.currency_pair.as_deref())
+                .context("Gate.io order report has no instrument symbol")?;
+            let instrument = if let Some(instrument) = instruments.get(raw) {
+                instrument.clone()
+            } else {
+                let instrument = self
+                    .resolve_report_instrument(instrument_id, Some(raw))
+                    .await?;
+                instruments.insert(raw.to_string(), instrument.clone());
+                instrument
+            };
+            let report = report_from_order(
+                &order,
+                &instrument,
+                self.core.account_id,
+                cmd.ts_init,
+                Some(&self.client_order_ids),
+            )?;
+            if let Some(start) = cmd.start
+                && report.ts_last < start
+            {
+                continue;
+            }
+            if let Some(end) = cmd.end
+                && report.ts_last > end
+            {
+                continue;
+            }
+            reports.push(report);
+        }
+        Ok(reports)
     }
 
     fn query_order_report(
@@ -792,7 +919,7 @@ fn reconcile_order(
     if remember_once(&context.seen_orders, dedup_key) {
         return Ok(false);
     }
-    context.emitter.send_order_status_report(report);
+    fills::publish_order(report, context);
     Ok(true)
 }
 
@@ -810,20 +937,13 @@ fn reconcile_trade(
         .instruments_by_raw
         .get(raw)
         .with_context(|| format!("Gate.io reconciled trade symbol is not cached: {raw}"))?;
-    let dedup_key = user_trade_dedup_key(&trade, raw);
-    if dedup_contains(&context.seen_trades, &dedup_key) {
-        return Ok(false);
-    }
     let mut report = parse_user_trade(&trade, instrument, context.account_id, ts_init)?;
     if report.client_order_id.is_none() {
         report.client_order_id = context
             .client_order_ids
             .resolve(trade.text.as_deref().unwrap_or_default(), &trade.order_id);
     }
-    if remember_once(&context.seen_trades, dedup_key) {
-        return Ok(false);
-    }
-    context.emitter.send_fill_report(report);
+    fills::publish_fill(report, context);
     Ok(true)
 }
 
@@ -1131,73 +1251,21 @@ fn dispatch_private_message(message: GateioWsMessage, context: &GateioExecutionW
     match channel {
         GateioPrivateChannel::SpotOrders | GateioPrivateChannel::FuturesOrders => {
             for value in private_rows(&message.result) {
-                let Ok(order) = serde_json::from_value::<GateioOrder>(value.clone()) else {
-                    log::debug!("Failed to decode Gate.io private order event");
-                    continue;
-                };
-                let Some(raw) = private_raw_symbol(&value, context.product_type) else {
-                    log::debug!("Gate.io private order event has no symbol");
-                    continue;
-                };
-                let Some(instrument) = context.instruments_by_raw.get(&raw) else {
-                    log::debug!("Gate.io private order symbol is not cached: {raw}");
-                    continue;
-                };
-                let dedup_key = order_dedup_key(&raw, &order);
-                if remember_once(&context.seen_orders, dedup_key) {
-                    continue;
-                }
-                match report_from_order(
-                    &order,
-                    instrument,
-                    context.account_id,
-                    context.clock.get_time_ns(),
-                    Some(&context.client_order_ids),
-                ) {
-                    Ok(report) => context.emitter.send_order_status_report(report),
-                    Err(error) => {
-                        log::warn!("Failed to parse Gate.io private order event: {error}")
-                    }
+                let result = serde_json::from_value(value)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|order| reconcile_order(order, context, context.clock.get_time_ns()));
+                if let Err(error) = result {
+                    log::warn!("Failed to process Gate.io private order event: {error}");
                 }
             }
         }
         GateioPrivateChannel::SpotUserTrades | GateioPrivateChannel::FuturesUserTrades => {
             for value in private_rows(&message.result) {
-                let Ok(trade) =
-                    serde_json::from_value::<crate::http::models::GateioUserTrade>(value.clone())
-                else {
-                    log::debug!("Failed to decode Gate.io private user trade event");
-                    continue;
-                };
-                let Some(raw) = private_raw_symbol(&value, context.product_type) else {
-                    log::debug!("Gate.io private user trade event has no symbol");
-                    continue;
-                };
-                let Some(instrument) = context.instruments_by_raw.get(&raw) else {
-                    log::debug!("Gate.io private user trade symbol is not cached: {raw}");
-                    continue;
-                };
-                if remember_once(&context.seen_trades, user_trade_dedup_key(&trade, &raw)) {
-                    continue;
-                }
-                match parse_user_trade(
-                    &trade,
-                    instrument,
-                    context.account_id,
-                    context.clock.get_time_ns(),
-                ) {
-                    Ok(mut report) => {
-                        if report.client_order_id.is_none() {
-                            report.client_order_id = context.client_order_ids.resolve(
-                                trade.text.as_deref().unwrap_or_default(),
-                                &trade.order_id,
-                            );
-                        }
-                        context.emitter.send_fill_report(report);
-                    }
-                    Err(error) => {
-                        log::warn!("Failed to parse Gate.io private fill event: {error}")
-                    }
+                let result = serde_json::from_value(value)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|trade| reconcile_trade(trade, context, context.clock.get_time_ns()));
+                if let Err(error) = result {
+                    log::warn!("Failed to process Gate.io private fill event: {error}");
                 }
             }
         }
@@ -1959,6 +2027,8 @@ impl ExecutionClient for GateioExecutionClient {
         let emitter = self.emitter.clone();
         let order = self.order_from_cache(cmd.client_order_id)?;
         let clock = self.clock;
+        let account_id = self.core.account_id;
+        let ids = Arc::clone(&self.client_order_ids);
         self.spawn_order_task("cancel_order", async move {
             match http
                 .cancel_order(
@@ -1968,8 +2038,23 @@ impl ExecutionClient for GateioExecutionClient {
                 )
                 .await
             {
-                Ok(_) => {
-                    emitter.emit_order_canceled(&order, Some(venue_order_id), clock.get_time_ns())
+                Ok(ack) => {
+                    anyhow::ensure!(
+                        ack.id == venue_order_id.as_str(),
+                        "Gate.io cancel acknowledgment has the wrong order ID"
+                    );
+                    let product = GateioProductType::from_symbol(cmd.instrument_id.symbol.as_str());
+                    let instrument = http
+                        .instrument(cmd.instrument_id, product, clock.get_time_ns())
+                        .await?;
+                    let report = report_from_order(
+                        &ack,
+                        &instrument,
+                        account_id,
+                        clock.get_time_ns(),
+                        Some(&ids),
+                    )?;
+                    fills::publish_rest(&http, &emitter, report).await?;
                 }
                 Err(error) => emitter.emit_order_cancel_rejected(
                     &order,
@@ -2032,9 +2117,9 @@ impl ExecutionClient for GateioExecutionClient {
             cmd.venue_order_id,
         );
         let emitter = self.emitter.clone();
+        let http = self.http_client.clone();
         self.spawn_order_task("query_order", async move {
-            emitter.send_order_status_report(query.await?);
-            Ok(())
+            fills::publish_rest(&http, &emitter, query.await?).await
         });
         Ok(())
     }
@@ -2050,100 +2135,29 @@ impl ExecutionClient for GateioExecutionClient {
         if cmd.venue_order_id.is_none() && cmd.client_order_id.is_none() {
             return Ok(None);
         }
-        self.query_order_report(instrument_id, cmd.client_order_id, cmd.venue_order_id)
-            .await
-            .map(Some)
+        let report = self
+            .query_order_report(instrument_id, cmd.client_order_id, cmd.venue_order_id)
+            .await?;
+        self.ensure_applied_fills(&report).await?;
+        Ok(Some(report))
     }
 
     async fn generate_order_status_reports(
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let instrument_id = cmd.instrument_id;
-        if let Some(instrument_id) = instrument_id {
-            self.ensure_product(instrument_id)?;
-        }
-
-        let symbol = instrument_id.map(raw_symbol);
-        let mut orders = self
-            .http_client
-            .open_orders(self.config.product_type, symbol.as_deref())
-            .await?;
-
-        if !cmd.open_only {
-            let start = cmd
-                .start
-                .map(|value| unix_nanos_to_datetime(value, "order start"))
-                .transpose()?;
-            let end = cmd
-                .end
-                .map(|value| unix_nanos_to_datetime(value, "order end"))
-                .transpose()?;
-            let finished = if start.is_some() || end.is_some() {
-                self.http_client
-                    .orders_in_time_range(self.config.product_type, symbol.as_deref(), start, end)
-                    .await?
-            } else {
-                self.http_client
-                    .orders(self.config.product_type, "finished", symbol.as_deref())
-                    .await?
-            };
-            orders.extend(finished);
-        }
-
-        let mut instruments = HashMap::new();
-        if let Some(instrument_id) = instrument_id {
-            instruments.insert(
-                raw_symbol(instrument_id),
-                self.http_client
-                    .instrument(
-                        instrument_id,
-                        self.config.product_type,
-                        self.clock.get_time_ns(),
-                    )
-                    .await?,
-            );
-        }
-
-        let mut seen = HashSet::new();
-        let mut reports = Vec::with_capacity(orders.len());
-        for order in orders {
-            if !seen.insert(order.id.clone()) {
-                continue;
+        let reports = self.fetch_order_reports(cmd).await?;
+        let mut incomplete = false;
+        for report in &reports {
+            if let Err(error) = self.ensure_applied_fills(report).await {
+                log::debug!("{error}");
+                incomplete = true;
             }
-            let raw = order
-                .contract
-                .as_deref()
-                .or(order.currency_pair.as_deref())
-                .context("Gate.io order report has no instrument symbol")?;
-            let instrument = if let Some(instrument) = instruments.get(raw) {
-                instrument.clone()
-            } else {
-                let instrument = self
-                    .resolve_report_instrument(instrument_id, Some(raw))
-                    .await?;
-                instruments.insert(raw.to_string(), instrument.clone());
-                instrument
-            };
-            let report = report_from_order(
-                &order,
-                &instrument,
-                self.core.account_id,
-                cmd.ts_init,
-                Some(&self.client_order_ids),
-            )?;
-            if let Some(start) = cmd.start
-                && report.ts_last < start
-            {
-                continue;
-            }
-            if let Some(end) = cmd.end
-                && report.ts_last > end
-            {
-                continue;
-            }
-            reports.push(report);
         }
+        anyhow::ensure!(
+            !incomplete,
+            "Gate.io order reports await application of real executions"
+        );
         Ok(reports)
     }
 
@@ -2295,11 +2309,32 @@ impl ExecutionClient for GateioExecutionClient {
             .map_err(|error| anyhow::anyhow!("{error}"))?;
 
         let (order_reports, fill_reports, position_reports) = tokio::try_join!(
-            self.generate_order_status_reports(&order_cmd),
+            self.fetch_order_reports(&order_cmd),
             self.generate_fill_reports(fill_cmd),
             self.generate_position_status_reports(&position_cmd),
         )?;
 
+        // Windowed history can omit older executions of a still-active order.
+        let mut by_order: HashMap<_, Vec<_>> = HashMap::new();
+        for fill in fill_reports {
+            by_order
+                .entry((fill.instrument_id, fill.venue_order_id))
+                .or_default()
+                .push(fill);
+        }
+        for report in &order_reports {
+            let fills = by_order
+                .entry((report.instrument_id, report.venue_order_id))
+                .or_default();
+            if !fills::covered(report, fills.iter()) {
+                anyhow::ensure!(
+                    !report.filled_qty.is_zero(),
+                    "Gate.io mass status contains fills newer than its order snapshot"
+                );
+                *fills = fills::load(&self.http_client, report).await?;
+            }
+            fills.sort_by_key(|fill| (fill.ts_event, fill.trade_id));
+        }
         let mut mass_status = ExecutionMassStatus::new(
             self.core.client_id,
             self.core.account_id,
@@ -2308,7 +2343,7 @@ impl ExecutionClient for GateioExecutionClient {
             None,
         );
         mass_status.add_order_reports(order_reports);
-        mass_status.add_fill_reports(fill_reports);
+        mass_status.add_fill_reports(by_order.into_values().flatten().collect());
         mass_status.add_position_reports(position_reports);
         Ok(Some(mass_status))
     }
@@ -2320,7 +2355,7 @@ mod tests {
     use crate::common::parse::{parse_perpetual_instrument, parse_spot_instrument};
     use crate::http::models::{GateioContract, GateioSpotPair};
 
-    fn spot_instrument() -> InstrumentAny {
+    pub(super) fn spot_instrument() -> InstrumentAny {
         let definition: GateioSpotPair = serde_json::from_value(serde_json::json!({
             "id": "BTC_USDT",
             "base": "BTC",

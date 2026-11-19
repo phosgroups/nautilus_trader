@@ -276,3 +276,61 @@ async fn insufficient_balance_emits_order_rejected() {
     assert_eq!(rejected.client_order_id, result.order.client_order_id());
     assert!(rejected.reason.as_str().contains("BALANCE_NOT_ENOUGH"));
 }
+
+#[rstest::rstest]
+#[case("0.4")]
+#[case("0.7")]
+#[tokio::test]
+async fn status_only_query_waits_for_real_executions(#[case] trade_qty: &'static str) {
+    let queries = Router::new()
+        .route("/api/v4/spot/orders/t-ABC-123", get(|| async {
+            let mut order = open_order();
+            order["status"] = json!("cancelled");
+            order["left"] = json!("0.3");
+            order["filled_amount"] = json!("0.7");
+            // A forty-day order needs two explicit windows.
+            order["create_time"] = json!(1_700_000_000);
+            order["update_time"] = json!(1_703_456_000);
+            Json(order)
+        }))
+        .route("/api/v4/spot/my_trades", get(move |Query(params): Query<HashMap<String, String>>| async move {
+            assert_eq!(params["currency_pair"], "BTC_USDT");
+            assert_eq!(params["order_id"], "701");
+            let from = params["from"].parse::<i64>().unwrap();
+            let to = params["to"].parse::<i64>().unwrap();
+            let boundary = 1_700_000_000 + 30 * 86_400;
+            if from == boundary {
+                assert_eq!(to, 1_703_456_001);
+                let later = json!({"order_id":"701","currency_pair":"BTC_USDT","id":"78","price":"49100","amount":"0.1","fee":"0.01","fee_currency":"USDT","side":"buy","role":"maker"});
+                return Json(json!([later]));
+            }
+            assert_eq!((from, to), (1_700_000_000, boundary));
+            let fill = json!({"order_id":"701", "currency_pair":"BTC_USDT","id":"77","price":"49000","amount":if trade_qty == "0.7" { "0.6" } else { "0.3" },"fee":"0.04","fee_currency":"USDT","side":"buy","role":"maker"});
+            Json(json!([fill, fill]))
+        }));
+    let SubmittedOrder {
+        client,
+        order,
+        mut events,
+    } = submit(StatusCode::OK, "{}", queries).await;
+    assert!(
+        client
+            .generate_order_status_report(&report_command(&order))
+            .await
+            .is_err()
+    );
+    if trade_qty == "0.4" {
+        assert!(events.try_recv().is_err());
+    } else {
+        let ExecutionEvent::Report(ExecutionReport::OrderWithFills(order, fills)) =
+            events.try_recv().unwrap()
+        else {
+            panic!("expected bundled terminal status and executions");
+        };
+        assert_eq!(order.order_status, OrderStatus::Canceled);
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].trade_id.as_str(), "77");
+        assert_eq!(fills[0].last_px, Price::from("49000"));
+        assert_eq!(fills[0].commission.to_string(), "0.04000000 USDT");
+    }
+}
