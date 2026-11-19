@@ -942,6 +942,16 @@ fn bounded_limit(value: u32, maximum: u32, resource: &str) -> Result<u32, Gateio
     Ok(value.min(maximum))
 }
 
+fn historical_candle_is_closed(row: &GateioCandle, interval_ms: i64, as_of: UnixNanos) -> bool {
+    // Futures REST candles have no close flag. Use the time captured before the request.
+    row.closed.unwrap_or_else(|| {
+        row.timestamp_ms
+            .checked_add(interval_ms)
+            .and_then(|end| u64::try_from(end).ok())
+            .is_some_and(|end| end <= as_of.as_millis())
+    })
+}
+
 fn pagination_offset(page: u32, page_limit: u32) -> Result<u32, GateioHttpError> {
     page.checked_sub(1)
         .and_then(|page_index| page_index.checked_mul(page_limit))
@@ -1040,6 +1050,34 @@ fn should_retry(method: &Method, error: &GateioHttpError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_excludes_open_candles_at_the_window_boundary() {
+        let row = GateioCandle {
+            timestamp_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let close = UnixNanos::from(1_700_000_060_000_000_000);
+        let before = UnixNanos::from(close.as_u64() - 1);
+        assert!(!historical_candle_is_closed(&row, 60_000, before));
+        assert!(historical_candle_is_closed(&row, 60_000, close));
+        assert!(!historical_candle_is_closed(
+            &GateioCandle {
+                closed: Some(false),
+                ..row.clone()
+            },
+            60_000,
+            close
+        ));
+        assert!(historical_candle_is_closed(
+            &GateioCandle {
+                closed: Some(true),
+                ..row
+            },
+            60_000,
+            before
+        ));
+    }
 
     #[test]
     fn cancel_all_params_map_spot_order_side() {
@@ -1351,7 +1389,9 @@ impl GateioHttpClient {
                 end,
             )
             .await?;
+        let interval_ms = bar_type.spec().timedelta().num_milliseconds();
         rows.iter()
+            .filter(|row| historical_candle_is_closed(row, interval_ms, ts))
             .map(|row| parse_candle(row, instrument, bar_type, ts))
             .collect()
     }

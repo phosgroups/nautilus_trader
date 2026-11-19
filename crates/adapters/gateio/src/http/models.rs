@@ -406,6 +406,7 @@ pub struct GateioCandle {
     pub volume: String,
     /// Spot base quantity (REST array index 6 or WebSocket field `a`).
     pub base_volume: Option<String>,
+    pub closed: Option<bool>,
     pub close: String,
     pub high: String,
     pub low: String,
@@ -428,6 +429,7 @@ impl<'de> Deserialize<'de> for GateioCandle {
                 object.get("l").cloned().unwrap_or(serde_json::Value::Null),
                 object.get("o").cloned().unwrap_or(serde_json::Value::Null),
                 object.get("a").cloned().unwrap_or(serde_json::Value::Null),
+                object.get("w").cloned().unwrap_or(serde_json::Value::Null),
             ],
             _ => {
                 return Err(de::Error::custom(
@@ -455,6 +457,12 @@ impl<'de> Deserialize<'de> for GateioCandle {
                     .round_dp(0)
                     .to_i64()
                     .ok_or_else(|| de::Error::custom("invalid candle timestamp"))?
+            },
+            closed: match row.get(7) {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::Bool(closed)) => Some(*closed),
+                Some(serde_json::Value::String(s)) => Some(s.parse().map_err(de::Error::custom)?),
+                _ => return Err(de::Error::custom("invalid candle close flag")),
             },
             volume: get(1)?,
             base_volume: row.get(6).and_then(|value| match value {
@@ -1002,6 +1010,7 @@ mod tests {
         assert_eq!(array.timestamp_ms, 1_700_000_000_000);
         assert_eq!(array.close, "50001");
         assert_eq!(array.base_volume.as_deref(), Some("0.002"));
+        assert_eq!(array.closed, Some(true));
 
         let object = serde_json::from_value::<GateioCandle>(serde_json::json!({
             "t": 1700000000000i64,

@@ -34,12 +34,9 @@ use nautilus_core::{
 };
 use nautilus_model::{
     data::{
-        BarSpecification, BarType, BookOrder, DEPTH10_LEN, Data, FundingRateUpdate,
-        OrderBookDeltas, OrderBookDepth10,
+        BarType, BookOrder, DEPTH10_LEN, Data, FundingRateUpdate, OrderBookDeltas, OrderBookDepth10,
     },
-    enums::{
-        AggregationSource, BarAggregation, BookAction, BookType, OrderSide, PriceType, RecordFlag,
-    },
+    enums::{BarAggregation, BookAction, BookType, OrderSide, RecordFlag},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
@@ -83,7 +80,7 @@ pub struct GateioDataClient {
     ws_client: GateioWebSocketClient,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-    bar_types: Arc<AtomicMap<String, BarType>>,
+    bar_types: Arc<Mutex<HashMap<String, CandleSubscription>>>,
     book_states: Arc<Mutex<HashMap<String, GateioBookState>>>,
     book_generation: Arc<AtomicU64>,
     ticker_subscriptions: Arc<Mutex<HashMap<String, usize>>>,
@@ -166,7 +163,7 @@ impl GateioDataClient {
             http_client,
             data_sender,
             instruments: Arc::new(AtomicMap::new()),
-            bar_types: Arc::new(AtomicMap::new()),
+            bar_types: Arc::new(Mutex::new(HashMap::new())),
             book_states: Arc::new(Mutex::new(HashMap::new())),
             book_generation: Arc::new(AtomicU64::new(0)),
             ticker_subscriptions: Arc::new(Mutex::new(HashMap::new())),
@@ -488,16 +485,30 @@ fn bar_key(raw_symbol: &str, interval: &str) -> String {
     format!("{raw_symbol}:{interval}")
 }
 
-fn bar_spec_from_interval(interval: &str) -> Option<BarSpecification> {
-    let (step, suffix) = interval.split_at(interval.len().saturating_sub(1));
-    let step = step.parse::<usize>().ok()?;
-    let aggregation = match suffix {
-        "m" => BarAggregation::Minute,
-        "h" => BarAggregation::Hour,
-        "d" => BarAggregation::Day,
-        _ => return None,
-    };
-    Some(BarSpecification::new(step, aggregation, PriceType::Last))
+#[derive(Debug)]
+struct CandleSubscription {
+    bar_type: BarType,
+    last_published_ms: Option<i64>,
+}
+
+impl CandleSubscription {
+    fn closed_bar(
+        &mut self,
+        candle: &GateioCandle,
+        instrument: &InstrumentAny,
+        ts_init: nautilus_core::UnixNanos,
+    ) -> anyhow::Result<Option<nautilus_model::data::Bar>> {
+        if candle.closed != Some(true)
+            || self
+                .last_published_ms
+                .is_some_and(|last| candle.timestamp_ms <= last)
+        {
+            return Ok(None);
+        }
+        let bar = parse_candle(candle, instrument, self.bar_type, ts_init)?;
+        self.last_published_ms = Some(candle.timestamp_ms);
+        Ok(Some(bar))
+    }
 }
 
 fn candle_subscription_payload(
@@ -1080,7 +1091,7 @@ fn dispatch_ws_message(
     message: GateioWsMessage,
     sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-    bar_types: &AtomicMap<String, BarType>,
+    bar_types: &Mutex<HashMap<String, CandleSubscription>>,
     book_states: &Arc<Mutex<HashMap<String, GateioBookState>>>,
     book_generation: &Arc<AtomicU64>,
     http_client: &GateioHttpClient,
@@ -1383,19 +1394,18 @@ fn dispatch_ws_message(
                 let Some(instrument) = instrument_for_raw(instruments, &raw) else {
                     continue;
                 };
-                let Some(bar_type) =
-                    bar_types.get_cloned(&bar_key(&raw, &interval)).or_else(|| {
-                        bar_spec_from_interval(&interval).map(|spec| {
-                            BarType::new(instrument.id(), spec, AggregationSource::External)
-                        })
-                    })
-                else {
+                let Ok(mut subscriptions) = bar_types.lock() else {
+                    log::error!("Gate.io candle subscription lock poisoned");
+                    return;
+                };
+                let Some(subscription) = subscriptions.get_mut(&bar_key(&raw, &interval)) else {
                     continue;
                 };
-                match parse_candle(&candle, &instrument, bar_type, ts_init) {
-                    Ok(bar) => {
+                match subscription.closed_bar(&candle, &instrument, ts_init) {
+                    Ok(Some(bar)) => {
                         let _ = sender.send(DataEvent::Data(Data::Bar(bar)));
                     }
+                    Ok(None) => {}
                     Err(error) => log::debug!("Failed to parse Gate.io candle update: {error}"),
                 }
             }
@@ -1433,6 +1443,33 @@ mod tests {
             first_sequence: first,
             sequence: last,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn streaming_candles_require_a_single_confirmed_close_per_window() {
+        let instrument = spot_instrument();
+        let mut sub = CandleSubscription {
+            bar_type: "BTC_USDT.GATEIO-1-MINUTE-LAST-EXTERNAL".parse().unwrap(),
+            last_published_ms: None,
+        };
+        let mut payload = serde_json::json!({"t":"1700000000","v":"1000","a":"2","o":"500","h":"500","l":"500","c":"500"});
+        for (flag, expected) in [
+            (None, false),
+            (Some(false), false),
+            (Some(true), true),
+            (Some(true), false),
+        ] {
+            if let Some(closed) = flag {
+                payload["w"] = closed.into();
+            }
+            let candle = serde_json::from_value(payload.clone()).unwrap();
+            assert_eq!(
+                sub.closed_bar(&candle, &instrument, nautilus_core::UnixNanos::default())
+                    .unwrap()
+                    .is_some(),
+                expected
+            );
         }
     }
 
@@ -1819,7 +1856,10 @@ impl DataClient for GateioDataClient {
     fn reset(&mut self) -> anyhow::Result<()> {
         self.stop()?;
         self.instruments.store(Default::default());
-        self.bar_types.store(Default::default());
+        self.bar_types
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Gate.io candle subscription lock poisoned"))?
+            .clear();
         self.book_states
             .lock()
             .map_err(|_| anyhow::anyhow!("Gate.io order-book state lock poisoned"))?
@@ -1935,7 +1975,13 @@ impl DataClient for GateioDataClient {
         let instrument_id = cmd.bar_type.instrument_id();
         let raw = raw_symbol(instrument_id);
         self.bar_types
-            .insert(bar_key(&raw, &interval), cmd.bar_type);
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Gate.io candle subscription lock poisoned"))?
+            .entry(bar_key(&raw, &interval))
+            .or_insert(CandleSubscription {
+                bar_type: cmd.bar_type,
+                last_published_ms: None,
+            });
         self.queue_subscription_payload(
             channel,
             candle_subscription_payload(self.config.product_type, raw, interval),
@@ -2030,7 +2076,10 @@ impl DataClient for GateioDataClient {
         };
         let ws = self.ws_client.clone();
         let raw = raw_symbol(cmd.bar_type.instrument_id());
-        self.bar_types.remove(&bar_key(&raw, &interval));
+        self.bar_types
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Gate.io candle subscription lock poisoned"))?
+            .remove(&bar_key(&raw, &interval));
         let channel = if self.config.product_type == GateioProductType::Spot {
             GATEIO_SPOT_CANDLES_WS_CHANNEL
         } else {
