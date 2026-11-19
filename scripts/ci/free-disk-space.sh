@@ -7,7 +7,7 @@
 # skipped, so the script is safe across evolving runner images.
 #
 # Usage: free-disk-space.sh [--android] [--dotnet] [--haskell]
-#                           [--large-packages] [--docker-images]
+#                           [--large-packages | --large-packages-keep-llvm] [--docker-images]
 #                           [--tool-cache] [--swap-storage] [--extra]
 #                           [--max-build]
 
@@ -17,6 +17,7 @@ android=0
 dotnet=0
 haskell=0
 large_packages=0
+keep_llvm=0
 docker_images=0
 tool_cache=0
 swap_storage=0
@@ -32,6 +33,7 @@ All categories are opt-in:
   --dotnet          Remove the .NET runtime (/usr/share/dotnet)
   --haskell         Remove GHC and ghcup (/opt/ghc, /usr/local/.ghcup)
   --large-packages  apt-get remove bulky system packages and autoremove
+  --large-packages-keep-llvm  Same cleanup, preserving the LLVM toolchain
   --docker-images   docker image prune --all --force
   --tool-cache      Remove the actions AGENT_TOOLSDIRECTORY
   --swap-storage    Disable swap and remove /mnt/swapfile
@@ -50,6 +52,7 @@ for arg in "$@"; do
     --dotnet) dotnet=1 ;;
     --haskell) haskell=1 ;;
     --large-packages) large_packages=1 ;;
+    --large-packages-keep-llvm) large_packages=1; keep_llvm=1 ;;
     --docker-images) docker_images=1 ;;
     --tool-cache) tool_cache=1 ;;
     --swap-storage) swap_storage=1 ;;
@@ -119,16 +122,22 @@ if [ "$large_packages" -eq 1 ]; then
   echo "Removing large system packages"
   sudo apt-get remove -y '^aspnetcore-.*' || true
   sudo apt-get remove -y '^dotnet-.*' --fix-missing || true
-  sudo apt-get remove -y '^llvm-.*' --fix-missing || true
+  autoremove_options=()
+  if (( keep_llvm )); then
+    autoremove_options=(-o 'APT::NeverAutoRemove::=^(llvm|clang|lld|libllvm|libclang|liblld)')
+  else
+    sudo apt-get remove -y '^llvm-.*' --fix-missing || true
+  fi
   sudo apt-get remove -y 'php.*' --fix-missing || true
   sudo apt-get remove -y '^mongodb-.*' --fix-missing || true
   sudo apt-get remove -y '^mysql-.*' --fix-missing || true
+  # Match installed packages so an unavailable optional package cannot block the others.
   sudo apt-get remove -y \
-    azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri \
+    '?and(?installed,?name("^(azure-cli|google-chrome-stable|firefox|powershell|mono-devel|libgl1-mesa-dri)$"))' \
     --fix-missing || true
   sudo apt-get remove -y google-cloud-sdk --fix-missing || true
   sudo apt-get remove -y google-cloud-cli --fix-missing || true
-  sudo apt-get autoremove -y || true
+  sudo apt-get "${autoremove_options[@]}" autoremove -y || true
   sudo apt-get clean || true
   report_saved "large system packages" "$before_kb"
 fi
