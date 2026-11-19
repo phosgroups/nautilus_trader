@@ -1,6 +1,6 @@
-# Gate spot adapter for NT 1.231
+# Gate adapter for NT 1.231
 
-This adapter implements public spot L2/trades/quotes and authenticated account,
+This adapter implements spot and USDT perpetual market data and authenticated account,
 order, fill and cancellation handling through NT v1's live client interfaces.
 The existing Bitget CLASSIC/UTA adapter remains available in the same build.
 
@@ -21,5 +21,6 @@ neither is treated as proof of cancellation. Empty or delayed history leaves the
 outcome unresolved until a real order report arrives. Queries for submissions
 still queued locally do not consume the REST budget needed to send those orders.
 
-Gate support is spot only. See `docs/integrations/gateio.md` for configuration,
-test coverage and current limitations.
+Choose `GateioProductType.SPOT` (default) or `GateioProductType.USDT_PERPETUAL`
+on both client configurations. USDT perpetuals use one-way margin accounting
+and quantities in contracts. See [the integration guide](../../../docs/integrations/gateio.md).

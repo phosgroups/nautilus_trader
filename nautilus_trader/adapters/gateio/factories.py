@@ -42,7 +42,9 @@ class GateioLiveExecClientFactory(LiveExecClientFactory):
     def create(loop, name, config, msgbus, cache, clock):
         client, provider, config = dependencies(config, clock, private=True)
         if config.product_type == GateioProductType.USDT_PERPETUAL:
-            raise ValueError("Gate perpetual execution is unavailable")
+            from nautilus_trader.adapters.gateio.perpetual_execution import GateioPerpetualExecutionClient
+
+            return GateioPerpetualExecutionClient(loop, client, msgbus, cache, clock, provider, config, name)
         return GateioExecutionClient(loop, client, msgbus, cache, clock, provider, config, name)
 
 
