@@ -579,7 +579,7 @@ def test_reconnect_cancels_slow_execution_recovery_and_fences_late_response():
         ("order_type", OrderType.MARKET),
         ("time_in_force", TimeInForce.IOC),
         ("is_quote_quantity", True),
-        ("is_post_only", False),
+        ("time_in_force", TimeInForce.GTD),
         ("is_reduce_only", True),
     ],
 )

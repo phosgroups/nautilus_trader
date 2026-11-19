@@ -70,10 +70,15 @@ def original_order_id(text):
 
 
 def submit_payload(order):
-    if order.order_type != OrderType.LIMIT or order.time_in_force != TimeInForce.GTC:
-        raise ValueError("Gate PMM supports GTC limit orders only")
-    if not order.is_post_only or order.is_quote_quantity or order.is_reduce_only:
-        raise ValueError("Gate PMM requires post-only, base-sized spot orders")
+    if order.order_type != OrderType.LIMIT or order.is_quote_quantity or order.is_reduce_only:
+        raise ValueError("Gate spot limit orders require base quantity and cannot be reduce-only")
+    tif = {
+        TimeInForce.GTC: "gtc",
+        TimeInForce.IOC: "ioc",
+        TimeInForce.FOK: "fok",
+    }.get(order.time_in_force)
+    if tif is None or (order.is_post_only and tif != "gtc"):
+        raise ValueError("Unsupported Gate spot limit order time-in-force and post-only combination")
     payload = {
         "currency_pair": order.instrument_id.symbol.value,
         "account": "spot",
@@ -81,7 +86,7 @@ def submit_payload(order):
         "side": "buy" if order.side == OrderSide.BUY else "sell",
         "amount": str(order.quantity.as_decimal()),
         "price": str(order.price.as_decimal()),
-        "time_in_force": "poc",
+        "time_in_force": "poc" if order.is_post_only else tif,
         "text": order_text(order.client_order_id),
     }
     if order.display_qty is not None:

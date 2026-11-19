@@ -219,8 +219,11 @@ def test_native_uuid_order_ids_are_safe_and_stable():
     )
     assert submit_payload(order_value)["time_in_force"] == "poc"
     order_value.is_post_only = False
-    with pytest.raises(ValueError):
-        submit_payload(order_value)
+    for tif, wire_tif in (
+        (TimeInForce.GTC, "gtc"), (TimeInForce.IOC, "ioc"), (TimeInForce.FOK, "fok"),
+    ):
+        order_value.time_in_force = tif
+        assert submit_payload(order_value)["time_in_force"] == wire_tif
 
 
 @pytest.mark.parametrize("display", [None, "0.000025", "0"])
