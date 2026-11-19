@@ -4,6 +4,8 @@ import asyncio
 from decimal import Decimal
 
 from nautilus_trader.adapters.gateio.config import GATEIO
+from nautilus_trader.adapters.gateio.history import candle_bar
+from nautilus_trader.adapters.gateio.history import candle_interval
 from nautilus_trader.adapters.gateio.history import spot_bars
 from nautilus_trader.adapters.gateio.history import spot_trades
 from nautilus_trader.adapters.gateio.parsing import public_quote_tick
@@ -154,6 +156,7 @@ class GateioDataClient(LiveMarketDataClient):
         self.http, self.config = client, config
         self.books, self.resyncs = {}, {}
         self._subscription_locks = {}
+        self._candles = {}
         self.public_subscriptions = {"spot.trades": set(), "spot.book_ticker": set()}
         self.ws = GateioWebSocket(
             loop,
@@ -287,6 +290,9 @@ class GateioDataClient(LiveMarketDataClient):
 
     async def _message(self, message):
         channel = message["channel"]
+        if channel == "spot.candlesticks":
+            self._candle_update(message["result"])
+            return
         if channel in {"spot.trades", "spot.book_ticker"}:
             self._public_tick(channel, message["result"])
             return
@@ -375,6 +381,52 @@ class GateioDataClient(LiveMarketDataClient):
 
     async def _unsubscribe_quote_ticks(self, command):
         await self._public_subscription("spot.book_ticker", command.instrument_id, False)
+
+    def _candle_update(self, row):
+        if not isinstance(row, dict) or row.get("w") is not True:
+            return
+        name = row.get("n")
+        if name not in self._candles:
+            return
+        bar_type, last_open = self._candles[name]
+        try:
+            opened = int(row["t"])
+            if last_open is not None and opened <= last_open:
+                return
+            bar = candle_bar(
+                bar_type, opened, row["o"], row["h"], row["l"], row["c"], row["a"],
+                self._clock.timestamp_ns(),
+            )
+        except (ArithmeticError, KeyError, ValueError, TypeError) as error:
+            self._log.warning(f"Discarding invalid Gate candlestick for {name}: {type(error).__name__}")
+            return
+        self._handle_data(bar)
+        self._candles[name] = (bar_type, opened)
+
+    async def _subscribe_bars(self, command):
+        bar_type = command.bar_type
+        interval = candle_interval(bar_type)
+        instrument = await self._history_instrument(bar_type.instrument_id)
+        raw = instrument.raw_symbol.value
+        name = f"{interval}_{raw}"
+        async with self._subscription_lock("spot.candlesticks", name):
+            if name in self._candles:
+                return
+            self._candles[name] = (bar_type, None)
+            try:
+                await self.ws.subscribe("spot.candlesticks", [interval, raw])
+            except BaseException:
+                self._candles.pop(name, None)
+                raise
+
+    async def _unsubscribe_bars(self, command):
+        interval = candle_interval(command.bar_type)
+        raw = command.bar_type.instrument_id.symbol.value
+        name = f"{interval}_{raw}"
+        async with self._subscription_lock("spot.candlesticks", name):
+            if name in self._candles:
+                await self.ws.unsubscribe("spot.candlesticks", [interval, raw])
+                self._candles.pop(name)
 
     async def _reconnect(self):
         instruments, tasks = list(self.books), []
