@@ -1737,7 +1737,7 @@ fn spot_filled_base_quantity(value: &GateioOrder) -> anyhow::Result<rust_decimal
 #[async_trait(?Send)]
 impl ExecutionClient for GateioExecutionClient {
     fn is_connected(&self) -> bool {
-        self.is_connected.load(Ordering::Acquire)
+        self.is_connected.load(Ordering::Acquire) && self.ws_client.is_active()
     }
 
     fn client_id(&self) -> ClientId {

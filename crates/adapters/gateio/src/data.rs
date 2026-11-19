@@ -1837,7 +1837,7 @@ impl DataClient for GateioDataClient {
     }
 
     fn is_connected(&self) -> bool {
-        self.is_connected.load(Ordering::Acquire)
+        self.is_connected.load(Ordering::Acquire) && self.ws_client.is_active()
     }
 
     fn is_disconnected(&self) -> bool {
