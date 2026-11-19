@@ -104,6 +104,8 @@ class GateioHttpClient:
             if before_send is not None:
                 before_send()  # Synchronous final check; no yield before transport dispatch.
             headers = {"Accept": "application/json", "Content-Type": "application/json"}
+            if path.startswith("/futures/"):
+                headers["X-Gate-Size-Decimal"] = "1"
             if private:
                 if not self.key or not self.secret:
                     raise ValueError("Gate private requests require api_key and api_secret")

@@ -22,7 +22,7 @@ def test_depth_and_deltas_share_a_single_wire_book_and_unsubscribe_independently
             _instrument_provider=SimpleNamespace(find=lambda _: object()), _schedule_resync=Mock(),
             _subscription_lock=lambda *_: asyncio.Lock(), ws=AsyncMock(),
         )
-        for method in ("_emit", "_subscribe_book", "_unsubscribe_book"):
+        for method in ("_emit", "_book_update", "_subscribe_book", "_unsubscribe_book"):
             setattr(client, method, partial(getattr(GateioDataClient, method), client))
         cmd = SimpleNamespace(instrument_id=ID, book_type=BookType.L2_MBP, depth=10)
         await GateioDataClient._subscribe_order_book_depth(client, cmd)

@@ -196,6 +196,18 @@ def book_deltas(instrument_id, book, snapshot, changes, sequence, ts_event, now)
     return OrderBookDeltas(instrument_id, deltas)
 
 
+def public_subscription(instrument_id, stream):
+    symbol = instrument_id.symbol.value
+    perpetual = symbol.endswith("-PERP")
+    channel = f"{'futures' if perpetual else 'spot'}.{stream}"
+    payload = [symbol.removesuffix("-PERP")]
+    if stream == "order_book_update":
+        payload.append("100ms")
+        if perpetual:
+            payload.append("100")
+    return channel, payload
+
+
 class GateioDataClient(LiveMarketDataClient):
     def __init__(self, loop, client, msgbus, cache, clock, instrument_provider, config, name=None):
         super().__init__(
@@ -338,6 +350,9 @@ class GateioDataClient(LiveMarketDataClient):
         instrument_id = next((i for i in self.books if i.symbol.value == row["s"]), None)
         if instrument_id is None:
             return
+        self._book_update(instrument_id, row)
+
+    def _book_update(self, instrument_id, row):
         book = self.books[instrument_id]
         try:
             result = book.update(row)
@@ -387,7 +402,7 @@ class GateioDataClient(LiveMarketDataClient):
         if self._instrument_provider.find(instrument_id) is None:
             raise ValueError("Gate subscription instrument was not loaded")
         selected = self.public_subscriptions[channel]
-        payload = [instrument_id.symbol.value]
+        payload = [self._instrument_provider.find(instrument_id).raw_symbol.value]
         if subscribe:
             if instrument_id in selected:
                 return
@@ -404,18 +419,22 @@ class GateioDataClient(LiveMarketDataClient):
             selected.discard(instrument_id)
 
     async def _subscribe_trade_ticks(self, command):
-        await self._public_subscription("spot.trades", command.instrument_id, True)
+        channel, _ = public_subscription(command.instrument_id, "trades")
+        await self._public_subscription(channel, command.instrument_id, True)
 
     async def _unsubscribe_trade_ticks(self, command):
-        await self._public_subscription("spot.trades", command.instrument_id, False)
+        channel, _ = public_subscription(command.instrument_id, "trades")
+        await self._public_subscription(channel, command.instrument_id, False)
 
     async def _subscribe_quote_ticks(self, command):
-        await self._public_subscription("spot.book_ticker", command.instrument_id, True)
+        channel, _ = public_subscription(command.instrument_id, "book_ticker")
+        await self._public_subscription(channel, command.instrument_id, True)
 
     async def _unsubscribe_quote_ticks(self, command):
-        await self._public_subscription("spot.book_ticker", command.instrument_id, False)
+        channel, _ = public_subscription(command.instrument_id, "book_ticker")
+        await self._public_subscription(channel, command.instrument_id, False)
 
-    def _candle_update(self, row):
+    def _candle_update(self, row, volume_key="a"):
         if not isinstance(row, dict) or row.get("w") is not True:
             return
         name = row.get("n")
@@ -427,7 +446,7 @@ class GateioDataClient(LiveMarketDataClient):
             if last_open is not None and opened <= last_open:
                 return
             bar = candle_bar(
-                bar_type, opened, row["o"], row["h"], row["l"], row["c"], row["a"],
+                bar_type, opened, row["o"], row["h"], row["l"], row["c"], row[volume_key],
                 self._clock.timestamp_ns(),
             )
         except (ArithmeticError, KeyError, ValueError, TypeError) as error:
@@ -442,23 +461,25 @@ class GateioDataClient(LiveMarketDataClient):
         instrument = await self._history_instrument(bar_type.instrument_id)
         raw = instrument.raw_symbol.value
         name = f"{interval}_{raw}"
-        async with self._subscription_lock("spot.candlesticks", name):
+        channel, _ = public_subscription(command.bar_type.instrument_id, "candlesticks")
+        async with self._subscription_lock(channel, name):
             if name in self._candles:
                 return
             self._candles[name] = (bar_type, None)
             try:
-                await self.ws.subscribe("spot.candlesticks", [interval, raw])
+                await self.ws.subscribe(channel, [interval, raw])
             except BaseException:
                 self._candles.pop(name, None)
                 raise
 
     async def _unsubscribe_bars(self, command):
         interval = candle_interval(command.bar_type)
-        raw = command.bar_type.instrument_id.symbol.value
+        raw = command.bar_type.instrument_id.symbol.value.removesuffix("-PERP")
         name = f"{interval}_{raw}"
-        async with self._subscription_lock("spot.candlesticks", name):
+        channel, _ = public_subscription(command.bar_type.instrument_id, "candlesticks")
+        async with self._subscription_lock(channel, name):
             if name in self._candles:
-                await self.ws.unsubscribe("spot.candlesticks", [interval, raw])
+                await self.ws.unsubscribe(channel, [interval, raw])
                 self._candles.pop(name)
 
     async def _reconnect(self):
@@ -477,13 +498,13 @@ class GateioDataClient(LiveMarketDataClient):
                 await self._resync(instrument_id)
 
     async def _subscribe_order_book_deltas(self, command):
-        async with self._subscription_lock("spot.order_book_update", command.instrument_id):
+        async with self._subscription_lock("order_book_update", command.instrument_id):
             await self._subscribe_book(command)
 
     async def _subscribe_order_book_depth(self, command):
         if command.depth not in (0, 10):
             raise ValueError("Gate OrderBookDepth10 requires ten levels")
-        async with self._subscription_lock("spot.order_book_update", command.instrument_id):
+        async with self._subscription_lock("order_book_update", command.instrument_id):
             await self._subscribe_book(command, depth=True)
 
     async def _subscribe_book(self, command, depth=False):
@@ -517,20 +538,18 @@ class GateioDataClient(LiveMarketDataClient):
         self.books[command.instrument_id] = book
         self._emit(command.instrument_id, True, [], 0, self._clock.timestamp_ns())
         try:
-            await self.ws.subscribe(
-                "spot.order_book_update", [command.instrument_id.symbol.value, "100ms"]
-            )
+            await self.ws.subscribe(*public_subscription(command.instrument_id, "order_book_update"))
         except BaseException:
             self.books.pop(command.instrument_id, None)
             raise
         self._schedule_resync(command.instrument_id)
 
     async def _unsubscribe_order_book_deltas(self, command):
-        async with self._subscription_lock("spot.order_book_update", command.instrument_id):
+        async with self._subscription_lock("order_book_update", command.instrument_id):
             await self._unsubscribe_book(command)
 
     async def _unsubscribe_order_book_depth(self, command):
-        async with self._subscription_lock("spot.order_book_update", command.instrument_id):
+        async with self._subscription_lock("order_book_update", command.instrument_id):
             await self._unsubscribe_book(command, depth=True)
 
     async def _unsubscribe_book(self, command, depth=False):
@@ -543,9 +562,7 @@ class GateioDataClient(LiveMarketDataClient):
         if not depth and book.publish_depth:
             book.publish_deltas = False
             return
-        await self.ws.unsubscribe(
-            "spot.order_book_update", [command.instrument_id.symbol.value, "100ms"]
-        )
+        await self.ws.unsubscribe(*public_subscription(command.instrument_id, "order_book_update"))
         task = self.resyncs.pop(command.instrument_id, None)
         if task:
             task.cancel()
@@ -559,7 +576,7 @@ class GateioDataClient(LiveMarketDataClient):
         instrument = await self._history_instrument(request.instrument_id)
         raw = await self._fetch_book(instrument.id, depth)
         now = self._clock.timestamp_ns()
-        event = int(raw["update"]) * 1_000_000 if raw.get("update") is not None else now
+        event = int(Decimal(str(raw["update"])) * 1_000_000) if raw.get("update") is not None else now
         book = GateBook(depth, cache_depth=depth)
         book.snapshot(raw)
         if book.sequence <= 0:
