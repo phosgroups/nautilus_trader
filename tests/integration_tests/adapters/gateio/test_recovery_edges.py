@@ -99,6 +99,7 @@ def submission(client):
             is_reduce_only=False,
             is_closed=False,
             quantity=Quantity.from_str("0.0001"),
+            display_qty=None,
             price=Price.from_str("99000"),
         )
     )

@@ -38,6 +38,7 @@ from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Currency
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
+from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 
 PAIR = {
@@ -213,12 +214,36 @@ def test_native_uuid_order_ids_are_safe_and_stable():
         is_quote_quantity=False,
         is_reduce_only=False,
         quantity=Quantity.from_str("0.0001"),
+        display_qty=None,
         price=Price.from_str("100000.00"),
     )
     assert submit_payload(order_value)["time_in_force"] == "poc"
     order_value.is_post_only = False
     with pytest.raises(ValueError):
         submit_payload(order_value)
+
+
+@pytest.mark.parametrize("display", [None, "0.000025", "0"])
+def test_iceberg_display_quantity_survives_order_submission_and_report(display):
+    instrument = parse_instrument(PAIR, 0)
+    display_qty = Quantity.from_str(display) if display is not None else None
+    submitted = TestComponentStubs.order_factory().limit(
+        instrument.id, OrderSide.BUY, Quantity.from_str("0.0001"),
+        Price.from_str("100000"), post_only=True, display_qty=display_qty,
+        client_order_id=ClientOrderId("iceberg"),
+    )
+    if display == "0":
+        with pytest.raises(ValueError, match="iceberg display quantity"):
+            submit_payload(submitted)
+        return
+    payload = submit_payload(submitted)
+    assert payload["amount"] == "0.0001"
+    assert payload.get("iceberg") == display
+    report = order_report(
+        order(iceberg=payload.get("iceberg", "0")), instrument,
+        AccountId("GATEIO-001"), submitted.client_order_id, 1,
+    )
+    assert report.display_qty == display_qty
 
 
 def test_uncertain_writes_are_never_retried():

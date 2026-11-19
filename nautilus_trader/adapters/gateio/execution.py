@@ -74,7 +74,7 @@ def submit_payload(order):
         raise ValueError("Gate PMM supports GTC limit orders only")
     if not order.is_post_only or order.is_quote_quantity or order.is_reduce_only:
         raise ValueError("Gate PMM requires post-only, base-sized spot orders")
-    return {
+    payload = {
         "currency_pair": order.instrument_id.symbol.value,
         "account": "spot",
         "type": "limit",
@@ -84,6 +84,11 @@ def submit_payload(order):
         "time_in_force": "poc",
         "text": order_text(order.client_order_id),
     }
+    if order.display_qty is not None:
+        if not 0 < order.display_qty <= order.quantity:
+            raise ValueError("Gate iceberg display quantity must be positive and at most the order quantity")
+        payload["iceberg"] = format(order.display_qty.as_decimal(), "f")
+    return payload
 
 
 class _SubmissionDeferred(ValueError):
