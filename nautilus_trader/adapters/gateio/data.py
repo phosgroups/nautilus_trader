@@ -4,13 +4,20 @@ import asyncio
 from decimal import Decimal
 
 from nautilus_trader.adapters.gateio.config import GATEIO
+from nautilus_trader.adapters.gateio.history import candle_bar
+from nautilus_trader.adapters.gateio.history import candle_interval
+from nautilus_trader.adapters.gateio.history import spot_bars
+from nautilus_trader.adapters.gateio.history import spot_trades
 from nautilus_trader.adapters.gateio.parsing import public_quote_tick
 from nautilus_trader.adapters.gateio.parsing import public_trade_tick
 from nautilus_trader.adapters.gateio.websocket import GateioWebSocket
 from nautilus_trader.live.data_client import LiveMarketDataClient
+from nautilus_trader.model.data import NULL_ORDER
 from nautilus_trader.model.data import BookOrder
+from nautilus_trader.model.data import DataType
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import OrderBookDeltas
+from nautilus_trader.model.data import OrderBookDepth10
 from nautilus_trader.model.enums import BookAction
 from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import OrderSide
@@ -28,6 +35,8 @@ class GateBook:
 
     def __init__(self, depth, max_buffer=10000, cache_depth=100):
         self.depth, self.max_buffer = depth, max_buffer
+        self.publish_deltas = True
+        self.publish_depth = False
         self.cache_depth = cache_depth
         self.bids, self.asks = {}, {}
         self.sequence = None
@@ -81,7 +90,7 @@ class GateBook:
             last = int(raw["u"])
             if self.sequence is not None and last < self.sequence:
                 return None
-            if int(raw.get("l", self.cache_depth)) < self.depth:
+            if int(raw.get("l", self.cache_depth)) < max(self.depth, 10 if self.publish_depth else 0):
                 raise BookGap("Gate channel depth is smaller than the requested visible depth")
             # A full image replaces the cache and is valid across sequence gaps.
             self.snapshot({"id": last, "bids": raw["b"], "asks": raw["a"]})
@@ -121,6 +130,22 @@ class GateBook:
                     del levels[price]
         self._validate()
 
+    def depth10(self, instrument_id, ts_event, ts_init):
+        sides = []
+        for index, (levels, side) in enumerate(((self.bids, OrderSide.BUY), (self.asks, OrderSide.SELL))):
+            prices = sorted(levels, reverse=index == 0)[:10]
+            boundary = self.boundaries[index]
+            if boundary is not None and (
+                len(prices) < 10 or (prices[-1] < boundary if index == 0 else prices[-1] > boundary)
+            ):
+                raise BookGap("Gate ten-level book exhausted known snapshot coverage")
+            orders = [BookOrder(side, Price.from_str(f"{p:f}"), Quantity.from_str(f"{levels[p]:f}"), 0)
+                      for p in prices]
+            sides.append(orders + [NULL_ORDER] * (10 - len(orders)))
+        return OrderBookDepth10(
+            instrument_id, *sides, [0] * 10, [0] * 10, 32 | 128, self.sequence, ts_event, ts_init,
+        )
+
     def _changes(self, before, initial):
         changes = []
         for side, old, new in (
@@ -132,6 +157,55 @@ class GateBook:
                 if initial or old.get(price) != quantity:
                     changes.append((side, price, quantity))
         return changes
+
+
+def book_deltas(instrument_id, book, snapshot, changes, sequence, ts_event, now):
+    rows = []
+    if snapshot:
+        rows.append((BookAction.CLEAR, OrderSide.NO_ORDER_SIDE, Decimal(0), Decimal(0)))
+    rows.extend(
+        (BookAction.UPDATE if q else BookAction.DELETE, side, p, q) for side, p, q in changes
+    )
+    if not rows:
+        # A sequence-advancing update still proves freshness when prices
+        # and sizes are unchanged. Do not silently turn a quiet book stale.
+        if book.ready and book.bids:
+            price = max(book.bids)
+            rows.append((BookAction.UPDATE, OrderSide.BUY, price, book.bids[price]))
+    if not rows:
+        return
+    deltas = []
+    for index, (action, side, price, size) in enumerate(rows):
+        flags = (32 if snapshot and changes else 0) | (128 if index == len(rows) - 1 else 0)
+        deltas.append(
+            OrderBookDelta(
+                instrument_id,
+                action,
+                BookOrder(
+                    side,
+                    Price.from_str(f"{price:f}"),
+                    Quantity.from_str(f"{size:f}"),
+                    0,
+                ),
+                flags,
+                sequence,
+                ts_event,
+                now,
+            )
+        )
+    return OrderBookDeltas(instrument_id, deltas)
+
+
+def public_subscription(instrument_id, stream):
+    symbol = instrument_id.symbol.value
+    perpetual = symbol.endswith("-PERP")
+    channel = f"{'futures' if perpetual else 'spot'}.{stream}"
+    payload = [symbol.removesuffix("-PERP")]
+    if stream == "order_book_update":
+        payload.append("100ms")
+        if perpetual:
+            payload.append("100")
+    return channel, payload
 
 
 class GateioDataClient(LiveMarketDataClient):
@@ -152,6 +226,7 @@ class GateioDataClient(LiveMarketDataClient):
         self.http, self.config = client, config
         self.books, self.resyncs = {}, {}
         self._subscription_locks = {}
+        self._candles = {}
         self.public_subscriptions = {"spot.trades": set(), "spot.book_ticker": set()}
         self.ws = GateioWebSocket(
             loop,
@@ -184,44 +259,22 @@ class GateioDataClient(LiveMarketDataClient):
         if instrument is None:
             raise ValueError("Gate instrument was not initialized")
         now = self._clock.timestamp_ns()
-        rows = []
-        if snapshot:
-            rows.append((BookAction.CLEAR, OrderSide.NO_ORDER_SIDE, Decimal(0), Decimal(0)))
-        rows.extend(
-            (BookAction.UPDATE if q else BookAction.DELETE, side, p, q) for side, p, q in changes
-        )
-        if not rows:
-            # A sequence-advancing update still proves freshness when prices
-            # and sizes are unchanged. Do not silently turn a quiet book stale.
-            book = self.books.get(instrument_id)
-            if book is not None and book.ready and book.bids:
-                price = max(book.bids)
-                rows.append((BookAction.UPDATE, OrderSide.BUY, price, book.bids[price]))
-        if not rows:
-            return
-        deltas = []
-        for index, (action, side, price, size) in enumerate(rows):
-            flags = (32 if snapshot and changes else 0) | (128 if index == len(rows) - 1 else 0)
-            deltas.append(
-                OrderBookDelta(
-                    instrument_id,
-                    action,
-                    BookOrder(
-                        side,
-                        Price.from_str(f"{price:f}"),
-                        Quantity.from_str(f"{size:f}"),
-                        0,
-                    ),
-                    flags,
-                    sequence,
-                    ts_event,
-                    now,
-                )
-            )
-        self._handle_data(OrderBookDeltas(instrument_id, deltas))
+        book = self.books[instrument_id]
+        book.ts_event = ts_event
+        depth = book.depth10(instrument_id, ts_event, now) if book.publish_depth and book.ready else None
+        if book.publish_deltas:
+            deltas = book_deltas(instrument_id, book, snapshot, changes, sequence, ts_event, now)
+            if deltas is not None:
+                self._handle_data(deltas)
+        if depth is not None:
+            self._handle_data(depth)
 
     def _reset(self, instrument_id):
-        self.books[instrument_id] = GateBook(self.config.book_depth, self.config.max_book_buffer)
+        old = self.books.get(instrument_id)
+        book = GateBook(self.config.book_depth, self.config.max_book_buffer)
+        if old is not None:
+            book.publish_deltas, book.publish_depth = old.publish_deltas, old.publish_depth
+        self.books[instrument_id] = book
         self._emit(instrument_id, True, [], 0, self._clock.timestamp_ns())
 
     def _invalidate_books(self):
@@ -248,18 +301,15 @@ class GateioDataClient(LiveMarketDataClient):
                 failures += 1
                 await asyncio.sleep(min(0.25 * 2 ** min(failures - 1, 4), 2))
 
+    async def _fetch_book(self, instrument_id, depth):
+        return await self.http.request("GET", "/spot/order_book", {
+            "currency_pair": instrument_id.symbol.value, "limit": depth, "with_id": "true",
+        })
+
     async def _resync(self, instrument_id):
         book = self.books[instrument_id]
         for attempt in range(self.config.max_retries + 1):
-            snapshot = await self.http.request(
-                "GET",
-                "/spot/order_book",
-                {
-                    "currency_pair": instrument_id.symbol.value,
-                    "limit": 100,
-                    "with_id": "true",
-                },
-            )
+            snapshot = await self._fetch_book(instrument_id, 100)
             if self.books.get(instrument_id) is not book or book.ready:
                 return
             book.snapshot(snapshot)
@@ -285,6 +335,9 @@ class GateioDataClient(LiveMarketDataClient):
 
     async def _message(self, message):
         channel = message["channel"]
+        if channel == "spot.candlesticks":
+            self._candle_update(message["result"])
+            return
         if channel in {"spot.trades", "spot.book_ticker"}:
             self._public_tick(channel, message["result"])
             return
@@ -297,6 +350,9 @@ class GateioDataClient(LiveMarketDataClient):
         instrument_id = next((i for i in self.books if i.symbol.value == row["s"]), None)
         if instrument_id is None:
             return
+        self._book_update(instrument_id, row)
+
+    def _book_update(self, instrument_id, row):
         book = self.books[instrument_id]
         try:
             result = book.update(row)
@@ -346,7 +402,7 @@ class GateioDataClient(LiveMarketDataClient):
         if self._instrument_provider.find(instrument_id) is None:
             raise ValueError("Gate subscription instrument was not loaded")
         selected = self.public_subscriptions[channel]
-        payload = [instrument_id.symbol.value]
+        payload = [self._instrument_provider.find(instrument_id).raw_symbol.value]
         if subscribe:
             if instrument_id in selected:
                 return
@@ -363,16 +419,68 @@ class GateioDataClient(LiveMarketDataClient):
             selected.discard(instrument_id)
 
     async def _subscribe_trade_ticks(self, command):
-        await self._public_subscription("spot.trades", command.instrument_id, True)
+        channel, _ = public_subscription(command.instrument_id, "trades")
+        await self._public_subscription(channel, command.instrument_id, True)
 
     async def _unsubscribe_trade_ticks(self, command):
-        await self._public_subscription("spot.trades", command.instrument_id, False)
+        channel, _ = public_subscription(command.instrument_id, "trades")
+        await self._public_subscription(channel, command.instrument_id, False)
 
     async def _subscribe_quote_ticks(self, command):
-        await self._public_subscription("spot.book_ticker", command.instrument_id, True)
+        channel, _ = public_subscription(command.instrument_id, "book_ticker")
+        await self._public_subscription(channel, command.instrument_id, True)
 
     async def _unsubscribe_quote_ticks(self, command):
-        await self._public_subscription("spot.book_ticker", command.instrument_id, False)
+        channel, _ = public_subscription(command.instrument_id, "book_ticker")
+        await self._public_subscription(channel, command.instrument_id, False)
+
+    def _candle_update(self, row, volume_key="a"):
+        if not isinstance(row, dict) or row.get("w") is not True:
+            return
+        name = row.get("n")
+        if name not in self._candles:
+            return
+        bar_type, last_open = self._candles[name]
+        try:
+            opened = int(row["t"])
+            if last_open is not None and opened <= last_open:
+                return
+            bar = candle_bar(
+                bar_type, opened, row["o"], row["h"], row["l"], row["c"], row[volume_key],
+                self._clock.timestamp_ns(),
+            )
+        except (ArithmeticError, KeyError, ValueError, TypeError) as error:
+            self._log.warning(f"Discarding invalid Gate candlestick for {name}: {type(error).__name__}")
+            return
+        self._handle_data(bar)
+        self._candles[name] = (bar_type, opened)
+
+    async def _subscribe_bars(self, command):
+        bar_type = command.bar_type
+        interval = candle_interval(bar_type)
+        instrument = await self._history_instrument(bar_type.instrument_id)
+        raw = instrument.raw_symbol.value
+        name = f"{interval}_{raw}"
+        channel, _ = public_subscription(command.bar_type.instrument_id, "candlesticks")
+        async with self._subscription_lock(channel, name):
+            if name in self._candles:
+                return
+            self._candles[name] = (bar_type, None)
+            try:
+                await self.ws.subscribe(channel, [interval, raw])
+            except BaseException:
+                self._candles.pop(name, None)
+                raise
+
+    async def _unsubscribe_bars(self, command):
+        interval = candle_interval(command.bar_type)
+        raw = command.bar_type.instrument_id.symbol.value.removesuffix("-PERP")
+        name = f"{interval}_{raw}"
+        channel, _ = public_subscription(command.bar_type.instrument_id, "candlesticks")
+        async with self._subscription_lock(channel, name):
+            if name in self._candles:
+                await self.ws.unsubscribe(channel, [interval, raw])
+                self._candles.pop(name)
 
     async def _reconnect(self):
         instruments, tasks = list(self.books), []
@@ -390,51 +498,129 @@ class GateioDataClient(LiveMarketDataClient):
                 await self._resync(instrument_id)
 
     async def _subscribe_order_book_deltas(self, command):
-        async with self._subscription_lock("spot.order_book_update", command.instrument_id):
+        async with self._subscription_lock("order_book_update", command.instrument_id):
             await self._subscribe_book(command)
 
-    async def _subscribe_book(self, command):
+    async def _subscribe_order_book_depth(self, command):
+        if command.depth not in (0, 10):
+            raise ValueError("Gate OrderBookDepth10 requires ten levels")
+        async with self._subscription_lock("order_book_update", command.instrument_id):
+            await self._subscribe_book(command, depth=True)
+
+    async def _subscribe_book(self, command, depth=False):
         if command.book_type != BookType.L2_MBP:
             raise ValueError("Gate PMM requires L2_MBP")
         if self._instrument_provider.find(command.instrument_id) is None:
             raise ValueError("Gate subscription instrument was not loaded")
-        if command.instrument_id in self.books:
+        book = self.books.get(command.instrument_id)
+        if book is not None:
+            if depth and not book.publish_depth:
+                if book.ready:
+                    try:
+                        data = book.depth10(command.instrument_id, book.ts_event, self._clock.timestamp_ns())
+                    except BookGap:
+                        book.publish_depth = True
+                        self._reset(command.instrument_id)
+                        self._schedule_resync(command.instrument_id)
+                        return
+                    self._handle_data(data)
+                book.publish_depth = True
+            elif not depth and not book.publish_deltas:
+                if book.ready:
+                    self._handle_data(book_deltas(
+                        command.instrument_id, book, True, book._changes(({}, {}), True),
+                        book.sequence, book.ts_event, self._clock.timestamp_ns(),
+                    ))
+                book.publish_deltas = True
             return
-        self._reset(command.instrument_id)
+        book = GateBook(self.config.book_depth, self.config.max_book_buffer)
+        book.publish_depth, book.publish_deltas = depth, not depth
+        self.books[command.instrument_id] = book
+        self._emit(command.instrument_id, True, [], 0, self._clock.timestamp_ns())
         try:
-            await self.ws.subscribe(
-                "spot.order_book_update", [command.instrument_id.symbol.value, "100ms"]
-            )
+            await self.ws.subscribe(*public_subscription(command.instrument_id, "order_book_update"))
         except BaseException:
             self.books.pop(command.instrument_id, None)
             raise
         self._schedule_resync(command.instrument_id)
 
     async def _unsubscribe_order_book_deltas(self, command):
-        async with self._subscription_lock("spot.order_book_update", command.instrument_id):
+        async with self._subscription_lock("order_book_update", command.instrument_id):
             await self._unsubscribe_book(command)
 
-    async def _unsubscribe_book(self, command):
-        if command.instrument_id not in self.books:
+    async def _unsubscribe_order_book_depth(self, command):
+        async with self._subscription_lock("order_book_update", command.instrument_id):
+            await self._unsubscribe_book(command, depth=True)
+
+    async def _unsubscribe_book(self, command, depth=False):
+        book = self.books.get(command.instrument_id)
+        if book is None:
             return
-        await self.ws.unsubscribe(
-            "spot.order_book_update", [command.instrument_id.symbol.value, "100ms"]
-        )
+        if depth and book.publish_deltas:
+            book.publish_depth = False
+            return
+        if not depth and book.publish_depth:
+            book.publish_deltas = False
+            return
+        await self.ws.unsubscribe(*public_subscription(command.instrument_id, "order_book_update"))
         task = self.resyncs.pop(command.instrument_id, None)
         if task:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self.books.pop(command.instrument_id, None)
 
+    async def _request_order_book_snapshot(self, request):
+        depth = request.limit or self.config.book_depth
+        if not 1 <= depth <= 1000:
+            raise ValueError("Gate supports snapshot depth from 1 to 1000")
+        instrument = await self._history_instrument(request.instrument_id)
+        raw = await self._fetch_book(instrument.id, depth)
+        now = self._clock.timestamp_ns()
+        event = int(Decimal(str(raw["update"])) * 1_000_000) if raw.get("update") is not None else now
+        book = GateBook(depth, cache_depth=depth)
+        book.snapshot(raw)
+        if book.sequence <= 0:
+            raise ValueError("Gate snapshot must include a positive update ID")
+        deltas = book_deltas(
+            instrument.id, book, True, book._changes(({}, {}), True), book.sequence, event, now,
+        )
+        self._handle_data_response(
+            data_type=DataType(OrderBookDeltas, metadata={"instrument_id": instrument.id}),
+            data=[deltas], correlation_id=request.id, start=request.start,
+            end=request.end, params=request.params,
+        )
+
+    async def _history_instrument(self, instrument_id):
+        instrument = self._instrument_provider.find(instrument_id)
+        if instrument is None:
+            await self._instrument_provider.load_async(instrument_id)
+            instrument = self._instrument_provider.find(instrument_id)
+        if instrument is None:
+            raise ValueError(f"Unknown Gate instrument: {instrument_id}")
+        return instrument
+
+    async def _request_bars(self, request):
+        instrument = await self._history_instrument(request.bar_type.instrument_id)
+        bars = await spot_bars(self.http, instrument, request, self._clock.timestamp_ns())
+        self._handle_bars(request.bar_type, bars, request.id, request.start, request.end, request.params)
+
+    async def _request_trade_ticks(self, request):
+        instrument = await self._history_instrument(request.instrument_id)
+        trades = await spot_trades(self.http, instrument, request, self._clock.timestamp_ns())
+        self._handle_trade_ticks(instrument.id, trades, request.id, request.start, request.end, request.params)
+
     async def _request_instrument(self, request):
         instrument = self._instrument_provider.find(request.instrument_id)
+        if instrument is None:
+            await self._instrument_provider.load_async(request.instrument_id, request.params)
+            instrument = self._instrument_provider.find(request.instrument_id)
         if instrument is not None:
-            self._handle_instrument(
-                instrument, request.id, request.start, request.end, request.params
-            )
+            self._handle_instrument(instrument, request.id, request.start, request.end, request.params)
 
     async def _request_instruments(self, request):
+        await self._instrument_provider.load_all_async(request.params)
         self._handle_instruments(
+            request.venue,
             list(self._instrument_provider.get_all().values()),
             request.id,
             request.start,

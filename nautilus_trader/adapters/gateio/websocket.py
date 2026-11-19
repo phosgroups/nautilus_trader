@@ -39,10 +39,12 @@ class GateioWebSocket:
         secret=None,
         error_handler=None,
         invalidate=None,
+        headers=(),
     ):
         self.loop, self.clock, self.url = loop, clock, url
         self.handler, self.reconnect = handler, reconnect
         self.proxy, self.key, self.secret = proxy, key, secret
+        self.headers = list(headers)
         self.client = None
         self._connecting = False
         self.subscriptions = []
@@ -95,7 +97,7 @@ class GateioWebSocket:
         try:
             client = await WebSocketClient.connect(
                 loop_=self.loop,
-                config=WebSocketConfig(url=self.url, headers=[], heartbeat=10, proxy_url=self.proxy),
+                config=WebSocketConfig(url=self.url, headers=self.headers, heartbeat=10, proxy_url=self.proxy),
                 handler=self._receive,
                 post_reconnection=self._reconnected,
             )
@@ -194,7 +196,7 @@ class GateioWebSocket:
                 else:
                     future.set_result(None)
                 return
-            if value.get("event") == "update":
+            if value.get("event") in {"update", "all"}:
                 self.queue.put_nowait((self._message_epoch, value))
         except (ValueError, TypeError, asyncio.QueueFull) as error:
             self._failed(error)

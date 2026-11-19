@@ -1,4 +1,4 @@
-"""Explicit spot endpoints and client settings; no environment credential fallback."""
+"""Explicit product endpoints and client settings; no environment credential fallback."""
 
 from enum import Enum
 
@@ -15,8 +15,19 @@ class GateioEnvironment(str, Enum):
     TESTNET = "TESTNET"
 
 
-def endpoints(environment, http=None, ws=None):
+class GateioProductType(str, Enum):
+    SPOT = "SPOT"
+    USDT_PERPETUAL = "USDT_PERPETUAL"
+
+
+def endpoints(environment, http=None, ws=None, product_type=GateioProductType.SPOT):
     environment = GateioEnvironment(environment)
+    if GateioProductType(product_type) == GateioProductType.USDT_PERPETUAL:
+        testnet = environment == GateioEnvironment.TESTNET
+        return (
+            http or ("https://api-testnet.gateapi.io/api/v4" if testnet else "https://api.gateio.ws/api/v4"),
+            ws or ("wss://ws-testnet.gate.com/v4/ws/futures/usdt" if testnet else "wss://fx-ws.gateio.ws/v4/ws/usdt"),
+        )
     if environment == GateioEnvironment.TESTNET:
         return (
             http or "https://api-testnet.gateapi.io/api/v4",
@@ -27,6 +38,7 @@ def endpoints(environment, http=None, ws=None):
 
 class GateioDataClientConfig(LiveDataClientConfig, frozen=True):
     venue: Venue = GATEIO
+    product_type: GateioProductType = GateioProductType.SPOT
     environment: GateioEnvironment = GateioEnvironment.TESTNET
     base_url_http: str | None = None
     base_url_ws: str | None = None
@@ -40,6 +52,7 @@ class GateioDataClientConfig(LiveDataClientConfig, frozen=True):
 
 class GateioExecClientConfig(LiveExecClientConfig, frozen=True):
     venue: Venue = GATEIO
+    product_type: GateioProductType = GateioProductType.SPOT
     environment: GateioEnvironment = GateioEnvironment.TESTNET
     api_key: str | None = None
     api_secret: str | None = None

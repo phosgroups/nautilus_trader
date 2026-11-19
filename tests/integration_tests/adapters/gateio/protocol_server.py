@@ -207,6 +207,14 @@ class LocalGate:
             )
             if row is None:
                 return web.json_response({"label": "ORDER_NOT_FOUND"}, status=404)
+            if request.method == "PATCH":
+                amendment = await request.json()
+                assert amendment["currency_pair"] == row["currency_pair"]
+                assert amendment["account"] == "spot"
+                if "amount" in amendment:
+                    filled = Decimal(row["amount"]) - Decimal(row["left"])
+                    row["left"] = str(Decimal(amendment["amount"]) - filled)
+                row.update(amendment, update_time_ms=str(int(time.time() * 1000)))
             if request.method == "DELETE":
                 await asyncio.sleep(self.cancel_delay)
                 if row["status"] != "open":

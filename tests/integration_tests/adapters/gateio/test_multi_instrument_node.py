@@ -141,6 +141,7 @@ def scenario():  # noqa: C901 (two-pair native lifecycle and settlement assertio
     counts = {str(i): {"books": 0, "quotes": 0, "trades": 0} for i in ids}
     class Maker(Strategy):
         def on_start(self):
+            children = []
             for iid in ids:
                 self.subscribe_order_book_deltas(iid, BookType.L2_MBP, managed=True)
                 self.subscribe_quote_ticks(iid)
@@ -150,10 +151,16 @@ def scenario():  # noqa: C901 (two-pair native lifecycle and settlement assertio
                     price = (99900 if side == OrderSide.BUY else 100100) if iid == ids[0] else (
                         0.122 if side == OrderSide.BUY else 0.125
                     )
-                    self.submit_order(self.order_factory.limit(
+                    order = self.order_factory.limit(
                         instrument_id=iid, order_side=side, price=instrument.make_price(price),
                         quantity=instrument.make_qty(0.0001 if iid == ids[0] else 100), post_only=True,
-                    ))
+                    )
+                    if side == OrderSide.BUY:
+                        children.append(order)
+                    else:
+                        self.submit_order(order)
+            self.submit_order_list(self.order_factory.create_list(children))
+
         def on_quote_tick(self, tick):
             assert tick.bid_price.precision == tick.ask_price.precision
             assert tick.bid_size.precision == tick.ask_size.precision

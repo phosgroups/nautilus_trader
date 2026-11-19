@@ -1,6 +1,6 @@
-# Gate spot on NautilusTrader 1.231
+# Gate on NautilusTrader 1.231
 
-This integration connects the PMM program to Gate through the standard NT v1
+This integration connects strategies to Gate through the standard NT v1
 Python `LiveMarketDataClient`, `LiveExecutionClient`, and client factories. It
 uses the existing native NT HTTP/WebSocket transports. No Rust/Cython engine
 changes or trading-bot / trading-bot-web integration are required.
@@ -13,11 +13,13 @@ Gate and Bitget use the same compiled native runtime and public v1 factories.
 
 | Area | Implementation |
 | --- | --- |
-| Instruments | Regular cash spot, `BASE_QUOTE.GATEIO`, precision and minimums from Gate REST |
-| Market data | Managed `L2_MBP`, REST snapshot + buffered `spot.order_book_update` |
+| Instruments | Cash spot `BASE_QUOTE.GATEIO` and linear perpetual `BASE_USDT-PERP.GATEIO`, with increments, fees and contract multiplier from Gate REST |
+| Market data | Managed L2 deltas, ten-level depth and on-demand REST snapshots |
 | Public trades | `spot.trades` -> native `TradeTick`, taker side, original ID and exchange time |
 | Best prices | `spot.book_ticker` -> native `QuoteTick`; empty sides do not produce zero quotes |
-| Orders | Base-sized GTC post-only limit orders (`time_in_force=poc`) |
+| Orders | Spot limit GTC, IOC, FOK and post-only, market buys by quote budget and market sells by base quantity. Lists submit each child individually. |
+| History and bars | Public trade history, closed historical bars and exchange-published closed bars |
+| Amendments | In-place price and quantity changes with venue confirmation |
 | Cancellation | Individual, batch, or strategy-scoped cancel-all; wait for exchange confirmation |
 | Account | Available + locked balances from `/spot/accounts`, reported to NT Cache |
 | Fills | Actual trade ID, base quantity, price, maker/taker, fee, and fee currency |
@@ -59,9 +61,24 @@ Other HTTP rejection labels keep `due_post_only=False`, even for post-only
 orders. Strategies can use this flag to distinguish a post-only price conflict
 from other rejections; their retry and fault policies remain strategy-owned.
 
-This profile does not support margin, perpetuals, market orders, in-place
-amendments, GT/points fee deductions, or unified-asset routing. The account
-should be dedicated to this PMM; external orders are not claimed or canceled.
+The spot PMM profile uses a dedicated cash account and post-only orders. Its
+accounting requires regular spot assets and fees in the trade currencies.
+
+### USDT perpetuals
+
+Select `GateioProductType.USDT_PERPETUAL` on both `GateioDataClientConfig` and
+`GateioExecClientConfig`, and configure a contract such as `BTC_USDT-PERP.GATEIO`
+in the instrument provider. The default product is `GateioProductType.SPOT`.
+Perpetual quantities are in contracts. The instrument multiplier gives the
+base-asset quantity per contract. The client requests fractional sizes from
+Gate for both REST and WebSocket.
+
+The perpetual data client delivers books, best prices, public trades, bars,
+mark and index prices, and funding rates. Execution uses a classic one-way
+USDT margin account, signed contract sizes and reduce-only orders. Order,
+fill and position reports reconcile the trading account after reconnects.
+Both classic and new classic accounts are supported in one-way mode. Unified
+accounts, hedge mode and point-card commissions are outside this profile.
 
 ## PMM configuration
 
@@ -115,9 +132,9 @@ as in Bitget. Gate balance pushes are not treated as complete wallet snapshots.
 
 The v2 Gate fixes in `1262d9f0e2` and `0443ac771f`, and
 [PR #4](https://github.com/phosgroups/nautilus_trader/pull/4), were checked against
-this spot-only v1 profile:
+the original spot PMM profile. The table records its behavior at that revision.
 
-| Review item | Current contract |
+| Review item | Contract at the time of review |
 | --- | --- |
 | 1. Private subscriptions | Explicit spot symbols, batches of at most 50, acknowledged subscriptions and retrying recovery; spot balances have no payload |
 | 2. Commission sign | Positive fee debit, negative rebate credit; same-currency rebates net correctly; unsupported mixed-currency fees/rebates fail explicitly |
@@ -217,10 +234,8 @@ fee currencies and exact final balances. PMM's separate suite covers its
 50-level/default-guard behavior. These are distinct from read-only real Gate
 observations and from funded execution tests.
 
-Supported execution remains regular cash spot GTC post-only. The visible
-100-level book is not the full venue book, and unavailable history must leave
-reconciliation incomplete. These changes do not expand supported account modes,
-alter PMM guards, or constitute deployment acceptance of a newly published wheel.
+These historical PMM regression results cover regular cash spot GTC post-only,
+the visible 100-level book and recovery with incomplete history.
 
 ### Verification on 2026-11-05
 

@@ -219,8 +219,11 @@ def test_native_uuid_order_ids_are_safe_and_stable():
     )
     assert submit_payload(order_value)["time_in_force"] == "poc"
     order_value.is_post_only = False
-    with pytest.raises(ValueError):
-        submit_payload(order_value)
+    for tif, wire_tif in (
+        (TimeInForce.GTC, "gtc"), (TimeInForce.IOC, "ioc"), (TimeInForce.FOK, "fok"),
+    ):
+        order_value.time_in_force = tif
+        assert submit_payload(order_value)["time_in_force"] == wire_tif
 
 
 @pytest.mark.parametrize("display", [None, "0.000025", "0"])
@@ -441,6 +444,7 @@ def test_lagging_rest_snapshot_keeps_the_ws_interval_for_the_next_attempt():
             _emit=Mock(),
             _reset=lambda iid: books.update({iid: GateBook(2)}),
         )
+        client._fetch_book = lambda iid, depth: GateioDataClient._fetch_book(client, iid, depth)
         await GateioDataClient._resync(client, instrument_id)
         assert client.http.request.await_count == 2
         assert books[instrument_id].ready

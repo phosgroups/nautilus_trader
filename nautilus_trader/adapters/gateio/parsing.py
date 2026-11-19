@@ -126,9 +126,36 @@ def order_report(row, instrument, account_id, client_order_id, now):  # noqa: C9
     iceberg = Decimal(str(row["iceberg"])) if row.get("iceberg") is not None else Decimal(0)
     if not iceberg.is_finite() or not 0 <= iceberg <= amount:
         raise ValueError("Invalid Gate iceberg display quantity")
-    price = Decimal(row["price"])
-    if not price.is_finite() or price <= 0:
-        raise ValueError("Invalid Gate limit order price")
+    order_type = {"limit": OrderType.LIMIT, "market": OrderType.MARKET}[row.get("type", "limit")]
+    side = {"buy": OrderSide.BUY, "sell": OrderSide.SELL}[row["side"]]
+    market_buy = order_type == OrderType.MARKET and side == OrderSide.BUY
+    price = None
+    if order_type == OrderType.LIMIT:
+        raw_price = Decimal(row["price"])
+        if not raw_price.is_finite() or raw_price <= 0:
+            raise ValueError("Invalid Gate limit order price")
+        price = Price.from_str(f"{raw_price:f}")
+    avg_px = Decimal(str(row.get("avg_deal_price") or "0"))
+    if not avg_px.is_finite() or avg_px < 0:
+        raise ValueError("Invalid Gate average fill price")
+    filled = amount - left
+    if market_buy:
+        # Both amount and left are quote units. Trade events carry base units.
+        spent = Decimal(str(row.get("filled_total") or row.get("fill_price") or filled))
+        if not spent.is_finite() or spent < 0:
+            raise ValueError("Invalid Gate market buy quote total")
+        if row.get("filled_amount") not in (None, ""):
+            filled = Decimal(str(row["filled_amount"]))
+        elif spent and avg_px:
+            filled = instrument.make_qty(spent / avg_px).as_decimal()
+        elif spent:
+            raise ValueError("Gate market buy missing filled base quantity and average price")
+        else:
+            filled = Decimal(0)
+        if not filled.is_finite() or filled < 0:
+            raise ValueError("Invalid Gate market buy base fill quantity")
+        if filled and not avg_px and spent:
+            avg_px = spent / filled
     status = row.get("status")
     finish = row.get("finish_as")
     if status is None:
@@ -140,8 +167,8 @@ def order_report(row, instrument, account_id, client_order_id, now):  # noqa: C9
     if finish in {"poc", "small", "unified_check_failed"} and left == amount:
         status = OrderStatus.REJECTED
     elif status == "open":
-        status = OrderStatus.PARTIALLY_FILLED if left < amount else OrderStatus.ACCEPTED
-    elif status == "closed" and left == 0:
+        status = OrderStatus.PARTIALLY_FILLED if filled else OrderStatus.ACCEPTED
+    elif status == "closed" and (left == 0 or (market_buy and finish == "filled")):
         status = OrderStatus.FILLED
     elif status in {"cancelled", "canceled"} or (
         status == "closed"
@@ -163,16 +190,27 @@ def order_report(row, instrument, account_id, client_order_id, now):  # noqa: C9
         status = OrderStatus.CANCELED
     else:
         raise ValueError("Unknown Gate order terminal state")
-    if row.get("type", "limit") != "limit":
-        raise ValueError("Gate PMM order reports currently support base-sized limit orders")
-    side = {"buy": OrderSide.BUY, "sell": OrderSide.SELL}[row["side"]]
+    quantity = amount
+    if market_buy and filled:
+        if status == OrderStatus.FILLED:
+            # A fully filled market buy can leave quote dust below one lot.
+            quantity = filled
+        elif avg_px:
+            # NT reconciles last_qty in base and expects quantity in the same units.
+            # Preserve a remaining lot for a partially filled, canceled order.
+            quantum = Decimal(1).scaleb(-instrument.size_precision)
+            quantity = max((amount / avg_px).quantize(quantum), filled + quantum)
+        else:
+            raise ValueError("Gate partial market buy missing execution price")
+    elif market_buy and status == OrderStatus.FILLED:
+        raise ValueError("Gate filled market buy is missing its base execution quantity")
     return OrderStatusReport(
         account_id=account_id,
         instrument_id=instrument.id,
         venue_order_id=VenueOrderId(_exchange_id(row["id"])),
         client_order_id=client_order_id,
         order_side=side,
-        order_type=OrderType.LIMIT,
+        order_type=order_type,
         time_in_force={
             "gtc": TimeInForce.GTC,
             "poc": TimeInForce.GTC,
@@ -180,11 +218,12 @@ def order_report(row, instrument, account_id, client_order_id, now):  # noqa: C9
             "fok": TimeInForce.FOK,
         }[row.get("time_in_force", "gtc")],
         order_status=status,
-        quantity=Quantity.from_str(f"{amount:f}"),
-        filled_qty=Quantity.from_str(f"{amount - left:f}"),
+        quantity=Quantity.from_str(f"{quantity:f}"),
+        is_quote_quantity=market_buy and not filled,
+        filled_qty=Quantity.from_str(f"{filled:f}"),
         display_qty=Quantity.from_str(f"{iceberg:f}") if iceberg else None,
-        price=Price.from_str(f"{price:f}"),
-        avg_px=Decimal(str(row["avg_deal_price"])) if row.get("avg_deal_price") else None,
+        price=price,
+        avg_px=avg_px or None,
         post_only=row.get("time_in_force") == "poc",
         report_id=UUID4(),
         ts_accepted=event_ns(row, "create_time", now),
