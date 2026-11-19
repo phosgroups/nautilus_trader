@@ -444,6 +444,7 @@ def test_lagging_rest_snapshot_keeps_the_ws_interval_for_the_next_attempt():
             _emit=Mock(),
             _reset=lambda iid: books.update({iid: GateBook(2)}),
         )
+        client._fetch_book = lambda iid, depth: GateioDataClient._fetch_book(client, iid, depth)
         await GateioDataClient._resync(client, instrument_id)
         assert client.http.request.await_count == 2
         assert books[instrument_id].ready

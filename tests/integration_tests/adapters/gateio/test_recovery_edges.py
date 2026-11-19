@@ -171,6 +171,7 @@ def test_late_rest_snapshot_cannot_overwrite_newer_ws_full_image():
             http=SimpleNamespace(request=AsyncMock(side_effect=request)),
             _emit=Mock(),
         )
+        client._fetch_book = lambda iid, depth: GateioDataClient._fetch_book(client, iid, depth)
         task = asyncio.create_task(GateioDataClient._resync(client, instrument.id))
         await entered.wait()
         book.update(full(200))

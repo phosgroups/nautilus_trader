@@ -12,9 +12,12 @@ from nautilus_trader.adapters.gateio.parsing import public_quote_tick
 from nautilus_trader.adapters.gateio.parsing import public_trade_tick
 from nautilus_trader.adapters.gateio.websocket import GateioWebSocket
 from nautilus_trader.live.data_client import LiveMarketDataClient
+from nautilus_trader.model.data import NULL_ORDER
 from nautilus_trader.model.data import BookOrder
+from nautilus_trader.model.data import DataType
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import OrderBookDeltas
+from nautilus_trader.model.data import OrderBookDepth10
 from nautilus_trader.model.enums import BookAction
 from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import OrderSide
@@ -32,6 +35,8 @@ class GateBook:
 
     def __init__(self, depth, max_buffer=10000, cache_depth=100):
         self.depth, self.max_buffer = depth, max_buffer
+        self.publish_deltas = True
+        self.publish_depth = False
         self.cache_depth = cache_depth
         self.bids, self.asks = {}, {}
         self.sequence = None
@@ -85,7 +90,7 @@ class GateBook:
             last = int(raw["u"])
             if self.sequence is not None and last < self.sequence:
                 return None
-            if int(raw.get("l", self.cache_depth)) < self.depth:
+            if int(raw.get("l", self.cache_depth)) < max(self.depth, 10 if self.publish_depth else 0):
                 raise BookGap("Gate channel depth is smaller than the requested visible depth")
             # A full image replaces the cache and is valid across sequence gaps.
             self.snapshot({"id": last, "bids": raw["b"], "asks": raw["a"]})
@@ -125,6 +130,22 @@ class GateBook:
                     del levels[price]
         self._validate()
 
+    def depth10(self, instrument_id, ts_event, ts_init):
+        sides = []
+        for index, (levels, side) in enumerate(((self.bids, OrderSide.BUY), (self.asks, OrderSide.SELL))):
+            prices = sorted(levels, reverse=index == 0)[:10]
+            boundary = self.boundaries[index]
+            if boundary is not None and (
+                len(prices) < 10 or (prices[-1] < boundary if index == 0 else prices[-1] > boundary)
+            ):
+                raise BookGap("Gate ten-level book exhausted known snapshot coverage")
+            orders = [BookOrder(side, Price.from_str(f"{p:f}"), Quantity.from_str(f"{levels[p]:f}"), 0)
+                      for p in prices]
+            sides.append(orders + [NULL_ORDER] * (10 - len(orders)))
+        return OrderBookDepth10(
+            instrument_id, *sides, [0] * 10, [0] * 10, 32 | 128, self.sequence, ts_event, ts_init,
+        )
+
     def _changes(self, before, initial):
         changes = []
         for side, old, new in (
@@ -136,6 +157,43 @@ class GateBook:
                 if initial or old.get(price) != quantity:
                     changes.append((side, price, quantity))
         return changes
+
+
+def book_deltas(instrument_id, book, snapshot, changes, sequence, ts_event, now):
+    rows = []
+    if snapshot:
+        rows.append((BookAction.CLEAR, OrderSide.NO_ORDER_SIDE, Decimal(0), Decimal(0)))
+    rows.extend(
+        (BookAction.UPDATE if q else BookAction.DELETE, side, p, q) for side, p, q in changes
+    )
+    if not rows:
+        # A sequence-advancing update still proves freshness when prices
+        # and sizes are unchanged. Do not silently turn a quiet book stale.
+        if book.ready and book.bids:
+            price = max(book.bids)
+            rows.append((BookAction.UPDATE, OrderSide.BUY, price, book.bids[price]))
+    if not rows:
+        return
+    deltas = []
+    for index, (action, side, price, size) in enumerate(rows):
+        flags = (32 if snapshot and changes else 0) | (128 if index == len(rows) - 1 else 0)
+        deltas.append(
+            OrderBookDelta(
+                instrument_id,
+                action,
+                BookOrder(
+                    side,
+                    Price.from_str(f"{price:f}"),
+                    Quantity.from_str(f"{size:f}"),
+                    0,
+                ),
+                flags,
+                sequence,
+                ts_event,
+                now,
+            )
+        )
+    return OrderBookDeltas(instrument_id, deltas)
 
 
 class GateioDataClient(LiveMarketDataClient):
@@ -189,44 +247,22 @@ class GateioDataClient(LiveMarketDataClient):
         if instrument is None:
             raise ValueError("Gate instrument was not initialized")
         now = self._clock.timestamp_ns()
-        rows = []
-        if snapshot:
-            rows.append((BookAction.CLEAR, OrderSide.NO_ORDER_SIDE, Decimal(0), Decimal(0)))
-        rows.extend(
-            (BookAction.UPDATE if q else BookAction.DELETE, side, p, q) for side, p, q in changes
-        )
-        if not rows:
-            # A sequence-advancing update still proves freshness when prices
-            # and sizes are unchanged. Do not silently turn a quiet book stale.
-            book = self.books.get(instrument_id)
-            if book is not None and book.ready and book.bids:
-                price = max(book.bids)
-                rows.append((BookAction.UPDATE, OrderSide.BUY, price, book.bids[price]))
-        if not rows:
-            return
-        deltas = []
-        for index, (action, side, price, size) in enumerate(rows):
-            flags = (32 if snapshot and changes else 0) | (128 if index == len(rows) - 1 else 0)
-            deltas.append(
-                OrderBookDelta(
-                    instrument_id,
-                    action,
-                    BookOrder(
-                        side,
-                        Price.from_str(f"{price:f}"),
-                        Quantity.from_str(f"{size:f}"),
-                        0,
-                    ),
-                    flags,
-                    sequence,
-                    ts_event,
-                    now,
-                )
-            )
-        self._handle_data(OrderBookDeltas(instrument_id, deltas))
+        book = self.books[instrument_id]
+        book.ts_event = ts_event
+        depth = book.depth10(instrument_id, ts_event, now) if book.publish_depth and book.ready else None
+        if book.publish_deltas:
+            deltas = book_deltas(instrument_id, book, snapshot, changes, sequence, ts_event, now)
+            if deltas is not None:
+                self._handle_data(deltas)
+        if depth is not None:
+            self._handle_data(depth)
 
     def _reset(self, instrument_id):
-        self.books[instrument_id] = GateBook(self.config.book_depth, self.config.max_book_buffer)
+        old = self.books.get(instrument_id)
+        book = GateBook(self.config.book_depth, self.config.max_book_buffer)
+        if old is not None:
+            book.publish_deltas, book.publish_depth = old.publish_deltas, old.publish_depth
+        self.books[instrument_id] = book
         self._emit(instrument_id, True, [], 0, self._clock.timestamp_ns())
 
     def _invalidate_books(self):
@@ -253,18 +289,15 @@ class GateioDataClient(LiveMarketDataClient):
                 failures += 1
                 await asyncio.sleep(min(0.25 * 2 ** min(failures - 1, 4), 2))
 
+    async def _fetch_book(self, instrument_id, depth):
+        return await self.http.request("GET", "/spot/order_book", {
+            "currency_pair": instrument_id.symbol.value, "limit": depth, "with_id": "true",
+        })
+
     async def _resync(self, instrument_id):
         book = self.books[instrument_id]
         for attempt in range(self.config.max_retries + 1):
-            snapshot = await self.http.request(
-                "GET",
-                "/spot/order_book",
-                {
-                    "currency_pair": instrument_id.symbol.value,
-                    "limit": 100,
-                    "with_id": "true",
-                },
-            )
+            snapshot = await self._fetch_book(instrument_id, 100)
             if self.books.get(instrument_id) is not book or book.ready:
                 return
             book.snapshot(snapshot)
@@ -447,14 +480,42 @@ class GateioDataClient(LiveMarketDataClient):
         async with self._subscription_lock("spot.order_book_update", command.instrument_id):
             await self._subscribe_book(command)
 
-    async def _subscribe_book(self, command):
+    async def _subscribe_order_book_depth(self, command):
+        if command.depth not in (0, 10):
+            raise ValueError("Gate OrderBookDepth10 requires ten levels")
+        async with self._subscription_lock("spot.order_book_update", command.instrument_id):
+            await self._subscribe_book(command, depth=True)
+
+    async def _subscribe_book(self, command, depth=False):
         if command.book_type != BookType.L2_MBP:
             raise ValueError("Gate PMM requires L2_MBP")
         if self._instrument_provider.find(command.instrument_id) is None:
             raise ValueError("Gate subscription instrument was not loaded")
-        if command.instrument_id in self.books:
+        book = self.books.get(command.instrument_id)
+        if book is not None:
+            if depth and not book.publish_depth:
+                if book.ready:
+                    try:
+                        data = book.depth10(command.instrument_id, book.ts_event, self._clock.timestamp_ns())
+                    except BookGap:
+                        book.publish_depth = True
+                        self._reset(command.instrument_id)
+                        self._schedule_resync(command.instrument_id)
+                        return
+                    self._handle_data(data)
+                book.publish_depth = True
+            elif not depth and not book.publish_deltas:
+                if book.ready:
+                    self._handle_data(book_deltas(
+                        command.instrument_id, book, True, book._changes(({}, {}), True),
+                        book.sequence, book.ts_event, self._clock.timestamp_ns(),
+                    ))
+                book.publish_deltas = True
             return
-        self._reset(command.instrument_id)
+        book = GateBook(self.config.book_depth, self.config.max_book_buffer)
+        book.publish_depth, book.publish_deltas = depth, not depth
+        self.books[command.instrument_id] = book
+        self._emit(command.instrument_id, True, [], 0, self._clock.timestamp_ns())
         try:
             await self.ws.subscribe(
                 "spot.order_book_update", [command.instrument_id.symbol.value, "100ms"]
@@ -468,8 +529,19 @@ class GateioDataClient(LiveMarketDataClient):
         async with self._subscription_lock("spot.order_book_update", command.instrument_id):
             await self._unsubscribe_book(command)
 
-    async def _unsubscribe_book(self, command):
-        if command.instrument_id not in self.books:
+    async def _unsubscribe_order_book_depth(self, command):
+        async with self._subscription_lock("spot.order_book_update", command.instrument_id):
+            await self._unsubscribe_book(command, depth=True)
+
+    async def _unsubscribe_book(self, command, depth=False):
+        book = self.books.get(command.instrument_id)
+        if book is None:
+            return
+        if depth and book.publish_deltas:
+            book.publish_depth = False
+            return
+        if not depth and book.publish_depth:
+            book.publish_deltas = False
             return
         await self.ws.unsubscribe(
             "spot.order_book_update", [command.instrument_id.symbol.value, "100ms"]
@@ -479,6 +551,27 @@ class GateioDataClient(LiveMarketDataClient):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self.books.pop(command.instrument_id, None)
+
+    async def _request_order_book_snapshot(self, request):
+        depth = request.limit or self.config.book_depth
+        if not 1 <= depth <= 1000:
+            raise ValueError("Gate supports snapshot depth from 1 to 1000")
+        instrument = await self._history_instrument(request.instrument_id)
+        raw = await self._fetch_book(instrument.id, depth)
+        now = self._clock.timestamp_ns()
+        event = int(raw["update"]) * 1_000_000 if raw.get("update") is not None else now
+        book = GateBook(depth, cache_depth=depth)
+        book.snapshot(raw)
+        if book.sequence <= 0:
+            raise ValueError("Gate snapshot must include a positive update ID")
+        deltas = book_deltas(
+            instrument.id, book, True, book._changes(({}, {}), True), book.sequence, event, now,
+        )
+        self._handle_data_response(
+            data_type=DataType(OrderBookDeltas, metadata={"instrument_id": instrument.id}),
+            data=[deltas], correlation_id=request.id, start=request.start,
+            end=request.end, params=request.params,
+        )
 
     async def _history_instrument(self, instrument_id):
         instrument = self._instrument_provider.find(instrument_id)
