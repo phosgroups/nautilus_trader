@@ -273,27 +273,32 @@ pub fn parse_trade(
         .as_deref()
         .context("Gate.io trade missing price")?;
     let price = price(price_raw, instrument.price_precision(), "trade.price")?;
-    let size_raw = trade
-        .amount
-        .as_deref()
-        .or(trade.size.as_deref())
-        .context("trade missing amount")?;
-    let (side_hint, size_raw) = if let Some(stripped) = size_raw.strip_prefix('-') {
-        (Some(OrderSide::Sell), stripped)
-    } else {
-        (None, size_raw)
+    let (size_raw, aggressor_side) = match product_for_instrument(instrument.id()) {
+        GateioProductType::Spot => {
+            let amount = trade
+                .amount
+                .as_deref()
+                .context("Gate.io spot trade missing amount")?;
+            let side = match trade.side.as_deref() {
+                Some("buy") => AggressorSide::Buyer,
+                Some("sell") => AggressorSide::Seller,
+                _ => AggressorSide::NoAggressor,
+            };
+            (amount, side)
+        }
+        GateioProductType::UsdtPerpetual => {
+            let size = trade
+                .size
+                .as_deref()
+                .context("Gate.io perpetual trade missing size")?;
+            match size.strip_prefix('-') {
+                Some(quantity) => (quantity, AggressorSide::Seller),
+                None => (size, AggressorSide::Buyer),
+            }
+        }
     };
     let size = quantity(size_raw, instrument.size_precision(), "trade.size")?;
     anyhow::ensure!(!size.is_zero(), "Gate.io trade size must be positive");
-    let aggressor_side = match trade.side.as_deref().or(match side_hint {
-        Some(OrderSide::Buy) => Some("buy"),
-        Some(OrderSide::Sell) => Some("sell"),
-        _ => None,
-    }) {
-        Some("buy") => AggressorSide::Buyer,
-        Some("sell") => AggressorSide::Seller,
-        _ => AggressorSide::NoAggressor,
-    };
     let ts_event = timestamp_or_init(trade.create_time_ms.or(trade.create_time), ts_init)?;
     let id = trade
         .id
@@ -883,6 +888,42 @@ mod tests {
             let bar = parse_candle(&candle, instrument, bar_type, UnixNanos::default()).unwrap();
             assert_eq!(bar.volume, Quantity::from(expected));
         }
+    }
+
+    #[test]
+    fn trade_aggressor_uses_signed_contracts_and_explicit_spot_side() {
+        let futures = futures_instrument();
+        let spot = spot_instrument();
+        for (row, instrument, expected) in [
+            (
+                serde_json::json!({"size": 3}),
+                &futures,
+                AggressorSide::Buyer,
+            ),
+            (
+                serde_json::json!({"size": "-3"}),
+                &futures,
+                AggressorSide::Seller,
+            ),
+            (
+                serde_json::json!({"amount":"3","side":"sell"}),
+                &spot,
+                AggressorSide::Seller,
+            ),
+            (
+                serde_json::json!({"amount":"3"}),
+                &spot,
+                AggressorSide::NoAggressor,
+            ),
+        ] {
+            let mut trade: GateioTrade = serde_json::from_value(row).unwrap();
+            trade.price = Some("50000".to_string());
+            let tick = parse_trade(&trade, instrument, UnixNanos::default()).unwrap();
+            assert_eq!(tick.size, Quantity::from("3"));
+            assert_eq!(tick.aggressor_side, expected);
+        }
+        let zero = serde_json::from_value(serde_json::json!({"size":0, "price":"50000"})).unwrap();
+        assert!(parse_trade(&zero, &futures, UnixNanos::default()).is_err());
     }
 
     #[test]
