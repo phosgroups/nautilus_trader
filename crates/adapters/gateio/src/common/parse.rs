@@ -586,7 +586,15 @@ pub fn parse_book(
     instrument: &InstrumentAny,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderBookDeltas> {
-    let sequence = book_snapshot_sequence(book);
+    parse_book_snapshot(book, instrument, ts_init, book_snapshot_sequence(book))
+}
+
+fn parse_book_snapshot(
+    book: &GateioOrderBook,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+    sequence: u64,
+) -> anyhow::Result<OrderBookDeltas> {
     let ts_event = timestamp_or_init(book.current.or(book.update), ts_init)?;
     let total_levels = book.bids.len() + book.asks.len();
     let mut deltas = vec![OrderBookDelta::clear(
@@ -655,15 +663,14 @@ pub fn parse_book_update(
     instrument: &InstrumentAny,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderBookDeltas> {
-    if book.full {
-        return parse_book(book, instrument, ts_init);
-    }
-
     let sequence = book_update_sequence(book);
     anyhow::ensure!(
         sequence > 0,
         "Gate.io order-book update missing last update id"
     );
+    if book.full {
+        return parse_book_snapshot(book, instrument, ts_init, sequence);
+    }
     let ts_event = timestamp_or_init(book.current.or(book.update), ts_init)?;
     let total_levels = book.bids.len() + book.asks.len();
     anyhow::ensure!(
@@ -1233,6 +1240,22 @@ mod tests {
         assert_eq!(update_deltas.deltas[0].order.size, Quantity::from("4"));
         assert_eq!(update_deltas.deltas[1].action, BookAction::Delete);
         assert_eq!(update_deltas.deltas[1].order.size, Quantity::from("0"));
+    }
+
+    #[test]
+    fn full_book_update_uses_wire_last_update_id_for_all_deltas() {
+        let instrument = spot_instrument();
+        let mut update: GateioOrderBook = serde_json::from_value(serde_json::json!({
+            "full": true, "U": 101, "u": 110, "t": 1700000000012_i64,
+            "b": [["50000", "1"]], "a": [["50001", "2"]]
+        }))
+        .unwrap();
+        let batch = parse_book_update(&update, &instrument, UnixNanos::default()).unwrap();
+        assert_eq!(batch.sequence, 110);
+        assert_eq!(batch.deltas[0].action, BookAction::Clear);
+        assert!(batch.deltas.iter().all(|delta| delta.sequence == 110));
+        update.sequence = None;
+        assert!(parse_book_update(&update, &instrument, UnixNanos::default()).is_err());
     }
 
     #[test]

@@ -695,8 +695,9 @@ struct BookReplayGap {
 }
 
 fn book_update_range(book: &GateioOrderBook) -> Option<BookUpdateRange> {
-    let first = book.first_sequence?;
     let last = book.sequence?;
+    // A full snapshot replaces every level and can bridge a gap up to its last ID.
+    let first = if book.full { 1 } else { book.first_sequence? };
     if first == 0 || last == 0 || first > last {
         return None;
     }
@@ -1626,6 +1627,16 @@ mod tests {
         assert_eq!(plan.updates[1].first_sequence, Some(102));
         assert_eq!(plan.updates[1].sequence, Some(102));
         assert_eq!(plan.last_sequence, 102);
+    }
+
+    #[test]
+    fn replay_can_resume_from_a_newer_full_book() {
+        let mut full = book_update(None, Some(110));
+        full.full = true;
+        let plan = prepare_book_replay(100, vec![book_update(Some(111), Some(112)), full]).unwrap();
+        assert_eq!(plan.last_sequence, 112);
+        assert!(plan.updates[0].full);
+        assert_eq!(plan.updates.len(), 2);
     }
 
     #[test]
